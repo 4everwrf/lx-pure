@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Minimalist soundwave + snow crystal emblem -->
+    <path
+        android:fillColor="#60A5FA"
+        android:fillAlpha="0.22"
+        android:pathData="M54,24a30,30 0 1,0 0,60a30,30 0 1,0 0,-60z" />
+    <!-- 3 minimalist fluid sound bars forming a snow-crystal rhythm -->
+    <path
+        android:fillColor="#F8FAFC"
+        android:pathData="M39,46 C39,43.8 40.8,42 43,42 C45.2,42 47,43.8 47,46 L47,62 C47,64.2 45.2,66 43,66 C40.8,66 39,64.2 39,62 Z" />
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M50,34 C50,31.8 51.8,30 54,30 C56.2,30 58,31.8 58,34 L58,74 C58,76.2 56.2,78 54,78 C51.8,78 50,76.2 50,74 Z" />
+    <path
+        android:fillColor="#F8FAFC"
+        android:pathData="M61,42 C61,39.8 62.8,38 65,38 C67.2,38 69,39.8 69,42 L69,66 C69,68.2 67.2,70 65,70 C62.8,70 61,68.2 61,66 Z" />
+</vector>

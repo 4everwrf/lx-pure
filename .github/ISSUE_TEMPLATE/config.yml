@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 免责声明与合规说明（发帖前必读）
+    url: https://github.com/4everwrf/lx-pure/blob/main/DISCLAIMER.md
+    about: 本仓库不提供任何第三方音源。严禁在 Issue 中索要、分享或贴出音源脚本与链接，违者直接关闭删除。

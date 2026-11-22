@@ -1,0 +1,47 @@
+name: Bug 反馈 / Bug Report
+description: 反馈应用闪退、播放异常、界面错位或协议兼容性问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **提醒**：请勿在 Issue 中粘贴第三方音源脚本源码、分享或索要音源链接，违者将直接关闭删除。
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 简明扼要地描述遇到的问题
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 ...
+        2. 点击 ...
+        3. 出现异常 ...
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 设备与环境
+      placeholder: 例如：小米 14 / Android 15 / LX Pure v1.0.1
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 补充信息 / 日志（可选）
+      description: 如有报错截图或脱敏后的 logcat 日志可附在下方
+    validations:
+      required: false
+  - type: checkboxes
+    id: compliance
+    attributes:
+      label: 合规确认
+      options:
+        - label: 我确认本 Issue 不包含任何第三方音源脚本、链接或版权音频内容
+          required: true

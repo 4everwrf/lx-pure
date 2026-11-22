@@ -1,0 +1,138 @@
+package com.lxpure.music.core.musicsdk
+
+import android.util.Base64
+import com.lxpure.music.core.userapi.LxCrypto
+import java.nio.charset.StandardCharsets
+import java.security.KeyFactory
+import java.security.spec.X509EncodedKeySpec
+import javax.crypto.Cipher
+import kotlin.random.Random
+
+object NetEaseCrypto {
+    private val iv = "0102030405060708".toByteArray(StandardCharsets.UTF_8)
+    private val presetKey = "0CoJUm6Qyw8W8jud".toByteArray(StandardCharsets.UTF_8)
+    private val linuxApiKey = "rFgB&h#%2?^eDg:Q".toByteArray(StandardCharsets.UTF_8)
+    private val eapiKey = "e82ckenh8dichen8".toByteArray(StandardCharsets.UTF_8)
+    private const val RSA_PUBLIC_KEY =
+        "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDgtQn2JZ34ZC28NWYpAUd98iZ37BUrX/aKzmFbt7clFSs6sXqHauqKWqdtLkF2KexO40H1YTX8z2lSgBBOAxLsvaklV8k4cBFK9snQXE9/DDaFt6Rr7iVZMldczhC0JNgTz+SHXT6CBHuX3e9SdB1Ua44oncaTWz7OBGLbCiK45wIDAQAB"
+
+    private const val BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    fun eapi(path: String, jsonBody: String): Map<String, String> {
+        val message = "nobody${path}use${jsonBody}md5forencrypt"
+        val digest = LxCrypto.md5Hex(message)
+        val data = "$path-36cd479b6b5-$jsonBody-36cd479b6b5-$digest"
+        val encrypted = LxCrypto.aesEncryptBytes(
+            data = data.toByteArray(StandardCharsets.UTF_8),
+            key = eapiKey,
+            iv = null,
+            mode = "AES/ECB/PKCS5Padding"
+        )
+        return mapOf("params" to encrypted.toHexUpper())
+    }
+
+    fun linuxApi(jsonBody: String): Map<String, String> {
+        val encrypted = LxCrypto.aesEncryptBytes(
+            data = jsonBody.toByteArray(StandardCharsets.UTF_8),
+            key = linuxApiKey,
+            iv = null,
+            mode = "AES/ECB/PKCS5Padding"
+        )
+        return mapOf("eparams" to encrypted.toHexUpper())
+    }
+
+    fun weapi(jsonBody: String): Map<String, String> {
+        val secretKey = buildString {
+            repeat(16) { append(BASE62[Random.nextInt(BASE62.length)]) }
+        }
+        val firstEnc = LxCrypto.aesEncryptBytes(
+            data = jsonBody.toByteArray(StandardCharsets.UTF_8),
+            key = presetKey,
+            iv = iv,
+            mode = "AES/CBC/PKCS5Padding"
+        )
+        val firstB64 = Base64.encodeToString(firstEnc, Base64.NO_WRAP)
+        val secondEnc = LxCrypto.aesEncryptBytes(
+            data = firstB64.toByteArray(StandardCharsets.UTF_8),
+            key = secretKey.toByteArray(StandardCharsets.UTF_8),
+            iv = iv,
+            mode = "AES/CBC/PKCS5Padding"
+        )
+        val params = Base64.encodeToString(secondEnc, Base64.NO_WRAP)
+
+        // RSA NoPadding with zero-padded reversed secretKey (128 bytes)
+        val reversed = secretKey.reversed().toByteArray(StandardCharsets.UTF_8)
+        val padded = ByteArray(128)
+        System.arraycopy(reversed, 0, padded, 128 - reversed.size, reversed.size)
+
+        val keySpec = X509EncodedKeySpec(Base64.decode(RSA_PUBLIC_KEY, Base64.DEFAULT))
+        val pubKey = KeyFactory.getInstance("RSA").generatePublic(keySpec)
+        val cipher = Cipher.getInstance("RSA/ECB/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, pubKey)
+        val encSecKey = cipher.doFinal(padded).toHexLower()
+
+        return mapOf("params" to params, "encSecKey" to encSecKey)
+    }
+
+    private fun ByteArray.toHexUpper(): String = joinToString("") { "%02X".format(it) }
+    private fun ByteArray.toHexLower(): String = joinToString("") { "%02x".format(it) }
+}
+
+object QqSign {
+    private val part1Indexes = intArrayOf(23, 14, 6, 36, 16, 40, 7, 19)
+    private val part2Indexes = intArrayOf(16, 1, 32, 12, 19, 27, 8, 5)
+    private val scrambleValues = intArrayOf(
+        89, 39, 179, 150, 218, 82, 58, 252, 177, 52,
+        186, 123, 120, 64, 242, 133, 143, 161, 121, 179
+    )
+
+    fun zzcSign(payload: String): String {
+        val hash = LxCrypto.sha1Hex(payload).uppercase()
+        val part1 = buildString {
+            for (idx in part1Indexes) {
+                if (idx < hash.length) append(hash[idx])
+            }
+        }
+        val part2 = buildString {
+            for (idx in part2Indexes) {
+                if (idx < hash.length) append(hash[idx])
+            }
+        }
+        val scrambled = ByteArray(scrambleValues.size) { i ->
+            val byteVal = hash.substring(i * 2, i * 2 + 2).toInt(16)
+            (scrambleValues[i] xor byteVal).toByte()
+        }
+        val b64 = Base64.encodeToString(scrambled, Base64.NO_WRAP)
+            .replace("[/+=]".toRegex(), "")
+        return "zzc${part1}${b64}${part2}".lowercase()
+    }
+}
+
+object FormatUtils {
+    fun formatSize(bytes: Long): String {
+        if (bytes <= 0L) return ""
+        val mb = bytes / (1024.0 * 1024.0)
+        return if (mb >= 1.0) "%.1fMB".format(mb) else "${(bytes / 1024).coerceAtLeast(1)}KB"
+    }
+
+    fun formatPlayCount(count: Long): String = when {
+        count >= 100_000_000L -> "%.1f亿".format(count / 100_000_000.0)
+        count >= 10_000L -> "%.1f万".format(count / 10_000.0)
+        else -> count.toString()
+    }
+
+    fun decodeHtml(input: String?): String {
+        if (input.isNullOrEmpty()) return ""
+        return input
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&nbsp;", " ")
+            .replace("<br>", "\n")
+            .replace("<br/>", "\n")
+            .trim()
+    }
+}

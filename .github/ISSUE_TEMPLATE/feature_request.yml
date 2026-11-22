@@ -1,0 +1,30 @@
+name: 功能建议 / Feature Request
+description: 提出新功能、交互体验改进或性能优化建议
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **提醒**：本项目不接受任何“内置音源”“默认集成解析接口”类需求，请勿提交相关建议。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景与痛点
+      description: 描述你遇到的问题或希望优化的场景
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望方案
+      description: 你希望应用提供怎样的能力或交互？
+    validations:
+      required: true
+  - type: checkboxes
+    id: compliance
+    attributes:
+      label: 合规确认
+      options:
+        - label: 我确认本建议不涉及内置第三方音源或绕过版权保护机制
+          required: true

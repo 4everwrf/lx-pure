@@ -1,0 +1,55 @@
+LX Pure (轻雪音乐)
+Copyright 2026 LX Pure Contributors
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text and DISCLAIMER.md for usage
+and copyright notices.
+
+========================================================================
+Upstream Attribution
+========================================================================
+
+This project is an independent, unofficial native Android implementation
+compatible with the LX Music custom source script protocol. It is NOT
+affiliated with or endorsed by the official LX Music maintainers.
+
+This product includes software derived from:
+
+1. lyswhut/lx-music-mobile
+   - Repository: https://github.com/lyswhut/lx-music-mobile
+   - License: Apache License, Version 2.0 (with upstream supplemental
+     non-commercial and copyright disclaimer terms)
+   - Included / adapted component:
+     `app/src/main/assets/script/user-api-preload.js`
+     (QuickJS custom source preload sandbox bridge script, adapted for
+     Android QuickJS native bindings in LX Pure)
+
+========================================================================
+Third-Party Open-Source Components
+========================================================================
+
+This application uses the following open-source libraries:
+
+- AndroidX / Jetpack Compose / Room / DataStore / Palette
+  https://developer.android.com/jetpack
+  License: Apache License, Version 2.0
+
+- AndroidX Media3 (ExoPlayer, MediaSession, OkHttp DataSource)
+  https://github.com/androidx/media
+  License: Apache License, Version 2.0
+
+- Kotlin & kotlinx.coroutines / kotlinx.serialization
+  https://github.com/JetBrains/kotlin
+  License: Apache License, Version 2.0
+
+- OkHttp
+  https://github.com/square/okhttp
+  License: Apache License, Version 2.0
+
+- Coil (Coroutine Image Loader)
+  https://github.com/coil-kt/coil
+  License: Apache License, Version 2.0
+
+- QuickJS Android Wrapper (quickjs-android-wrapper)
+  https://github.com/HarlonWang/quickjs-android-wrapper
+  License: Apache License, Version 2.0 (wraps QuickJS under MIT License)

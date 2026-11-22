@@ -10,6 +10,7 @@
   <img src="https://img.shields.io/badge/Kotlin-2.0-7F52FF?logo=kotlin&logoColor=white" alt="Kotlin 2.0">
   <img src="https://img.shields.io/badge/UI-Jetpack%20Compose-4285F4?logo=jetpackcompose&logoColor=white" alt="Jetpack Compose">
   <a href="https://github.com/4everwrf/lx-pure/actions/workflows/android-ci.yml"><img src="https://github.com/4everwrf/lx-pure/actions/workflows/android-ci.yml/badge.svg" alt="Android CI"></a>
+  <a href="https://linux.do/"><img src="https://img.shields.io/badge/Community-LINUX%20DO-1C1C1E?logo=linux&logoColor=white" alt="LINUX DO 社区"></a>
 </p>
 
 > **重要说明（使用前请阅读）**
@@ -130,6 +131,10 @@ app/src/main/
 - 本项目基于 **[Apache License 2.0](./LICENSE)** 开源，详细归属说明见 [NOTICE](./NOTICE)，完整法律与免责说明见 [DISCLAIMER.md](./DISCLAIMER.md)。
 - 特别致谢 **[lyswhut/lx-music-mobile](https://github.com/lyswhut/lx-music-mobile)**（Apache-2.0）：本项目遵循其开放的自定义源脚本协议，且 `app/src/main/assets/script/user-api-preload.js` 衍生自该项目的预加载桥接脚本并针对 QuickJS 原生桥接进行了适配。
 - 感谢 Jetpack Compose、AndroidX Media3、QuickJS、OkHttp、Coil 等优秀开源社区项目。
+
+## 社区认可
+
+本项目完整开源，认可并支持 **[LINUX DO 社区](https://linux.do/)** 的开源分享精神（真诚、友善、团结、专业），感谢社区为开发者提供开放、纯粹的技术交流与开源展示平台。欢迎各位佬友在社区与 GitHub 交流使用体验与改进建议。
 
 ## 参与贡献
 

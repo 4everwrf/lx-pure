@@ -58,6 +58,16 @@ class MediaCacheManager(
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
     }
 
+    /**
+     * Evicts a single stream cache key (e.g. if a truncated/corrupted partial stream caused a playback error).
+     */
+    fun removeCacheKey(cacheKey: String?) {
+        if (cacheKey.isNullOrBlank()) return
+        runCatching {
+            getAudioCache().removeResource(cacheKey)
+        }
+    }
+
     suspend fun calculateTotalCacheBytes(): Long = withContext(Dispatchers.IO) {
         val audioBytes = runCatching { simpleCache?.cacheSpace ?: directorySize(audioCacheDir) }.getOrDefault(0L)
         val imageBytes = directorySize(imageCacheDir)

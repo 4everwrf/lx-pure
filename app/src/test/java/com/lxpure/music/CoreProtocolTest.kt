@@ -329,4 +329,129 @@ class CoreProtocolTest {
         assertTrue(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedScript(hexEscapedScript))
         assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedScript("<html><body>404 Not Found</body></html>" + " ".repeat(200)))
     }
+
+    @Test
+    fun foregroundServiceHeldAcrossBackgroundTrackTransitionAndRecovery() {
+        // Song ended naturally in background while queue will auto-advance -> MUST hold FGS
+        assertTrue(
+            com.lxpure.music.core.player.PlaybackRecoveryPolicy.shouldHoldForegroundDuringTransition(
+                isPlaybackOngoing = true,
+                isTransitioningOrRecovering = false,
+                playbackState = androidx.media3.common.Player.STATE_ENDED,
+                playWhenReady = true,
+                willAutoAdvanceOnEnd = true,
+                hasPlayerError = false,
+                canAutoRecoverFromError = false
+            )
+        )
+        // Resolving next track URL asynchronously while previous audio was silenced -> MUST hold FGS
+        assertTrue(
+            com.lxpure.music.core.player.PlaybackRecoveryPolicy.shouldHoldForegroundDuringTransition(
+                isPlaybackOngoing = true,
+                isTransitioningOrRecovering = true,
+                playbackState = androidx.media3.common.Player.STATE_READY,
+                playWhenReady = false,
+                willAutoAdvanceOnEnd = true,
+                hasPlayerError = false,
+                canAutoRecoverFromError = false
+            )
+        )
+        // Mid-stream error with auto-recovery budget remaining -> MUST hold FGS
+        assertTrue(
+            com.lxpure.music.core.player.PlaybackRecoveryPolicy.shouldHoldForegroundDuringTransition(
+                isPlaybackOngoing = true,
+                isTransitioningOrRecovering = false,
+                playbackState = androidx.media3.common.Player.STATE_IDLE,
+                playWhenReady = true,
+                willAutoAdvanceOnEnd = true,
+                hasPlayerError = true,
+                canAutoRecoverFromError = true
+            )
+        )
+        // User explicitly paused playback (not transitioning, not ended, no error) -> MUST release FGS
+        assertFalse(
+            com.lxpure.music.core.player.PlaybackRecoveryPolicy.shouldHoldForegroundDuringTransition(
+                isPlaybackOngoing = true,
+                isTransitioningOrRecovering = false,
+                playbackState = androidx.media3.common.Player.STATE_READY,
+                playWhenReady = false,
+                willAutoAdvanceOnEnd = true,
+                hasPlayerError = false,
+                canAutoRecoverFromError = false
+            )
+        )
+        // Service not currently in foreground -> never suppress normal notification updates
+        assertFalse(
+            com.lxpure.music.core.player.PlaybackRecoveryPolicy.shouldHoldForegroundDuringTransition(
+                isPlaybackOngoing = false,
+                isTransitioningOrRecovering = true,
+                playbackState = androidx.media3.common.Player.STATE_ENDED,
+                playWhenReady = true,
+                willAutoAdvanceOnEnd = true,
+                hasPlayerError = false,
+                canAutoRecoverFromError = true
+            )
+        )
+    }
+
+    @Test
+    fun playbackRecoveryPreservesPositionAndNeverBansPrimaryTrack() {
+        // 1. Transient UnknownHostException: keep same source, keep cache, preserve position
+        val netKind = com.lxpure.music.core.player.PlaybackRecoveryPolicy.classifyError(
+            errorCode = androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+            rootCauseClassName = "UnknownHostException",
+            rootCauseMessage = "UnknownHostException (no network)"
+        )
+        assertEquals(com.lxpure.music.core.player.PlaybackErrorKind.TRANSIENT_NETWORK, netKind)
+        val netPlan = com.lxpure.music.core.player.PlaybackRecoveryPolicy.decideRecovery(
+            kind = netKind,
+            retryAttemptIndex = 0,
+            primaryTrackId = "wy_1001",
+            resolvedTrackId = "wy_1001"
+        )
+        assertFalse(netPlan.excludeCurrentSource)
+        assertFalse(netPlan.excludeResolvedTrack)
+        assertFalse(netPlan.evictStreamCache)
+        assertTrue(netPlan.preferSameSourceFirst)
+        assertTrue(netPlan.preservePosition)
+
+        // 2. Expired CDN URL (HTTP 403): first attempt refreshes same source without banning it
+        val expiredKind = com.lxpure.music.core.player.PlaybackRecoveryPolicy.classifyError(
+            errorCode = androidx.media3.common.PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+            httpStatusCode = 403
+        )
+        assertEquals(com.lxpure.music.core.player.PlaybackErrorKind.EXPIRED_OR_DENIED_URL, expiredKind)
+        val refreshPlan = com.lxpure.music.core.player.PlaybackRecoveryPolicy.decideRecovery(
+            kind = expiredKind,
+            retryAttemptIndex = 0,
+            primaryTrackId = "wy_1001",
+            resolvedTrackId = "wy_1001"
+        )
+        assertFalse(refreshPlan.excludeCurrentSource)
+        assertTrue(refreshPlan.preferSameSourceFirst)
+        assertTrue(refreshPlan.preservePosition)
+
+        // 3. Broken stream on primary track: bans ONLY the source, NEVER primary track ID, and evicts cache
+        val brokenPlanPrimary = com.lxpure.music.core.player.PlaybackRecoveryPolicy.decideRecovery(
+            kind = com.lxpure.music.core.player.PlaybackErrorKind.STREAM_OR_SOURCE_BROKEN,
+            retryAttemptIndex = 0,
+            primaryTrackId = "wy_1001",
+            resolvedTrackId = "wy_1001"
+        )
+        assertTrue(brokenPlanPrimary.excludeCurrentSource)
+        assertFalse(brokenPlanPrimary.excludeResolvedTrack)
+        assertTrue(brokenPlanPrimary.evictStreamCache)
+        assertTrue(brokenPlanPrimary.preservePosition)
+
+        // 4. Broken stream on cross-platform alternate track: excludes the bad alternate track too
+        val brokenPlanAlt = com.lxpure.music.core.player.PlaybackRecoveryPolicy.decideRecovery(
+            kind = com.lxpure.music.core.player.PlaybackErrorKind.STREAM_OR_SOURCE_BROKEN,
+            retryAttemptIndex = 1,
+            primaryTrackId = "wy_1001",
+            resolvedTrackId = "tx_9999"
+        )
+        assertTrue(brokenPlanAlt.excludeCurrentSource)
+        assertTrue(brokenPlanAlt.excludeResolvedTrack)
+        assertTrue(brokenPlanAlt.evictStreamCache)
+    }
 }

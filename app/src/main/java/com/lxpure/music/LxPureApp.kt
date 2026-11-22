@@ -35,8 +35,19 @@ class AppContainer(application: Application) {
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(18, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .followRedirects(true)
         .followSslRedirects(true)
+        .build()
+
+    // Dedicated audio streaming client: bypasses the 12 MB API metadata cache (audio uses 300 MB SimpleCache)
+    // and allows longer CDN read windows + automatic TCP reconnects across network hiccups.
+    val streamHttpClient: OkHttpClient = httpClient.newBuilder()
+        .cache(null)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     val imageLoader: ImageLoader = ImageLoader.Builder(application)
@@ -81,6 +92,7 @@ class AppContainer(application: Application) {
         context = application,
         imageLoader = imageLoader,
         networkAdvisor = networkQualityAdvisor,
+        mediaCacheManager = mediaCacheManager,
         settingsDataStore = settingsDataStore,
         libraryRepository = libraryRepository,
         userApiManager = userApiManager,

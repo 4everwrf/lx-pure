@@ -2,6 +2,8 @@ package com.lxpure.music.core.player
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -13,24 +15,79 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.lxpure.music.LxPureApp
 import com.lxpure.music.MainActivity
 
 class PlaybackService : MediaSessionService() {
+    companion object {
+        private val mainHandler = Handler(Looper.getMainLooper())
+
+        @Volatile
+        private var activeInstance: PlaybackService? = null
+
+        /**
+         * Silently pauses the underlying ExoPlayer during an async track transition
+         * without clearing MediaItems, cancelling the notification, or cancelling PlayerController's
+         * pending resolution. Keeps the mediaPlayback foreground service continuously intact.
+         */
+        fun silenceForTransition() {
+            val runSilence = {
+                activeInstance?.exoPlayerRef?.let { player ->
+                    if (player.playWhenReady) {
+                        player.pause()
+                    }
+                }
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                runSilence()
+            } else {
+                mainHandler.post { runSilence() }
+            }
+        }
+
+        /**
+         * Re-evaluates foreground service / notification state after an async transition finishes
+         * with a terminal error or explicit queue clear so foreground is cleanly released.
+         */
+        @OptIn(UnstableApi::class)
+        fun refreshNotificationIfNeeded() {
+            val runRefresh = {
+                activeInstance?.let { service ->
+                    service.mediaSession?.let { session ->
+                        service.onUpdateNotification(session, false)
+                    }
+                }
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                runRefresh()
+            } else {
+                mainHandler.post { runRefresh() }
+            }
+        }
+    }
+
     private var mediaSession: MediaSession? = null
+    private var exoPlayerRef: ExoPlayer? = null
 
     @OptIn(UnstableApi::class)
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         val app = application as LxPureApp
 
-        val okHttpFactory = OkHttpDataSource.Factory(app.container.httpClient)
+        val okHttpFactory = OkHttpDataSource.Factory(app.container.streamHttpClient)
             .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         val upstreamFactory = DefaultDataSource.Factory(this, okHttpFactory)
         // Disk-backed 300 MB LRU cache: replays, loops, and seek-backs consume 0 mobile data
         val cachedDataSourceFactory = app.container.mediaCacheManager.wrapWithAudioCache(upstreamFactory)
+
+        // Allow up to 5 internal ExoPlayer load retries (1s..5s backoff) to smoothly absorb
+        // brief Wi-Fi <-> 5G handoffs or transient CDN resets without interrupting playback.
+        val mediaSourceFactory = DefaultMediaSourceFactory(cachedDataSourceFactory)
+            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(5))
 
         // Balanced load control: 1.5s fast start, 15s-30s anti-jitter buffer, capped at 10 MB RAM
         val loadControl = DefaultLoadControl.Builder()
@@ -50,14 +107,15 @@ class PlaybackService : MediaSessionService() {
             .build()
 
         val exoPlayer = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(cachedDataSourceFactory))
+            .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
+        exoPlayerRef = exoPlayer
 
-        // Bridge system/Bluetooth/Lock-Screen next & previous buttons directly to our queue controller
+        // Bridge system/Bluetooth/Lock-Screen controls directly to our queue controller
         val forwardingPlayer = object : ForwardingPlayer(exoPlayer) {
             override fun getAvailableCommands(): Player.Commands {
                 return super.getAvailableCommands().buildUpon()
@@ -80,6 +138,22 @@ class PlaybackService : MediaSessionService() {
 
             override fun hasNextMediaItem(): Boolean = app.container.playerController.hasNext()
             override fun hasPreviousMediaItem(): Boolean = app.container.playerController.hasPrevious()
+
+            override fun pause() {
+                app.container.playerController.onExternalPauseRequested()
+                super.pause()
+            }
+
+            override fun play() {
+                if (exoPlayer.mediaItemCount == 0 ||
+                    exoPlayer.playerError != null ||
+                    exoPlayer.playbackState == Player.STATE_IDLE
+                ) {
+                    app.container.playerController.resumeOrReloadCurrent()
+                } else {
+                    super.play()
+                }
+            }
 
             override fun seekToNext() {
                 app.container.playerController.next()
@@ -114,14 +188,42 @@ class PlaybackService : MediaSessionService() {
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
+    @OptIn(UnstableApi::class)
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        val app = application as LxPureApp
+        val controller = app.container.playerController
+        val player = session.player
+        val keepForeground = PlaybackRecoveryPolicy.shouldHoldForegroundDuringTransition(
+            isPlaybackOngoing = isPlaybackOngoing,
+            isTransitioningOrRecovering = controller.isTransitioningOrRecovering(),
+            playbackState = player.playbackState,
+            playWhenReady = player.playWhenReady,
+            willAutoAdvanceOnEnd = controller.willAutoAdvanceOnEnd(),
+            hasPlayerError = player.playerError != null,
+            canAutoRecoverFromError = controller.canAutoRecoverFromError()
+        )
+        if (!startInForegroundRequired && keepForeground) {
+            return
+        }
+        super.onUpdateNotification(session, startInForegroundRequired)
+    }
+
     override fun onTaskRemoved(rootIntent: Intent?) {
+        val app = application as LxPureApp
         val player = mediaSession?.player
-        if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
+        val keepAlive = isPlaybackOngoing ||
+            app.container.playerController.isTransitioningOrRecovering() ||
+            (player != null && player.playWhenReady && player.mediaItemCount > 0)
+        if (!keepAlive) {
             stopSelf()
         }
     }
 
     override fun onDestroy() {
+        if (activeInstance === this) {
+            activeInstance = null
+        }
+        exoPlayerRef = null
         mediaSession?.run {
             player.release()
             release()

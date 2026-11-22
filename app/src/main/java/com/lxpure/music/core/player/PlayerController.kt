@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
 import android.net.Uri
+import android.util.Log
 import androidx.compose.ui.graphics.Color
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -18,7 +19,9 @@ import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.lxpure.music.core.download.DownloadManager
 import com.lxpure.music.core.musicsdk.MusicAggregator
+import com.lxpure.music.core.network.EffectiveQualityDecision
 import com.lxpure.music.core.network.NetworkQualityAdvisor
+import com.lxpure.music.core.userapi.ResolvedStream
 import com.lxpure.music.core.userapi.UserApiManager
 import com.lxpure.music.data.local.SettingsDataStore
 import com.lxpure.music.data.repository.LibraryRepository
@@ -81,16 +84,36 @@ data class PlayerState(
     val activeLyricIndex: Int get() = lyrics.activeIndexAt(positionMs)
 }
 
+private data class PreloadedNextItem(
+    val forTrackId: String,
+    val nextIndex: Int,
+    val track: Track,
+    val mediaItem: MediaItem,
+    val qualityBadge: String,
+    val providerName: String,
+    val sourceId: String?,
+    val resolvedTrackId: String?,
+    val cacheKey: String?
+)
+
 class PlayerController(
     private val context: Context,
     private val imageLoader: ImageLoader,
     private val networkAdvisor: NetworkQualityAdvisor,
+    private val mediaCacheManager: MediaCacheManager,
     private val settingsDataStore: SettingsDataStore,
     private val libraryRepository: LibraryRepository,
     private val userApiManager: UserApiManager,
     private val musicAggregator: MusicAggregator,
     private val downloadManager: DownloadManager
 ) {
+    companion object {
+        private const val TAG = "PlayerController"
+        private const val PRELOAD_WINDOW_MS = 20_000L
+        private const val MIN_TRACK_DURATION_FOR_PRELOAD_MS = 25_000L
+        private const val STABLE_PLAYBACK_RESET_DELTA_MS = 8_000L
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private val _state = MutableStateFlow(PlayerState())
@@ -101,26 +124,77 @@ class PlayerController(
 
     private var mediaController: MediaController? = null
     private var resolveJob: Job? = null
+    private var recoveryDelayJob: Job? = null
+    private var preloadJob: Job? = null
     private var coverJob: Job? = null
     private var lyricJob: Job? = null
     private var paletteJob: Job? = null
     private var sleepTimerJob: Job? = null
     private var isConnecting = false
 
-    // Guards against stale progress flicker & false auto-advance when switching or failing tracks
+    // Guards against stale progress flicker, false auto-advance, and premature FGS demotion
+    @Volatile
     private var isAwaitingMediaLoad = false
+    @Volatile
+    private var isRecoveringError = false
     private var hasEnteredReadyForActiveMedia = false
     private var activeExpectedMediaId: String? = null
 
-    // Tracks failed sources & playback retries for the currently playing song to guarantee seamless runtime failover
+    // Tracks failed sources & playback retries for the currently playing song
     private var activeStreamSourceId: String? = null
     private var activeResolvedTrackId: String? = null
+    private var activeCacheKey: String? = null
+    private var pendingResumePositionMs: Long = 0L
+    private var lastRecoveryStartPositionMs: Long = 0L
     private val failedSourceIdsForCurrentTrack = mutableSetOf<String>()
     private val failedTrackIdsForCurrentTrack = mutableSetOf<String>()
     private var runtimeRetryCount = 0
+    private var consecutiveAutoSkipCount = 0
+
+    // Gapless next-track preload state (eliminates STATE_ENDED between songs in background)
+    private var preloadAttemptedForTrackId: String? = null
+    private var preloadedNext: PreloadedNextItem? = null
 
     init {
         startProgressTicker()
+    }
+
+    /**
+     * Used by PlaybackService.onUpdateNotification to keep the mediaPlayback foreground service
+     * alive during async track URL resolution and mid-stream error recovery.
+     */
+    fun isTransitioningOrRecovering(): Boolean = isAwaitingMediaLoad || isRecoveringError
+
+    fun willAutoAdvanceOnEnd(): Boolean = _state.value.queue.isNotEmpty()
+
+    fun canAutoRecoverFromError(): Boolean {
+        val track = _state.value.currentTrack ?: return false
+        return !track.isLocal && runtimeRetryCount < PlaybackRecoveryPolicy.MAX_RUNTIME_RETRIES
+    }
+
+    /**
+     * Called when the user explicitly taps Pause from notification / lock screen / Bluetooth
+     * while an async track transition or error recovery is in progress.
+     */
+    fun onExternalPauseRequested() {
+        if (isAwaitingMediaLoad || isRecoveringError) {
+            recoveryDelayJob?.cancel()
+            resolveJob?.cancel()
+            isAwaitingMediaLoad = false
+            isRecoveringError = false
+            _state.update { it.copy(isBuffering = false, isPlaying = false) }
+            PlaybackService.refreshNotificationIfNeeded()
+        }
+    }
+
+    /**
+     * Called when Play is requested from lock screen / Bluetooth after playback stopped or errored.
+     */
+    fun resumeOrReloadCurrent() {
+        val idx = _state.value.currentIndex
+        if (idx >= 0) {
+            loadAndPlayIndex(idx, resumePositionMs = pendingResumePositionMs)
+        }
     }
 
     private suspend fun ensureController(): MediaController? {
@@ -137,6 +211,11 @@ class PlayerController(
             val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
             val controller = MediaController.Builder(context, token).buildAsync().await()
             attachPlayerListener(controller)
+            controller.repeatMode = if (_state.value.repeatMode == RepeatMode.SINGLE_LOOP) {
+                Player.REPEAT_MODE_ONE
+            } else {
+                Player.REPEAT_MODE_OFF
+            }
             mediaController = controller
             controller
         } catch (t: Throwable) {
@@ -154,6 +233,18 @@ class PlayerController(
                 _state.update { it.copy(isPlaying = isPlaying) }
             }
 
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                if (isAwaitingMediaLoad) return
+                val next = preloadedNext ?: return
+                if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO &&
+                    mediaItem != null &&
+                    mediaItem.mediaId == next.track.id
+                ) {
+                    Log.d(TAG, "Gapless auto-transition to ${next.track.title}")
+                    promotePreloadedNextTrack(controller, next)
+                }
+            }
+
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (isAwaitingMediaLoad) return
                 val currentMediaId = controller.currentMediaItem?.mediaId
@@ -168,6 +259,8 @@ class PlayerController(
                     Player.STATE_READY -> {
                         if (matchesActiveTrack) {
                             hasEnteredReadyForActiveMedia = true
+                            isRecoveringError = false
+                            consecutiveAutoSkipCount = 0
                             val dur = controller.duration.takeIf { it > 0L } ?: _state.value.durationMs
                             _state.update { it.copy(isBuffering = false, durationMs = dur) }
                         }
@@ -181,7 +274,9 @@ class PlayerController(
                         }
                     }
                     Player.STATE_IDLE -> {
-                        _state.update { it.copy(isBuffering = false, isPlaying = false) }
+                        if (!isRecoveringError) {
+                            _state.update { it.copy(isBuffering = false, isPlaying = false) }
+                        }
                     }
                 }
             }
@@ -191,28 +286,151 @@ class PlayerController(
                 hasEnteredReadyForActiveMedia = false
                 val curIdx = _state.value.currentIndex
                 val curTrack = _state.value.currentTrack
-                if (curTrack != null && !curTrack.isLocal && runtimeRetryCount < 3) {
-                    activeStreamSourceId?.let { failedSourceIdsForCurrentTrack.add(it) }
-                    activeResolvedTrackId?.let { failedTrackIdsForCurrentTrack.add(it) }
+                val livePos = controller.currentPosition.coerceAtLeast(0L)
+                val resumePos = maxOf(livePos, _state.value.positionMs)
+                pendingResumePositionMs = resumePos
+
+                val errorKind = PlaybackRecoveryPolicy.classifyPlaybackException(error)
+                Log.w(
+                    TAG,
+                    "Playback error (${error.errorCodeName}, kind=$errorKind) on ${curTrack?.title} at ${resumePos}ms: ${error.message}"
+                )
+
+                if (curTrack != null && !curTrack.isLocal && runtimeRetryCount < PlaybackRecoveryPolicy.MAX_RUNTIME_RETRIES) {
+                    val attempt = runtimeRetryCount
                     runtimeRetryCount++
-                    emitMessage("音频流异常，正在自动切换备用音源重试…")
-                    loadAndPlayIndex(curIdx, isRuntimeFallbackRetry = true)
+                    val plan = PlaybackRecoveryPolicy.decideRecovery(
+                        kind = errorKind,
+                        retryAttemptIndex = attempt,
+                        primaryTrackId = curTrack.id,
+                        resolvedTrackId = activeResolvedTrackId
+                    )
+                    isRecoveringError = true
+                    clearPreloadedNext(removeFromPlayer = true)
+
+                    if (plan.evictStreamCache) {
+                        mediaCacheManager.removeCacheKey(activeCacheKey)
+                    }
+                    if (plan.excludeCurrentSource) {
+                        activeStreamSourceId?.let { failedSourceIdsForCurrentTrack.add(it) }
+                    }
+                    if (plan.excludeResolvedTrack) {
+                        activeResolvedTrackId?.let { failedTrackIdsForCurrentTrack.add(it) }
+                    }
+
+                    val preferredSource = if (plan.preferSameSourceFirst) activeStreamSourceId else null
+                    val targetPos = if (plan.preservePosition) resumePos else 0L
+                    lastRecoveryStartPositionMs = targetPos
+
+                    _state.update { it.copy(isBuffering = true, isPlaying = false, positionMs = targetPos) }
+                    when (plan.kind) {
+                        PlaybackErrorKind.TRANSIENT_NETWORK ->
+                            emitMessage("网络波动，正在自动恢复播放…")
+                        PlaybackErrorKind.EXPIRED_OR_DENIED_URL ->
+                            emitMessage("音频链接已刷新，正在无缝续播…")
+                        PlaybackErrorKind.STREAM_OR_SOURCE_BROKEN ->
+                            emitMessage("音频流异常，正在自动切换备用音源续播…")
+                    }
+
+                    recoveryDelayJob?.cancel()
+                    resolveJob?.cancel()
+                    recoveryDelayJob = scope.launch {
+                        delay(plan.backoffMs)
+                        if (plan.kind == PlaybackErrorKind.TRANSIENT_NETWORK && !networkAdvisor.isNetworkConnected()) {
+                            // Wait up to 8s for Wi-Fi <-> 5G handoff to settle before resolving
+                            repeat(16) {
+                                if (networkAdvisor.isNetworkConnected()) return@repeat
+                                delay(500L)
+                            }
+                        }
+                        if (!isActive || _state.value.currentTrack?.id != curTrack.id) return@launch
+                        loadAndPlayIndex(
+                            index = curIdx,
+                            preferredSourceId = preferredSource,
+                            isRuntimeFallbackRetry = true,
+                            resumePositionMs = targetPos
+                        )
+                    }
                 } else {
-                    _state.update { it.copy(isBuffering = false, isPlaying = false) }
-                    emitMessage("当前曲目播放失败，可尝试切换音质或手动下一首")
+                    isRecoveringError = false
+                    isAwaitingMediaLoad = false
+                    _state.update { it.copy(isBuffering = false, isPlaying = false, positionMs = resumePos) }
+                    PlaybackService.refreshNotificationIfNeeded()
+                    val msg = if (errorKind == PlaybackErrorKind.TRANSIENT_NETWORK) {
+                        "网络波动导致播放中断，恢复网络后点击播放可从原位置继续"
+                    } else {
+                        "当前曲目播放失败，可尝试切换音质或手动下一首"
+                    }
+                    emitMessage(msg)
                 }
             }
         })
     }
 
+    private fun promotePreloadedNextTrack(controller: MediaController, next: PreloadedNextItem) {
+        val currentQueue = _state.value.queue
+        val validIdx = if (next.nextIndex in currentQueue.indices && currentQueue[next.nextIndex].id == next.track.id) {
+            next.nextIndex
+        } else {
+            currentQueue.indexOfFirst { it.id == next.track.id }
+        }
+        preloadedNext = null
+        preloadAttemptedForTrackId = null
+        if (validIdx < 0) return
+
+        // Trim the finished track from ExoPlayer so memory stays strictly bounded to 1-2 items
+        if (controller.mediaItemCount > 1 && controller.currentMediaItemIndex > 0) {
+            runCatching { controller.removeMediaItems(0, controller.currentMediaItemIndex) }
+        }
+
+        activeExpectedMediaId = next.track.id
+        hasEnteredReadyForActiveMedia = true
+        activeStreamSourceId = next.sourceId
+        activeResolvedTrackId = next.resolvedTrackId
+        activeCacheKey = next.cacheKey
+        pendingResumePositionMs = 0L
+        lastRecoveryStartPositionMs = 0L
+        runtimeRetryCount = 0
+        consecutiveAutoSkipCount = 0
+        failedSourceIdsForCurrentTrack.clear()
+        failedTrackIdsForCurrentTrack.clear()
+
+        val dur = controller.duration.takeIf { it > 0L } ?: next.track.durationMs
+        _state.update {
+            it.copy(
+                currentIndex = validIdx,
+                isPlaying = controller.isPlaying || controller.playWhenReady,
+                isBuffering = false,
+                positionMs = controller.currentPosition.coerceAtLeast(0L),
+                durationMs = dur,
+                activeQualityBadge = next.qualityBadge,
+                activeProviderName = next.providerName,
+                lyrics = ParsedLyrics(),
+                isLoadingLyrics = true
+            )
+        }
+
+        loadLyricsAsync(next.track)
+        if (!next.track.coverUrl.isNullOrBlank()) {
+            extractAmbientPaletteAsync(next.track.coverUrl)
+        } else {
+            resolveCoverAsync(validIdx, next.track)
+        }
+        scope.launch(Dispatchers.IO) {
+            libraryRepository.recordPlay(next.track)
+        }
+    }
+
     fun playTracks(tracks: List<Track>, startIndex: Int = 0) {
         if (tracks.isEmpty()) return
         val clamped = startIndex.coerceIn(0, tracks.lastIndex)
+        clearPreloadedNext(removeFromPlayer = true)
         _state.update { it.copy(queue = tracks, currentIndex = clamped) }
         loadAndPlayIndex(clamped)
     }
 
     fun playSingle(track: Track) {
+        clearPreloadedNext(removeFromPlayer = true)
         val currentQueue = _state.value.queue.toMutableList()
         val existingIdx = currentQueue.indexOfFirst { it.id == track.id }
         if (existingIdx >= 0) {
@@ -227,6 +445,7 @@ class PlayerController(
     }
 
     fun playNextInQueue(track: Track) {
+        clearPreloadedNext(removeFromPlayer = true)
         val currentQueue = _state.value.queue.toMutableList()
         if (currentQueue.isEmpty()) {
             playTracks(listOf(track), 0)
@@ -249,17 +468,21 @@ class PlayerController(
     }
 
     fun removeFromQueue(index: Int) {
+        clearPreloadedNext(removeFromPlayer = true)
         val queue = _state.value.queue.toMutableList()
         if (index !in queue.indices) return
         val cur = _state.value.currentIndex
         queue.removeAt(index)
         when {
             queue.isEmpty() -> {
+                recoveryDelayJob?.cancel()
                 resolveJob?.cancel()
                 coverJob?.cancel()
                 isAwaitingMediaLoad = false
+                isRecoveringError = false
                 hasEnteredReadyForActiveMedia = false
                 activeExpectedMediaId = null
+                pendingResumePositionMs = 0L
                 mediaController?.stop()
                 mediaController?.clearMediaItems()
                 _state.update {
@@ -273,6 +496,7 @@ class PlayerController(
                         lyrics = ParsedLyrics()
                     )
                 }
+                PlaybackService.refreshNotificationIfNeeded()
             }
             index < cur -> _state.update { it.copy(queue = queue, currentIndex = cur - 1) }
             index == cur -> {
@@ -285,11 +509,15 @@ class PlayerController(
     }
 
     fun clearQueue() {
+        clearPreloadedNext(removeFromPlayer = false)
+        recoveryDelayJob?.cancel()
         resolveJob?.cancel()
         coverJob?.cancel()
         isAwaitingMediaLoad = false
+        isRecoveringError = false
         hasEnteredReadyForActiveMedia = false
         activeExpectedMediaId = null
+        pendingResumePositionMs = 0L
         mediaController?.stop()
         mediaController?.clearMediaItems()
         _state.update {
@@ -303,21 +531,29 @@ class PlayerController(
                 lyrics = ParsedLyrics()
             )
         }
+        PlaybackService.refreshNotificationIfNeeded()
     }
 
     fun togglePlayPause() {
         val ctrl = mediaController
         if (ctrl == null) {
             val idx = _state.value.currentIndex
-            if (idx >= 0) loadAndPlayIndex(idx)
+            if (idx >= 0) loadAndPlayIndex(idx, resumePositionMs = pendingResumePositionMs)
             return
         }
-        if (isAwaitingMediaLoad) return
+        if (isAwaitingMediaLoad || isRecoveringError) {
+            onExternalPauseRequested()
+            ctrl.pause()
+            return
+        }
         if (ctrl.isPlaying) {
             ctrl.pause()
         } else {
-            if (ctrl.mediaItemCount == 0 && _state.value.currentIndex >= 0) {
-                loadAndPlayIndex(_state.value.currentIndex)
+            val needsReload = ctrl.mediaItemCount == 0 ||
+                ctrl.playerError != null ||
+                ctrl.playbackState == Player.STATE_IDLE
+            if (needsReload && _state.value.currentIndex >= 0) {
+                loadAndPlayIndex(_state.value.currentIndex, resumePositionMs = pendingResumePositionMs)
             } else {
                 ctrl.play()
             }
@@ -327,6 +563,7 @@ class PlayerController(
     fun seekTo(positionMs: Long) {
         if (isAwaitingMediaLoad) return
         val clamped = positionMs.coerceAtLeast(0L)
+        pendingResumePositionMs = clamped
         mediaController?.seekTo(clamped)
         _state.update { it.copy(positionMs = clamped) }
     }
@@ -335,21 +572,76 @@ class PlayerController(
     fun hasPrevious(): Boolean = _state.value.queue.size > 1
 
     fun next() {
+        nextInternal(isAutoAdvance = false)
+    }
+
+    private fun nextInternal(isAutoAdvance: Boolean) {
         val st = _state.value
         if (st.queue.isEmpty()) return
-        val nextIdx = when (st.repeatMode) {
-            RepeatMode.SHUFFLE -> {
-                if (st.queue.size == 1) 0
-                else {
-                    var candidate = Random.nextInt(st.queue.size)
-                    if (candidate == st.currentIndex) candidate = (candidate + 1) % st.queue.size
-                    candidate
-                }
-            }
-            else -> (st.currentIndex + 1) % st.queue.size
+        if (!isAutoAdvance) {
+            consecutiveAutoSkipCount = 0
         }
+
+        // Fast-path: if the next track was already preloaded for the current song, play it directly with 0ms resolve
+        val readyNext = preloadedNext
+        val preloadedUri = readyNext?.mediaItem?.localConfiguration?.uri
+        if (readyNext != null &&
+            preloadedUri != null &&
+            readyNext.forTrackId == st.currentTrack?.id &&
+            readyNext.nextIndex in st.queue.indices &&
+            st.queue[readyNext.nextIndex].id == readyNext.track.id
+        ) {
+            clearPreloadedNext(removeFromPlayer = false)
+            recoveryDelayJob?.cancel()
+            resolveJob?.cancel()
+            coverJob?.cancel()
+            isAwaitingMediaLoad = true
+            hasEnteredReadyForActiveMedia = false
+            activeExpectedMediaId = readyNext.track.id
+            activeStreamSourceId = readyNext.sourceId
+            activeResolvedTrackId = readyNext.resolvedTrackId
+            failedSourceIdsForCurrentTrack.clear()
+            failedTrackIdsForCurrentTrack.clear()
+            runtimeRetryCount = 0
+            lastRecoveryStartPositionMs = 0L
+            pendingResumePositionMs = 0L
+            PlaybackService.silenceForTransition()
+
+            _state.update {
+                it.copy(
+                    currentIndex = readyNext.nextIndex,
+                    isPlaying = false,
+                    isBuffering = true,
+                    positionMs = 0L,
+                    durationMs = readyNext.track.durationMs,
+                    activeQualityBadge = readyNext.qualityBadge,
+                    activeProviderName = readyNext.providerName,
+                    lyrics = ParsedLyrics(),
+                    isLoadingLyrics = true
+                )
+            }
+            loadLyricsAsync(readyNext.track)
+            if (!readyNext.track.coverUrl.isNullOrBlank()) {
+                extractAmbientPaletteAsync(readyNext.track.coverUrl)
+            } else {
+                resolveCoverAsync(readyNext.nextIndex, readyNext.track)
+            }
+            resolveJob = scope.launch {
+                startPlaybackOnMedia3(
+                    track = readyNext.track,
+                    mediaUri = preloadedUri,
+                    qualityBadge = readyNext.qualityBadge,
+                    providerName = readyNext.providerName,
+                    cacheKey = readyNext.cacheKey,
+                    startPositionMs = 0L
+                )
+            }
+            return
+        }
+
+        val nextIdx = computeNextIndex(st)
         _state.update { it.copy(currentIndex = nextIdx) }
-        loadAndPlayIndex(nextIdx)
+        loadAndPlayIndex(nextIdx, isAutoAdvance = isAutoAdvance)
     }
 
     fun previous() {
@@ -360,19 +652,37 @@ class PlayerController(
             seekTo(0L)
             return
         }
+        consecutiveAutoSkipCount = 0
         val prevIdx = if (st.currentIndex <= 0) st.queue.lastIndex else st.currentIndex - 1
         _state.update { it.copy(currentIndex = prevIdx) }
         loadAndPlayIndex(prevIdx)
     }
 
     fun cycleRepeatMode() {
-        _state.update { it.copy(repeatMode = it.repeatMode.next()) }
+        val nextMode = _state.value.repeatMode.next()
+        _state.update { it.copy(repeatMode = nextMode) }
+        mediaController?.let { ctrl ->
+            if (ctrl.isConnected) {
+                ctrl.repeatMode = if (nextMode == RepeatMode.SINGLE_LOOP) {
+                    Player.REPEAT_MODE_ONE
+                } else {
+                    Player.REPEAT_MODE_OFF
+                }
+            }
+        }
+        clearPreloadedNext(removeFromPlayer = true)
     }
 
     fun retryWithQuality(quality: AudioQuality, preferredSourceId: String? = null) {
         val idx = _state.value.currentIndex
         if (idx >= 0) {
-            loadAndPlayIndex(idx, qualityOverride = quality, preferredSourceId = preferredSourceId)
+            val curPos = mediaController?.currentPosition?.coerceAtLeast(0L) ?: _state.value.positionMs
+            loadAndPlayIndex(
+                index = idx,
+                qualityOverride = quality,
+                preferredSourceId = preferredSourceId,
+                resumePositionMs = curPos
+            )
         }
     }
 
@@ -393,10 +703,23 @@ class PlayerController(
                 remaining -= 1_000L
                 _state.update { it.copy(sleepTimerRemainingMs = remaining.coerceAtLeast(0L)) }
             }
+            onExternalPauseRequested()
             mediaController?.pause()
             _state.update { it.copy(sleepTimerRemainingMs = null) }
             emitMessage("睡眠定时已到，已暂停播放")
         }
+    }
+
+    private fun computeNextIndex(st: PlayerState): Int = when (st.repeatMode) {
+        RepeatMode.SHUFFLE -> {
+            if (st.queue.size == 1) 0
+            else {
+                var candidate = Random.nextInt(st.queue.size)
+                if (candidate == st.currentIndex) candidate = (candidate + 1) % st.queue.size
+                candidate
+            }
+        }
+        else -> (st.currentIndex + 1) % st.queue.size
     }
 
     private fun handleTrackEnded() {
@@ -404,51 +727,174 @@ class PlayerController(
         if (st.queue.isEmpty()) return
         if (st.repeatMode == RepeatMode.SINGLE_LOOP) {
             hasEnteredReadyForActiveMedia = true
-            seekTo(0L)
+            mediaController?.seekTo(0L)
             mediaController?.play()
         } else {
-            next()
+            nextInternal(isAutoAdvance = true)
         }
+    }
+
+    private fun clearPreloadedNext(removeFromPlayer: Boolean) {
+        preloadJob?.cancel()
+        preloadJob = null
+        preloadedNext = null
+        preloadAttemptedForTrackId = null
+        if (removeFromPlayer) {
+            mediaController?.let { ctrl ->
+                if (ctrl.isConnected && ctrl.mediaItemCount > ctrl.currentMediaItemIndex + 1) {
+                    runCatching {
+                        ctrl.removeMediaItems(ctrl.currentMediaItemIndex + 1, ctrl.mediaItemCount)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun schedulePreloadNextTrack(currentTrackId: String, snapshot: PlayerState) {
+        if (snapshot.queue.size <= 1 || snapshot.repeatMode == RepeatMode.SINGLE_LOOP) return
+        val nextIdx = computeNextIndex(snapshot)
+        if (nextIdx == snapshot.currentIndex) return
+        val nextTrack = snapshot.queue.getOrNull(nextIdx) ?: return
+
+        preloadAttemptedForTrackId = currentTrackId
+        preloadJob?.cancel()
+        preloadJob = scope.launch {
+            val built = resolveTrackToPreparedItem(
+                track = nextTrack,
+                qualityOverride = null,
+                preferredSourceId = null,
+                excludedSourceIds = emptySet(),
+                excludedTrackIds = emptySet()
+            ) ?: return@launch
+
+            if (!isActive || isAwaitingMediaLoad || _state.value.currentTrack?.id != currentTrackId) return@launch
+            if (_state.value.repeatMode == RepeatMode.SINGLE_LOOP) return@launch
+            val ctrl = mediaController ?: return@launch
+            if (!ctrl.isConnected || ctrl.currentMediaItem?.mediaId != currentTrackId) return@launch
+
+            // Ensure no stale preloaded items linger after the active item
+            if (ctrl.mediaItemCount > ctrl.currentMediaItemIndex + 1) {
+                runCatching { ctrl.removeMediaItems(ctrl.currentMediaItemIndex + 1, ctrl.mediaItemCount) }
+            }
+            ctrl.addMediaItem(built.mediaItem)
+            preloadedNext = built.copy(forTrackId = currentTrackId, nextIndex = nextIdx)
+            Log.d(TAG, "Preloaded gapless next track: ${nextTrack.title} [${built.qualityBadge}]")
+        }
+    }
+
+    private suspend fun resolveTrackToPreparedItem(
+        track: Track,
+        qualityOverride: AudioQuality?,
+        preferredSourceId: String?,
+        excludedSourceIds: Set<String>,
+        excludedTrackIds: Set<String>
+    ): PreloadedNextItem? {
+        if (!track.localUri.isNullOrBlank()) {
+            val item = buildMediaItem(track, Uri.parse(track.localUri), cacheKey = null)
+            return PreloadedNextItem(
+                forTrackId = "",
+                nextIndex = -1,
+                track = track,
+                mediaItem = item,
+                qualityBadge = "LOCAL",
+                providerName = "本地音频",
+                sourceId = null,
+                resolvedTrackId = track.id,
+                cacheKey = null
+            )
+        }
+        val cachedPath = downloadManager.getLocalCachedPath(track.id)
+            ?: track.cachedFilePath?.takeIf { File(it).exists() }
+        if (!cachedPath.isNullOrBlank()) {
+            val item = buildMediaItem(track, Uri.fromFile(File(cachedPath)), cacheKey = null)
+            return PreloadedNextItem(
+                forTrackId = "",
+                nextIndex = -1,
+                track = track,
+                mediaItem = item,
+                qualityBadge = "离线",
+                providerName = "离线缓存",
+                sourceId = null,
+                resolvedTrackId = track.id,
+                cacheKey = null
+            )
+        }
+        val settings: AppSettings = settingsDataStore.settings.first()
+        val qualityDecision = if (qualityOverride != null) {
+            EffectiveQualityDecision(qualityOverride, downgradedForCellular = false)
+        } else {
+            networkAdvisor.decideQuality(settings.preferredQuality, settings.wifiOnlyHighQuality)
+        }
+        val resolved: ResolvedStream = userApiManager.resolveStream(
+            track = track,
+            preferredQuality = qualityDecision.quality,
+            allowCrossPlatformFallback = settings.autoFallbackSource,
+            preferredSourceId = preferredSourceId,
+            excludedSourceIds = excludedSourceIds,
+            excludedTrackIds = excludedTrackIds
+        ).getOrNull() ?: return null
+
+        val qualityBadge = if (qualityDecision.downgradedForCellular) {
+            "${resolved.quality.badge} · 省流"
+        } else {
+            resolved.quality.badge
+        }
+        val cacheKey = "${track.id}_${resolved.quality.lxType}"
+        val item = buildMediaItem(track, Uri.parse(resolved.url), cacheKey = cacheKey)
+        return PreloadedNextItem(
+            forTrackId = "",
+            nextIndex = -1,
+            track = track,
+            mediaItem = item,
+            qualityBadge = qualityBadge,
+            providerName = resolved.providerName,
+            sourceId = resolved.sourceId,
+            resolvedTrackId = resolved.resolvedTrack.id,
+            cacheKey = cacheKey
+        )
     }
 
     private fun loadAndPlayIndex(
         index: Int,
         qualityOverride: AudioQuality? = null,
         preferredSourceId: String? = null,
-        isRuntimeFallbackRetry: Boolean = false
+        isRuntimeFallbackRetry: Boolean = false,
+        resumePositionMs: Long = 0L,
+        isAutoAdvance: Boolean = false
     ) {
         val track = _state.value.queue.getOrNull(index) ?: return
+        recoveryDelayJob?.cancel()
         resolveJob?.cancel()
         coverJob?.cancel()
+        clearPreloadedNext(removeFromPlayer = false)
 
-        // Immediately stop any previous track so old STATE_ENDED / old position never leak into the new track
+        // Mark awaiting BEFORE silencing previous audio so PlaybackService NEVER drops
+        // out of foreground service status while the next track URL is resolving.
         isAwaitingMediaLoad = true
         hasEnteredReadyForActiveMedia = false
         activeExpectedMediaId = track.id
-        mediaController?.let { ctrl ->
-            if (ctrl.isConnected) {
-                ctrl.stop()
-                ctrl.clearMediaItems()
-            }
-        }
+        PlaybackService.silenceForTransition()
 
         if (!isRuntimeFallbackRetry) {
             failedSourceIdsForCurrentTrack.clear()
             failedTrackIdsForCurrentTrack.clear()
             activeStreamSourceId = null
             activeResolvedTrackId = null
+            activeCacheKey = null
             runtimeRetryCount = 0
+            lastRecoveryStartPositionMs = resumePositionMs
         }
+        pendingResumePositionMs = resumePositionMs
 
         _state.update {
             it.copy(
                 currentIndex = index,
                 isPlaying = false,
                 isBuffering = true,
-                positionMs = 0L,
-                durationMs = track.durationMs,
-                activeQualityBadge = track.bestQualityBadge,
-                activeProviderName = null,
+                positionMs = resumePositionMs,
+                durationMs = if (isRuntimeFallbackRetry && it.durationMs > 0L) it.durationMs else track.durationMs,
+                activeQualityBadge = if (isRuntimeFallbackRetry) it.activeQualityBadge else track.bestQualityBadge,
+                activeProviderName = if (isRuntimeFallbackRetry) it.activeProviderName else null,
                 lyrics = if (isRuntimeFallbackRetry) it.lyrics else ParsedLyrics(),
                 isLoadingLyrics = !isRuntimeFallbackRetry
             )
@@ -473,7 +919,8 @@ class PlayerController(
                     track = activeTrack,
                     mediaUri = Uri.parse(activeTrack.localUri),
                     qualityBadge = "LOCAL",
-                    providerName = "本地音频"
+                    providerName = "本地音频",
+                    startPositionMs = resumePositionMs
                 )
                 return@launch
             }
@@ -486,7 +933,8 @@ class PlayerController(
                     track = activeTrack,
                     mediaUri = Uri.fromFile(File(cachedPath)),
                     qualityBadge = "离线",
-                    providerName = "离线缓存"
+                    providerName = "离线缓存",
+                    startPositionMs = resumePositionMs
                 )
                 return@launch
             }
@@ -494,7 +942,7 @@ class PlayerController(
             // 3. Resolve online stream via LX QuickJS custom sources (network-aware quality + concurrent racing)
             val settings: AppSettings = settingsDataStore.settings.first()
             val qualityDecision = if (qualityOverride != null) {
-                com.lxpure.music.core.network.EffectiveQualityDecision(qualityOverride, downgradedForCellular = false)
+                EffectiveQualityDecision(qualityOverride, downgradedForCellular = false)
             } else {
                 networkAdvisor.decideQuality(settings.preferredQuality, settings.wifiOnlyHighQuality)
             }
@@ -528,12 +976,33 @@ class PlayerController(
                     mediaUri = Uri.parse(resolved.url),
                     qualityBadge = qualityBadge,
                     providerName = resolved.providerName,
-                    cacheKey = "${latestTrack.id}_${resolved.quality.lxType}"
+                    cacheKey = "${latestTrack.id}_${resolved.quality.lxType}",
+                    startPositionMs = resumePositionMs
                 )
             }.onFailure { err ->
+                // During background playlist auto-advance, automatically skip up to 3 dead tracks while online
+                if (isAutoAdvance &&
+                    networkAdvisor.isNetworkConnected() &&
+                    _state.value.queue.size > 1 &&
+                    consecutiveAutoSkipCount < PlaybackRecoveryPolicy.MAX_CONSECUTIVE_AUTO_SKIPS
+                ) {
+                    consecutiveAutoSkipCount++
+                    emitMessage("《${latestTrack.title}》暂无可用音源，已自动跳至下一首")
+                    nextInternal(isAutoAdvance = true)
+                    return@launch
+                }
+
                 isAwaitingMediaLoad = false
+                isRecoveringError = false
                 hasEnteredReadyForActiveMedia = false
-                _state.update { it.copy(isBuffering = false, isPlaying = false, positionMs = 0L) }
+                _state.update {
+                    it.copy(
+                        isBuffering = false,
+                        isPlaying = false,
+                        positionMs = resumePositionMs
+                    )
+                }
+                PlaybackService.refreshNotificationIfNeeded()
                 val noSource = !userApiManager.hasReadySource()
                 _events.tryEmit(
                     PlayerUiEvent(
@@ -568,19 +1037,7 @@ class PlayerController(
         }
     }
 
-    private suspend fun startPlaybackOnMedia3(
-        track: Track,
-        mediaUri: Uri,
-        qualityBadge: String,
-        providerName: String,
-        cacheKey: String? = null
-    ) {
-        val controller = ensureController() ?: run {
-            isAwaitingMediaLoad = false
-            hasEnteredReadyForActiveMedia = false
-            _state.update { it.copy(isBuffering = false, isPlaying = false) }
-            return
-        }
+    private fun buildMediaItem(track: Track, mediaUri: Uri, cacheKey: String?): MediaItem {
         val metadata = MediaMetadata.Builder()
             .setTitle(track.title)
             .setArtist(track.artist)
@@ -590,7 +1047,7 @@ class PlayerController(
             }
             .build()
 
-        val mediaItem = MediaItem.Builder()
+        return MediaItem.Builder()
             .setMediaId(track.id)
             .setUri(mediaUri)
             .apply {
@@ -598,20 +1055,52 @@ class PlayerController(
             }
             .setMediaMetadata(metadata)
             .build()
+    }
+
+    private suspend fun startPlaybackOnMedia3(
+        track: Track,
+        mediaUri: Uri,
+        qualityBadge: String,
+        providerName: String,
+        cacheKey: String? = null,
+        startPositionMs: Long = 0L
+    ) {
+        val controller = ensureController() ?: run {
+            isAwaitingMediaLoad = false
+            isRecoveringError = false
+            hasEnteredReadyForActiveMedia = false
+            _state.update { it.copy(isBuffering = false, isPlaying = false) }
+            PlaybackService.refreshNotificationIfNeeded()
+            return
+        }
+
+        val mediaItem = buildMediaItem(track, mediaUri, cacheKey)
 
         activeExpectedMediaId = track.id
+        activeCacheKey = cacheKey
         hasEnteredReadyForActiveMedia = false
         isAwaitingMediaLoad = false
+        isRecoveringError = false
+        pendingResumePositionMs = startPositionMs
 
         _state.update {
             it.copy(
                 activeQualityBadge = qualityBadge,
                 activeProviderName = providerName,
-                positionMs = 0L
+                positionMs = startPositionMs
             )
         }
 
-        controller.setMediaItem(mediaItem)
+        controller.repeatMode = if (_state.value.repeatMode == RepeatMode.SINGLE_LOOP) {
+            Player.REPEAT_MODE_ONE
+        } else {
+            Player.REPEAT_MODE_OFF
+        }
+        if (startPositionMs > 0L) {
+            controller.setMediaItem(mediaItem, startPositionMs)
+        } else {
+            controller.setMediaItem(mediaItem)
+        }
         controller.prepare()
         controller.play()
 
@@ -692,6 +1181,28 @@ class PlayerController(
                         val dur = ctrl.duration.takeIf { it > 0L } ?: _state.value.durationMs
                         if (pos != _state.value.positionMs || dur != _state.value.durationMs) {
                             _state.update { it.copy(positionMs = pos, durationMs = dur) }
+                        }
+
+                        // Once playback progresses stably by 8s after a recovery, restore fresh retry budget
+                        if (runtimeRetryCount > 0 && pos >= lastRecoveryStartPositionMs + STABLE_PLAYBACK_RESET_DELTA_MS) {
+                            runtimeRetryCount = 0
+                            failedSourceIdsForCurrentTrack.clear()
+                            failedTrackIdsForCurrentTrack.clear()
+                        }
+
+                        // Pre-resolve the next track in the final 20s so transitions happen gaplessly
+                        // inside ExoPlayer (0 wasted data if skipped early, never enters STATE_ENDED)
+                        val st = _state.value
+                        val curTrack = st.currentTrack
+                        if (curTrack != null &&
+                            st.repeatMode != RepeatMode.SINGLE_LOOP &&
+                            st.queue.size > 1 &&
+                            dur >= MIN_TRACK_DURATION_FOR_PRELOAD_MS &&
+                            (dur - pos) in 1_000L..PRELOAD_WINDOW_MS &&
+                            preloadAttemptedForTrackId != curTrack.id &&
+                            preloadJob?.isActive != true
+                        ) {
+                            schedulePreloadNextTrack(curTrack.id, st)
                         }
                     }
                     delay(300L)

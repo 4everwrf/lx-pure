@@ -15,6 +15,16 @@ class NetworkQualityAdvisor(context: Context) {
         context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
 
     /**
+     * Returns true when the device currently has an active internet-capable network.
+     */
+    fun isNetworkConnected(): Boolean {
+        val cm = connectivityManager ?: return true
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    /**
      * Returns true when active network is metered (typically 4G/5G cellular or hotspot).
      */
     fun isMeteredNetwork(): Boolean {

@@ -1,0 +1,177 @@
+name: Auto Release APK
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional tag override (leave empty to use versionName from app/build.gradle.kts)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release-lx-pure
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine release tag and check if release already exists
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            VERSION=$(grep -oE 'versionName\s*=\s*"[^"]+"' app/build.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)"/\1/')
+            if [ -z "$VERSION" ]; then
+              echo "Failed to read versionName from app/build.gradle.kts" >&2
+              exit 1
+            fi
+            TAG="v${VERSION}"
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "release_exists=true" >> "$GITHUB_OUTPUT"
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "Release ${TAG} already exists; workflow_dispatch will rebuild and refresh assets."
+            else
+              echo "release_exists=true" >> "$GITHUB_OUTPUT"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "Release ${TAG} already exists; skipping auto-release. Bump versionName in app/build.gradle.kts or push a new v* tag to publish."
+            fi
+          else
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "New release detected: ${TAG}"
+          fi
+
+      - name: Set up JDK 17
+        if: steps.meta.outputs.should_release == 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        if: steps.meta.outputs.should_release == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        if: steps.meta.outputs.should_release == 'true'
+        run: chmod +x gradlew
+
+      - name: Run unit tests
+        if: steps.meta.outputs.should_release == 'true'
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Prepare release signing keystore
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            mkdir -p keystore
+            echo "$KEYSTORE_B64" | base64 -d > keystore/lx-pure-release.jks
+            echo "has_keystore=true" >> "$GITHUB_ENV"
+          else
+            echo "WARNING: RELEASE_KEYSTORE_BASE64 secret not configured; Release APK will fall back to debug signing." >&2
+            echo "has_keystore=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build signed Release APK
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          RELEASE_STORE_FILE: ${{ env.has_keystore == 'true' && 'keystore/lx-pure-release.jks' || '' }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Verify APK signature and generate checksums & release notes
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release_out
+          APK_NAME="lx-pure-${TAG}-release.apk"
+          cp app/build/outputs/apk/release/app-release.apk "release_out/${APK_NAME}"
+
+          APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -name apksigner | sort -V | tail -n 1)
+          CERT_INFO=$("$APKSIGNER" verify --print-certs "release_out/${APK_NAME}")
+          echo "$CERT_INFO"
+          CERT_SHA256=$(echo "$CERT_INFO" | grep -i "SHA-256 digest:" | head -n 1 | awk '{print $NF}')
+
+          (cd release_out && sha256sum "${APK_NAME}" > SHA256SUMS.txt)
+          APK_SHA256=$(awk '{print $1}' release_out/SHA256SUMS.txt)
+
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n 1 || true)
+          if [ -n "$PREV_TAG" ]; then
+            CHANGES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges)
+          else
+            CHANGES=$(git log -n 10 --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          if [ -z "$CHANGES" ]; then
+            CHANGES="- 常规维护与稳定性优化"
+          fi
+
+          cat > release_out/release_notes.md <<EOF
+          ## 轻雪音乐 (LX Pure) ${TAG}
+
+          ### 本版变更记录
+          ${CHANGES}
+
+          ### 重要提示
+          - 本安装包为**开源纯净版**，**不内置、不提供、不推荐任何第三方音源脚本或音频资源**。请自行导入合规的 \`.js\` 自定义源或扫描设备本地音乐使用。
+          - 使用正式 Release 证书签名，可从上一正式版直接覆盖升级并保留本地歌单、收藏与已导入音源。
+
+          ### 校验信息
+          - **APK 文件**: \`${APK_NAME}\`
+          - **SHA-256**: \`${APK_SHA256}\`
+          - **签名证书 SHA-256 指纹**: \`${CERT_SHA256}\`
+          EOF
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_EXISTS: ${{ steps.meta.outputs.release_exists }}
+        run: |
+          APK_PATH="release_out/lx-pure-${TAG}-release.apk"
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            gh release upload "$TAG" "$APK_PATH" release_out/SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --notes-file release_out/release_notes.md
+          else
+            gh release create "$TAG" "$APK_PATH" release_out/SHA256SUMS.txt \
+              --target "${GITHUB_SHA}" \
+              --title "${TAG}" \
+              --notes-file release_out/release_notes.md
+          fi
+
+      - name: Clean up temporary keystore
+        if: always()
+        run: rm -rf keystore release_out

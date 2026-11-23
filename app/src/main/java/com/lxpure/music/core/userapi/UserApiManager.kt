@@ -115,10 +115,34 @@ class UserApiManager(
 
     private val _sources = MutableStateFlow<List<UserApiSource>>(emptyList())
     val sources: StateFlow<List<UserApiSource>> = _sources.asStateFlow()
+    private val initialDbLoadDone = CompletableDeferred<Unit>()
 
     init {
         scope.launch {
-            reloadAllFromDatabase()
+            try {
+                reloadAllFromDatabase()
+            } finally {
+                initialDbLoadDone.complete(Unit)
+            }
+        }
+    }
+
+    /**
+     * Waits briefly during cold start so hitting Play right after launching the app
+     * waits for saved custom source runtimes to finish loading/initializing instead
+     * of falsely reporting "no available source".
+     */
+    suspend fun awaitInitialLoadIfNeeded(timeoutMs: Long = 4_000L) {
+        withTimeoutOrNull(timeoutMs) {
+            initialDbLoadDone.await()
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                val list = _sources.value
+                val hasReady = list.any { it.enabled && it.status == UserApiRuntimeStatus.READY }
+                val hasInitializing = list.any { it.enabled && it.status == UserApiRuntimeStatus.INITIALIZING }
+                if (hasReady || !hasInitializing) break
+                kotlinx.coroutines.delay(60L)
+            }
         }
     }
 
@@ -505,6 +529,7 @@ class UserApiManager(
         excludedSourceIds: Set<String> = emptySet(),
         excludedTrackIds: Set<String> = emptySet()
     ): Result<ResolvedStream> = withContext(Dispatchers.IO) {
+        awaitInitialLoadIfNeeded()
         val readySources = _sources.value
             .filter {
                 it.enabled &&

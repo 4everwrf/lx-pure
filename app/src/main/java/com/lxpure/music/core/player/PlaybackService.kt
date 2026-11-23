@@ -210,6 +210,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         val app = application as LxPureApp
+        app.container.playerController.persistSnapshotNow()
         val player = mediaSession?.player
         val keepAlive = isPlaybackOngoing ||
             app.container.playerController.isTransitioningOrRecovering() ||
@@ -220,6 +221,9 @@ class PlaybackService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        runCatching {
+            (application as? LxPureApp)?.container?.playerController?.persistSnapshotNow()
+        }
         if (activeInstance === this) {
             activeInstance = null
         }

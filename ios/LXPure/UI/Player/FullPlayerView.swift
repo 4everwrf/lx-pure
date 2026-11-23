@@ -100,6 +100,7 @@ struct FullPlayerView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
                     .animation(.easeInOut(duration: 0.25), value: showLyrics)
 
                     // Track info + Favorite + Download + Lyrics toggle
@@ -116,6 +117,7 @@ struct FullPlayerView: View {
                                     .lineLimit(1)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
 
                             Button {
                                 onToggleFavorite(track)
@@ -332,12 +334,14 @@ struct FullPlayerView: View {
             .contentShape(Rectangle())
             .onTapGesture { showLyrics = true }
             .gesture(
-                DragGesture(minimumDistance: 32)
+                DragGesture(minimumDistance: 36)
                     .onEnded { value in
-                        if abs(value.translation.width) > abs(value.translation.height) {
-                            if value.translation.width < -50 { onNext() }
-                            else if value.translation.width > 50 { onPrevious() }
-                        } else if value.translation.height > 90 {
+                        let dx = value.translation.width
+                        let dy = value.translation.height
+                        if abs(dx) > abs(dy) * 1.4 {
+                            if dx < -65 { onNext() }
+                            else if dx > 65 { onPrevious() }
+                        } else if dy > 95 {
                             onCollapse()
                         }
                     }

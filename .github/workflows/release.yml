@@ -339,7 +339,7 @@ jobs:
 
           ### 重要提示
           - Android 与 iOS 安装包均为**开源纯净版**，**不内置、不提供、不推荐任何第三方音源脚本或音频资源**。请自行导入合规的 \`.js\` 自定义源或导入本地音频使用。
-          - **Android**：使用正式 Release 证书签名，可从上一正式版直接覆盖升级并保留本地歌单、收藏与已导入音源。
+          - **Android**：使用正式 Release 证书签名，支持直接覆盖升级。
           - **iOS**：${IPA_SIGNED_MODE}，要求 iOS 16.0 及以上，支持通过巨魔（TrollStore）、AltStore、SideStore、Sideloadly 等工具安装，或使用 Xcode 打开 \`ios/\` 自行签名编译。
 
           ### 校验信息

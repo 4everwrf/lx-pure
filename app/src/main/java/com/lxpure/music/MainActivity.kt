@@ -2,7 +2,9 @@ package com.lxpure.music
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -65,6 +67,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
@@ -72,14 +75,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.lxpure.music.core.update.AppUpdateState
 import com.lxpure.music.domain.model.AppSettings
 import com.lxpure.music.domain.model.DownloadStatus
 import com.lxpure.music.domain.model.LeaderboardItem
 import com.lxpure.music.domain.model.OnlinePlaylist
+import com.lxpure.music.domain.model.PlaybackQueueSource
+import com.lxpure.music.domain.model.QueueSourceType
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.domain.model.UserApiRuntimeStatus
 import com.lxpure.music.domain.model.UserPlaylist
 import com.lxpure.music.ui.components.AddToPlaylistSheet
+import com.lxpure.music.ui.components.AppUpdateDialog
 import com.lxpure.music.ui.components.FloatingMiniPlayer
 import com.lxpure.music.ui.components.TrackActionSheet
 import com.lxpure.music.ui.discover.DiscoverScreen
@@ -97,6 +104,7 @@ import com.lxpure.music.ui.theme.FluidAmbientBackground
 import com.lxpure.music.ui.theme.LocalLxColors
 import com.lxpure.music.ui.theme.LxPureTheme
 import kotlinx.coroutines.launch
+import java.io.File
 
 private enum class BottomTab(val label: String, val icon: ImageVector) {
     LIBRARY("音乐库", Icons.Rounded.LibraryMusic),
@@ -126,6 +134,16 @@ class MainActivity : ComponentActivity() {
             LxPureRoot(container)
         }
     }
+
+    override fun onPause() {
+        super.onPause()
+        (application as? LxPureApp)?.container?.playerController?.persistSnapshotNow()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        (application as? LxPureApp)?.container?.playerController?.persistSnapshotNow()
+    }
 }
 
 @Composable
@@ -146,6 +164,7 @@ private fun LxPureRoot(container: AppContainer) {
     val searchHistory by container.libraryRepository.searchHistory.collectAsState(initial = emptyList())
     val localTracks by container.localMusicScanner.localTracks.collectAsState()
     val isScanningLocal by container.localMusicScanner.isScanning.collectAsState()
+    val updateState by container.appUpdateManager.state.collectAsState()
 
     var activeTab by remember { mutableStateOf(BottomTab.LIBRARY) }
     val backStack = remember { mutableStateListOf<SubRoute>() }
@@ -156,6 +175,8 @@ private fun LxPureRoot(container: AppContainer) {
     var isImportingPlaylist by remember { mutableStateOf(false) }
     var downloadedBytes by remember { mutableStateOf(0L) }
     var cacheBytes by remember { mutableStateOf(0L) }
+    var pendingInstallApkFile by remember { mutableStateOf<File?>(null) }
+    var autoLaunchedApkPath by remember { mutableStateOf<String?>(null) }
 
     val hasReadySource = remember(sources) {
         sources.any { it.enabled && it.status == UserApiRuntimeStatus.READY }
@@ -212,6 +233,83 @@ private fun LxPureRoot(container: AppContainer) {
         ActivityResultContracts.RequestPermission()
     ) { /* Notification permission optional */ }
 
+    fun openExternalUrl(url: String) {
+        runCatching {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        }.onFailure {
+            showToast("无法打开浏览器链接")
+        }
+    }
+
+    fun launchApkInstall(apkFile: File) {
+        container.playerController.persistSnapshotNow()
+        runCatching {
+            context.startActivity(container.appUpdateManager.buildInstallIntent(apkFile))
+        }.onFailure { err ->
+            showToast("无法调起系统安装器：${err.message ?: "请通过浏览器下载安装"}")
+        }
+    }
+
+    val unknownSourcesLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val pendingFile = pendingInstallApkFile
+        pendingInstallApkFile = null
+        if (pendingFile != null && pendingFile.exists()) {
+            if (container.appUpdateManager.canRequestPackageInstalls()) {
+                launchApkInstall(pendingFile)
+            } else {
+                showToast("未授予安装权限，请允许「安装未知应用」后点击立即安装")
+            }
+        }
+    }
+
+    fun requestApkInstall(apkFile: File) {
+        if (!apkFile.exists()) {
+            showToast("安装包不存在，请重新下载")
+            return
+        }
+        if (container.appUpdateManager.canRequestPackageInstalls()) {
+            launchApkInstall(apkFile)
+        } else {
+            pendingInstallApkFile = apkFile
+            showToast("请先开启「允许安装未知应用」，返回后自动继续安装")
+            runCatching {
+                unknownSourcesLauncher.launch(container.appUpdateManager.buildUnknownSourcesSettingsIntent())
+            }.onFailure {
+                pendingInstallApkFile = null
+                showToast("无法打开安装权限设置，请在系统设置中开启允许安装未知应用")
+            }
+        }
+    }
+
+    fun navigateToQueueSource(source: PlaybackQueueSource) {
+        isPlayerExpanded = false
+        val target: SubRoute? = when (source.type) {
+            QueueSourceType.FAVORITES -> SubRoute.Collection(LibraryCollectionType.FAVORITES)
+            QueueSourceType.LOCAL -> SubRoute.Collection(LibraryCollectionType.LOCAL)
+            QueueSourceType.DOWNLOADS -> SubRoute.Collection(LibraryCollectionType.DOWNLOADS)
+            QueueSourceType.HISTORY -> SubRoute.Collection(LibraryCollectionType.HISTORY)
+            QueueSourceType.USER_PLAYLIST -> {
+                val matched = playlists.firstOrNull { it.id == source.userPlaylistId }
+                matched?.let { SubRoute.UserPlaylistDetail(it) }
+            }
+            QueueSourceType.ONLINE_PLAYLIST -> source.onlinePlaylist?.let { SubRoute.OnlinePlaylistDetail(it) }
+            QueueSourceType.LEADERBOARD -> source.leaderboard?.let { SubRoute.LeaderboardDetail(it) }
+            else -> null
+        }
+        if (target != null) {
+            if (backStack.lastOrNull() != target) {
+                backStack.add(target)
+            }
+        } else {
+            showToast("未找到原歌单，当前队列曲目仍可继续播放")
+        }
+    }
+
     fun triggerLocalScan() {
         val granted = ContextCompat.checkSelfPermission(context, audioPermission) == PackageManager.PERMISSION_GRANTED
         if (granted) {
@@ -224,8 +322,9 @@ private fun LxPureRoot(container: AppContainer) {
         }
     }
 
-    // Initial passive scan if permission already granted + Android 13 notification permission
+    // Immediate GitHub version check + initial passive local scan + Android 13 notification permission
     LaunchedEffect(Unit) {
+        container.appUpdateManager.checkOnStartupOnce()
         if (ContextCompat.checkSelfPermission(context, audioPermission) == PackageManager.PERMISSION_GRANTED) {
             container.localMusicScanner.scan()
         }
@@ -233,6 +332,22 @@ private fun LxPureRoot(container: AppContainer) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        container.appUpdateManager.messages.collect { msg ->
+            showToast(msg)
+        }
+    }
+
+    LaunchedEffect(updateState) {
+        val ready = updateState as? AppUpdateState.ReadyToInstall
+        if (ready != null && autoLaunchedApkPath != ready.apkFile.absolutePath) {
+            autoLaunchedApkPath = ready.apkFile.absolutePath
+            requestApkInstall(ready.apkFile)
+        } else if (updateState is AppUpdateState.Idle) {
+            autoLaunchedApkPath = null
         }
     }
 
@@ -284,6 +399,10 @@ private fun LxPureRoot(container: AppContainer) {
         val hasCurrentTrack = playerState.currentTrack != null
         val showBottomNav = backStack.isEmpty()
 
+        LaunchedEffect(hasCurrentTrack) {
+            if (!hasCurrentTrack) isPlayerExpanded = false
+        }
+
         // Dynamically sync system status bar & navigation bar icon contrast with App theme and immersive player
         val useLightSystemBars = !lxColors.isDark && !(isPlayerExpanded && hasCurrentTrack)
         SideEffect {
@@ -326,7 +445,21 @@ private fun LxPureRoot(container: AppContainer) {
                         onOpenSourceManager = { backStack.add(SubRoute.SourceManager) },
                         onOpenCollection = { type -> backStack.add(SubRoute.Collection(type)) },
                         onOpenPlaylist = { playlist -> backStack.add(SubRoute.UserPlaylistDetail(playlist)) },
-                        onPlayTrack = { track -> container.playerController.playSingle(track) },
+                        onPlayTrack = { track ->
+                            val idx = recentHistory.indexOfFirst { it.id == track.id }
+                            if (idx >= 0) {
+                                container.playerController.playTracks(
+                                    tracks = recentHistory,
+                                    startIndex = idx,
+                                    queueSource = PlaybackQueueSource(QueueSourceType.HISTORY, "最近播放")
+                                )
+                            } else {
+                                container.playerController.playSingle(
+                                    track = track,
+                                    queueSource = PlaybackQueueSource(QueueSourceType.HISTORY, "最近播放")
+                                )
+                            }
+                        },
                         onCreatePlaylist = { name ->
                             scope.launch {
                                 container.libraryRepository.createPlaylist(name)
@@ -371,7 +504,13 @@ private fun LxPureRoot(container: AppContainer) {
                         bottomPadding = contentBottomPadding,
                         onSaveSearchQuery = { q -> scope.launch { container.libraryRepository.saveSearchQuery(q) } },
                         onClearSearchHistory = { scope.launch { container.libraryRepository.clearSearchHistory() } },
-                        onPlayTracks = { list, idx -> container.playerController.playTracks(list, idx) },
+                        onPlayTracks = { list, idx ->
+                            container.playerController.playTracks(
+                                tracks = list,
+                                startIndex = idx,
+                                queueSource = PlaybackQueueSource(QueueSourceType.SEARCH, "搜索结果")
+                            )
+                        },
                         onTrackMore = { track -> actionSheetTrack = track }
                     )
                 }
@@ -387,8 +526,20 @@ private fun LxPureRoot(container: AppContainer) {
                             bottomPadding = contentBottomPadding,
                             emptyHint = "还没有喜欢的歌曲，听到心动的旋律点亮红心吧",
                             onBack = { backStack.removeAt(backStack.lastIndex) },
-                            onPlayAll = { container.playerController.playTracks(favorites, 0) },
-                            onPlayTrackAt = { idx -> container.playerController.playTracks(favorites, idx) },
+                            onPlayAll = {
+                                container.playerController.playTracks(
+                                    favorites,
+                                    0,
+                                    PlaybackQueueSource(QueueSourceType.FAVORITES, "我喜欢的")
+                                )
+                            },
+                            onPlayTrackAt = { idx ->
+                                container.playerController.playTracks(
+                                    favorites,
+                                    idx,
+                                    PlaybackQueueSource(QueueSourceType.FAVORITES, "我喜欢的")
+                                )
+                            },
                             onTrackMore = { actionSheetTrack = it }
                         )
 
@@ -403,8 +554,20 @@ private fun LxPureRoot(container: AppContainer) {
                             showScanAction = true,
                             emptyHint = "点击下方按钮扫描手机中的无损或 MP3 音频",
                             onBack = { backStack.removeAt(backStack.lastIndex) },
-                            onPlayAll = { container.playerController.playTracks(localTracks, 0) },
-                            onPlayTrackAt = { idx -> container.playerController.playTracks(localTracks, idx) },
+                            onPlayAll = {
+                                container.playerController.playTracks(
+                                    localTracks,
+                                    0,
+                                    PlaybackQueueSource(QueueSourceType.LOCAL, "本地音乐")
+                                )
+                            },
+                            onPlayTrackAt = { idx ->
+                                container.playerController.playTracks(
+                                    localTracks,
+                                    idx,
+                                    PlaybackQueueSource(QueueSourceType.LOCAL, "本地音乐")
+                                )
+                            },
                             onTrackMore = { actionSheetTrack = it },
                             onScanLocal = { triggerLocalScan() }
                         )
@@ -415,7 +578,24 @@ private fun LxPureRoot(container: AppContainer) {
                             isPlaying = playerState.isPlaying,
                             bottomPadding = contentBottomPadding,
                             onBack = { backStack.removeAt(backStack.lastIndex) },
-                            onPlayTrack = { track -> container.playerController.playSingle(track) },
+                            onPlayTrack = { track ->
+                                val completedTracks = downloads
+                                    .filter { it.status == DownloadStatus.COMPLETED }
+                                    .map { it.track }
+                                val idx = completedTracks.indexOfFirst { it.id == track.id }
+                                if (idx >= 0) {
+                                    container.playerController.playTracks(
+                                        completedTracks,
+                                        idx,
+                                        PlaybackQueueSource(QueueSourceType.DOWNLOADS, "离线下载")
+                                    )
+                                } else {
+                                    container.playerController.playSingle(
+                                        track,
+                                        PlaybackQueueSource(QueueSourceType.DOWNLOADS, "离线下载")
+                                    )
+                                }
+                            },
                             onDeleteDownload = { id ->
                                 scope.launch {
                                     container.downloadManager.deleteDownload(id)
@@ -434,8 +614,20 @@ private fun LxPureRoot(container: AppContainer) {
                             showClearAction = true,
                             emptyHint = "还没有播放记录",
                             onBack = { backStack.removeAt(backStack.lastIndex) },
-                            onPlayAll = { container.playerController.playTracks(recentHistory, 0) },
-                            onPlayTrackAt = { idx -> container.playerController.playTracks(recentHistory, idx) },
+                            onPlayAll = {
+                                container.playerController.playTracks(
+                                    recentHistory,
+                                    0,
+                                    PlaybackQueueSource(QueueSourceType.HISTORY, "最近播放")
+                                )
+                            },
+                            onPlayTrackAt = { idx ->
+                                container.playerController.playTracks(
+                                    recentHistory,
+                                    idx,
+                                    PlaybackQueueSource(QueueSourceType.HISTORY, "最近播放")
+                                )
+                            },
                             onTrackMore = { actionSheetTrack = it },
                             onClearAction = {
                                 scope.launch {
@@ -450,6 +642,11 @@ private fun LxPureRoot(container: AppContainer) {
                         val plTracks by container.libraryRepository
                             .observePlaylistTracks(topRoute.playlist.id)
                             .collectAsState(initial = emptyList())
+                        val plSource = PlaybackQueueSource(
+                            type = QueueSourceType.USER_PLAYLIST,
+                            title = topRoute.playlist.name,
+                            userPlaylistId = topRoute.playlist.id
+                        )
 
                         CollectionDetailScreen(
                             title = topRoute.playlist.name,
@@ -461,8 +658,8 @@ private fun LxPureRoot(container: AppContainer) {
                             showDeletePlaylistAction = true,
                             emptyHint = "歌单里还没有歌曲",
                             onBack = { backStack.removeAt(backStack.lastIndex) },
-                            onPlayAll = { container.playerController.playTracks(plTracks, 0) },
-                            onPlayTrackAt = { idx -> container.playerController.playTracks(plTracks, idx) },
+                            onPlayAll = { container.playerController.playTracks(plTracks, 0, plSource) },
+                            onPlayTrackAt = { idx -> container.playerController.playTracks(plTracks, idx, plSource) },
                             onTrackMore = { actionSheetTrack = it },
                             onDeletePlaylist = {
                                 scope.launch {
@@ -482,7 +679,17 @@ private fun LxPureRoot(container: AppContainer) {
                         isPlaying = playerState.isPlaying,
                         bottomPadding = contentBottomPadding,
                         onBack = { backStack.removeAt(backStack.lastIndex) },
-                        onPlayTracks = { list, idx -> container.playerController.playTracks(list, idx) },
+                        onPlayTracks = { list, idx ->
+                            container.playerController.playTracks(
+                                list,
+                                idx,
+                                PlaybackQueueSource(
+                                    type = QueueSourceType.ONLINE_PLAYLIST,
+                                    title = topRoute.playlist.name,
+                                    onlinePlaylist = topRoute.playlist
+                                )
+                            )
+                        },
                         onSaveToLibrary = { res ->
                             scope.launch {
                                 container.libraryRepository.createPlaylist(
@@ -506,7 +713,17 @@ private fun LxPureRoot(container: AppContainer) {
                         isPlaying = playerState.isPlaying,
                         bottomPadding = contentBottomPadding,
                         onBack = { backStack.removeAt(backStack.lastIndex) },
-                        onPlayTracks = { list, idx -> container.playerController.playTracks(list, idx) },
+                        onPlayTracks = { list, idx ->
+                            container.playerController.playTracks(
+                                list,
+                                idx,
+                                PlaybackQueueSource(
+                                    type = QueueSourceType.LEADERBOARD,
+                                    title = topRoute.board.name,
+                                    leaderboard = topRoute.board
+                                )
+                            )
+                        },
                         onSaveToLibrary = { res ->
                             scope.launch {
                                 container.libraryRepository.createPlaylist(
@@ -526,6 +743,7 @@ private fun LxPureRoot(container: AppContainer) {
                         sources = sources,
                         downloadedBytes = downloadedBytes,
                         cacheBytes = cacheBytes,
+                        isCheckingUpdate = updateState is AppUpdateState.Checking,
                         bottomPadding = contentBottomPadding,
                         onBack = { backStack.removeAt(backStack.lastIndex) },
                         onOpenSourceManager = { backStack.add(SubRoute.SourceManager) },
@@ -542,7 +760,8 @@ private fun LxPureRoot(container: AppContainer) {
                                 cacheBytes = container.mediaCacheManager.calculateTotalCacheBytes()
                                 showToast("已清理音频与封面缓存")
                             }
-                        }
+                        },
+                        onCheckUpdate = { container.appUpdateManager.checkForUpdate(manual = true) }
                     )
 
                     SubRoute.SourceManager -> SourceManagerScreen(
@@ -622,7 +841,11 @@ private fun LxPureRoot(container: AppContainer) {
                 val currentDownloadRecord = remember(cur?.id, downloads) {
                     cur?.let { track -> downloads.firstOrNull { it.trackId == track.id } }
                 }
-                Box(modifier = Modifier.fillMaxSize()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(Unit) {}
+                ) {
                     FullPlayerScreen(
                         state = playerState,
                         isFavorite = cur != null && cur.id in favoriteIds,
@@ -674,11 +897,27 @@ private fun LxPureRoot(container: AppContainer) {
                 forceDarkStatusBar = isPlayerExpanded,
                 onDismiss = { showQueueSheet = false },
                 onSelectIndex = { idx ->
-                    container.playerController.playTracks(playerState.queue, idx)
+                    container.playerController.playTracks(
+                        tracks = playerState.queue,
+                        startIndex = idx,
+                        queueSource = playerState.queueSource
+                    )
                     showQueueSheet = false
                 },
                 onRemoveIndex = { idx -> container.playerController.removeFromQueue(idx) },
-                onClearQueue = { container.playerController.clearQueue() }
+                onClearQueue = { container.playerController.clearQueue() },
+                onOpenQueueSource = { source -> navigateToQueueSource(source) }
+            )
+        }
+
+        if (updateState !is AppUpdateState.Idle && updateState !is AppUpdateState.Checking) {
+            AppUpdateDialog(
+                state = updateState,
+                onStartDownload = { info -> container.appUpdateManager.startDownload(info) },
+                onCancelDownload = { container.appUpdateManager.cancelDownload() },
+                onInstallApk = { apkFile -> requestApkInstall(apkFile) },
+                onOpenInBrowser = { url -> openExternalUrl(url) },
+                onDismiss = { container.appUpdateManager.dismiss() }
             )
         }
 

@@ -97,6 +97,8 @@ import com.lxpure.music.core.player.PlayerState
 import com.lxpure.music.domain.model.AudioQuality
 import com.lxpure.music.domain.model.DownloadRecord
 import com.lxpure.music.domain.model.DownloadStatus
+import com.lxpure.music.domain.model.PlaybackQueueSource
+import com.lxpure.music.domain.model.QueueSourceType
 import com.lxpure.music.domain.model.RepeatMode
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.ui.components.AlbumArtwork
@@ -141,12 +143,20 @@ fun FullPlayerScreen(
         label = "artworkScale"
     )
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        FluidAmbientBackground(
-            palette = state.ambientPalette,
-            enabled = fluidAmbientEnabled,
-            immersive = true
-        )
+    // Non-clickable Surface + pointerInput blocks all unhandled taps/drags (e.g. on song title,
+    // artist/album lines, or margins) from passing through to underlying track lists behind the overlay.
+    Surface(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {},
+        color = Color(0xFF090B10)
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            FluidAmbientBackground(
+                palette = state.ambientPalette,
+                enabled = fluidAmbientEnabled,
+                immersive = true
+            )
 
         Column(
             modifier = Modifier
@@ -561,6 +571,7 @@ fun FullPlayerScreen(
             }
         }
     }
+    }
 
     if (showQualitySheet) {
         val lxColors = LocalLxColors.current
@@ -841,9 +852,23 @@ fun QueueBottomSheet(
     onDismiss: () -> Unit,
     onSelectIndex: (Int) -> Unit,
     onRemoveIndex: (Int) -> Unit,
-    onClearQueue: () -> Unit
+    onClearQueue: () -> Unit,
+    onOpenQueueSource: ((PlaybackQueueSource) -> Unit)? = null
 ) {
     val lxColors = LocalLxColors.current
+    val queueSource = state.queueSource
+    val canJumpToSource = onOpenQueueSource != null &&
+        queueSource != null &&
+        queueSource.type != QueueSourceType.UNKNOWN &&
+        queueSource.type != QueueSourceType.SEARCH
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(state.currentIndex, state.queue.size) {
+        if (state.currentIndex in state.queue.indices) {
+            listState.scrollToItem((state.currentIndex - 2).coerceAtLeast(0))
+        }
+    }
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         containerColor = lxColors.surfaceElevated,
@@ -858,22 +883,41 @@ fun QueueBottomSheet(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text("当前播放队列", style = MaterialTheme.typography.titleLarge)
+                    val subtitle = buildString {
+                        if (!queueSource?.title.isNullOrBlank()) {
+                            append("来自「${queueSource!!.title}」 · ")
+                        }
+                        append("${state.queue.size} 首歌曲 · ${state.repeatMode.label}")
+                    }
                     Text(
-                        "${state.queue.size} 首歌曲 · ${state.repeatMode.label}",
+                        subtitle,
                         style = MaterialTheme.typography.bodyMedium,
-                        color = lxColors.textSecondary
+                        color = lxColors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
-                if (state.queue.isNotEmpty()) {
-                    TextButton(onClick = {
-                        onClearQueue()
-                        onDismiss()
-                    }) {
-                        Icon(Icons.Rounded.DeleteOutline, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("清空")
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (canJumpToSource) {
+                        val targetSource = queueSource!!
+                        TextButton(onClick = {
+                            onDismiss()
+                            onOpenQueueSource?.invoke(targetSource)
+                        }) {
+                            Text("原歌单", color = lxColors.accent)
+                        }
+                    }
+                    if (state.queue.isNotEmpty()) {
+                        TextButton(onClick = {
+                            onClearQueue()
+                            onDismiss()
+                        }) {
+                            Icon(Icons.Rounded.DeleteOutline, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("清空")
+                        }
                     }
                 }
             }
@@ -890,6 +934,7 @@ fun QueueBottomSheet(
                 }
             } else {
                 LazyColumn(
+                    state = listState,
                     modifier = Modifier.height(380.dp)
                 ) {
                     itemsIndexed(state.queue, key = { idx, t -> "${t.id}_$idx" }) { index, track ->

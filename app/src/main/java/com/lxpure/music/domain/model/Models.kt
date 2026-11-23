@@ -302,3 +302,46 @@ data class AppSettings(
     val showTranslationLyrics: Boolean = true,
     val wifiOnlyHighQuality: Boolean = true
 )
+
+@Serializable
+enum class QueueSourceType {
+    UNKNOWN,
+    FAVORITES,
+    LOCAL,
+    DOWNLOADS,
+    HISTORY,
+    USER_PLAYLIST,
+    ONLINE_PLAYLIST,
+    LEADERBOARD,
+    SEARCH
+}
+
+@Serializable
+data class PlaybackQueueSource(
+    val type: QueueSourceType = QueueSourceType.UNKNOWN,
+    val title: String = "",
+    val userPlaylistId: Long? = null,
+    val onlinePlaylist: OnlinePlaylist? = null,
+    val leaderboard: LeaderboardItem? = null
+)
+
+@Serializable
+data class PlaybackQueueSnapshot(
+    val version: Int = 1,
+    val queue: List<Track> = emptyList(),
+    val queueSource: PlaybackQueueSource? = null,
+    val savedAt: Long = 0L
+)
+
+@Serializable
+data class PlaybackCursorSnapshot(
+    val version: Int = 1,
+    val currentIndex: Int = -1,
+    val currentTrackId: String? = null,
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val repeatMode: String = RepeatMode.LIST_LOOP.name,
+    val activeQualityBadge: String? = null,
+    val activeProviderName: String? = null,
+    val updatedAt: Long = 0L
+)

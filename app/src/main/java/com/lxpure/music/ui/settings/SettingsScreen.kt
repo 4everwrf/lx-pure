@@ -54,6 +54,7 @@ fun SettingsScreen(
     sources: List<UserApiSource>,
     downloadedBytes: Long,
     cacheBytes: Long,
+    isCheckingUpdate: Boolean = false,
     bottomPadding: Dp,
     onBack: () -> Unit,
     onOpenSourceManager: () -> Unit,
@@ -64,7 +65,8 @@ fun SettingsScreen(
     onToggleFluidAmbient: (Boolean) -> Unit,
     onToggleTranslation: (Boolean) -> Unit,
     onScanLocalMusic: () -> Unit,
-    onClearCache: () -> Unit
+    onClearCache: () -> Unit,
+    onCheckUpdate: () -> Unit = {}
 ) {
     val lxColors = LocalLxColors.current
     val readyCount = sources.count { it.enabled && it.status == UserApiRuntimeStatus.READY }
@@ -298,6 +300,25 @@ fun SettingsScreen(
             // 5. About
             item {
                 SettingsGroup(title = "关于轻雪音乐") {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = !isCheckingUpdate, onClick = onCheckUpdate)
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("检查新版本", style = MaterialTheme.typography.titleMedium, color = lxColors.textPrimary)
+                            Text(
+                                text = if (isCheckingUpdate) "正在连接 GitHub 查询最新版本…" else "当前版本 v${BuildConfig.VERSION_NAME}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = lxColors.textSecondary
+                            )
+                        }
+                        Icon(Icons.Rounded.ChevronRight, contentDescription = null, tint = lxColors.textTertiary)
+                    }
+                    HorizontalDivider(color = lxColors.hairline)
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()

@@ -26,6 +26,12 @@
 	<true/>
 	<key>UIFileSharingEnabled</key>
 	<true/>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>apple-magnifier</string>
+		<string>altstore</string>
+		<string>sidestore</string>
+	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

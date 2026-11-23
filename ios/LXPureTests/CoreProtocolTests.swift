@@ -393,4 +393,123 @@ final class CoreProtocolTests: XCTestCase {
         store.deletePlaylist(id: plId)
         XCTAssertTrue(store.userPlaylists.isEmpty)
     }
+
+    func testPlaybackSessionStorePersistsQueuePlaylistContextAndProgressRoundTrip() {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LXPureSessionTest_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = PlaybackSessionStore(baseDirectory: tempDir)
+        let t1 = Track(id: "wy_1", title: "晴天", artist: "周杰伦", album: "叶惠美", source: .wy, songmid: "1", durationMs: 269_000)
+        let t2 = Track(id: "tx_2", title: "稻香", artist: "周杰伦", album: "魔杰座", source: .tx, songmid: "2", durationMs: 223_000)
+        let t3 = Track(id: "wy_3", title: "夜曲", artist: "周杰伦", album: "十一月的萧邦", source: .wy, songmid: "3", durationMs: 226_000)
+        let source = PlaybackQueueSource(type: .userPlaylist, title: "通勤歌单", userPlaylistId: 42)
+
+        store.saveQueueAndCursor(
+            queue: [t1, t2, t3],
+            queueSource: source,
+            currentIndex: 1,
+            positionMs: 95_000,
+            durationMs: 223_000,
+            repeatMode: .shuffle,
+            activeQualityBadge: "SQ",
+            activeProviderName: "测试源",
+            synchronous: true
+        )
+
+        store.saveCursorOnly(
+            currentIndex: 2,
+            currentTrackId: "wy_3",
+            positionMs: 142_500,
+            durationMs: 226_000,
+            repeatMode: .singleLoop,
+            activeQualityBadge: "HR",
+            activeProviderName: "测试源",
+            synchronous: true
+        )
+
+        let reloaded = PlaybackSessionStore(baseDirectory: tempDir).loadSession()
+        XCTAssertNotNil(reloaded)
+        XCTAssertEqual(reloaded?.queue.count, 3)
+        XCTAssertEqual(reloaded?.currentIndex, 2)
+        XCTAssertEqual(reloaded?.queue[2].id, "wy_3")
+        XCTAssertEqual(reloaded?.positionMs, 142_500)
+        XCTAssertEqual(reloaded?.durationMs, 226_000)
+        XCTAssertEqual(reloaded?.repeatMode, .singleLoop)
+        XCTAssertEqual(reloaded?.queueSource?.title, "通勤歌单")
+        XCTAssertEqual(reloaded?.queueSource?.userPlaylistId, 42)
+        XCTAssertEqual(reloaded?.activeQualityBadge, "HR")
+
+        // Index drift + near-end timestamp clamping
+        let reconciled = PlaybackSessionStore.resolveRestoredSession(
+            queueSnapshot: PlaybackQueueSnapshot(queue: [t1, t2, t3], queueSource: source),
+            cursorSnapshot: PlaybackCursorSnapshot(currentIndex: 0, currentTrackId: "tx_2", positionMs: 222_500, durationMs: 223_000)
+        )
+        XCTAssertEqual(reconciled?.currentIndex, 1)
+        XCTAssertEqual(reconciled?.positionMs, 221_000)
+
+        // Oversized queue slicing
+        let bigQueue = (0..<6000).map { Track(id: "wy_\($0)", title: "Song \($0)", artist: "Artist") }
+        let (sliced, remapped) = PlaybackSessionStore.sliceQueueForPersistence(bigQueue, currentIndex: 3456)
+        XCTAssertEqual(sliced.count, PlaybackSessionStore.maxPersistedQueueSize)
+        XCTAssertEqual(sliced[remapped].id, "wy_3456")
+
+        store.clear(synchronous: true)
+        XCTAssertNil(store.loadSession())
+    }
+
+    @MainActor
+    func testAppUpdateVersionComparisonAndGithubReleaseParsing() {
+        XCTAssertTrue(AppUpdateManager.isNewerVersion(current: "1.1.0", remote: "1.1.1"))
+        XCTAssertTrue(AppUpdateManager.isNewerVersion(current: "1.1.0-beta", remote: "v1.1.1"))
+        XCTAssertTrue(AppUpdateManager.isNewerVersion(current: "1.2.0", remote: "1.10.0"))
+        XCTAssertFalse(AppUpdateManager.isNewerVersion(current: "1.1.1", remote: "v1.1.1"))
+        XCTAssertFalse(AppUpdateManager.isNewerVersion(current: "1.2.0", remote: "1.1.9"))
+        XCTAssertEqual(AppUpdateManager.compareVersions(remote: "v1.2", current: "1.2.0"), 0)
+
+        let releaseJson = """
+        {
+          "tag_name": "v1.1.1",
+          "name": "v1.1.1",
+          "draft": false,
+          "prerelease": false,
+          "html_url": "https://github.com/4everwrf/lx-pure/releases/tag/v1.1.1",
+          "body": "## 轻雪音乐 (LX Pure) v1.1.1\\n\\n### 本版变更记录\\n- 修复播放页误触切歌\\n- 新增退出后自动记录歌单与进度",
+          "assets": [
+            {
+              "name": "lx-pure-v1.1.1-release.apk",
+              "size": 8200000,
+              "digest": "sha256:5aa7222a07e8ce0775389a3f3611bc03c08a3f48dd02108de4a97b3acd76ed10",
+              "browser_download_url": "https://github.com/4everwrf/lx-pure/releases/download/v1.1.1/lx-pure-v1.1.1-release.apk"
+            },
+            {
+              "name": "lx-pure-ios-v1.1.1-unsigned.ipa",
+              "size": 1350000,
+              "digest": "sha256:311d2cd87bd93693f69b96f82dfa1394d64ef804fc40730aadb2d0647dc442b3",
+              "browser_download_url": "https://github.com/4everwrf/lx-pure/releases/download/v1.1.1/lx-pure-ios-v1.1.1-unsigned.ipa"
+            }
+          ]
+        }
+        """
+
+        let parsed = AppUpdateManager.parseGithubReleaseJson(releaseJson)
+        XCTAssertNotNil(parsed)
+        XCTAssertEqual(parsed?.versionName, "1.1.1")
+        XCTAssertEqual(parsed?.tagName, "v1.1.1")
+        XCTAssertEqual(parsed?.assetName, "lx-pure-ios-v1.1.1-unsigned.ipa")
+        XCTAssertEqual(parsed?.assetSizeBytes, 1_350_000)
+        XCTAssertEqual(parsed?.expectedSha256, "311d2cd87bd93693f69b96f82dfa1394d64ef804fc40730aadb2d0647dc442b3")
+        XCTAssertTrue(parsed?.releaseNotes.contains("修复播放页误触切歌") == true)
+
+        let draftJson = releaseJson.replacingOccurrences(of: "\"draft\": false", with: "\"draft\": true")
+        XCTAssertNil(AppUpdateManager.parseGithubReleaseJson(draftJson))
+
+        XCTAssertEqual(
+            AppUpdateManager.extractTagFromReleaseUrl("https://github.com/4everwrf/lx-pure/releases/tag/v1.2.3?ref=app"),
+            "v1.2.3"
+        )
+        XCTAssertTrue(AppUpdateManager.isValidZipOrIpaMagic(Data([0x50, 0x4B, 0x03, 0x04])))
+        XCTAssertFalse(AppUpdateManager.isValidZipOrIpaMagic(Data("<html>".utf8)))
+        XCTAssertNotNil(AppUpdateManager.trollStoreInstallURL(for: "https://github.com/4everwrf/lx-pure/releases/download/v1.1.1/lx-pure-ios-v1.1.1-unsigned.ipa"))
+    }
 }

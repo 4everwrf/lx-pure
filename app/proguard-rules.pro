@@ -10,3 +10,6 @@
 -keep,includedescriptorclasses class com.lxpure.music.domain.model.**$$serializer { *; }
 -keepclassmembers class com.lxpure.music.domain.model.** { *** Companion; }
 -keepclasseswithmembers class com.lxpure.music.domain.model.** { kotlinx.serialization.KSerializer serializer(...); }
+-keep,includedescriptorclasses class com.lxpure.music.core.update.**$$serializer { *; }
+-keepclassmembers class com.lxpure.music.core.update.** { *** Companion; }
+-keepclasseswithmembers class com.lxpure.music.core.update.** { kotlinx.serialization.KSerializer serializer(...); }

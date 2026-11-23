@@ -33,6 +33,11 @@ private enum AppRoute: Hashable {
     case sourceManager
 }
 
+private struct ShareFileItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 struct RootView: View {
     @EnvironmentObject private var container: AppContainer
     @EnvironmentObject private var settingsStore: SettingsStore
@@ -40,8 +45,10 @@ struct RootView: View {
     @EnvironmentObject private var userApiManager: UserApiManager
     @EnvironmentObject private var localMusicManager: LocalMusicManager
     @EnvironmentObject private var playerController: PlayerController
+    @EnvironmentObject private var appUpdateManager: AppUpdateManager
 
     @Environment(\.colorScheme) private var systemColorScheme
+    @Environment(\.openURL) private var openURL
 
     @State private var activeTab: BottomTab = .library
     @State private var path: [AppRoute] = []
@@ -52,9 +59,34 @@ struct RootView: View {
     @State private var isImportingPlaylist = false
     @State private var downloadedBytes: Int64 = 0
     @State private var cacheBytes: Int64 = 0
+    @State private var shareFileItem: ShareFileItem?
+    @State private var autoTriggeredIpaPath: String?
 
     @State private var activeToast: PlayerUiEvent?
     @State private var toastDismissTask: Task<Void, Never>?
+
+    private var isUpdateSheetPresented: Bool {
+        switch appUpdateManager.state {
+        case .available, .downloading, .verifying, .readyToInstall, .error:
+            return true
+        case .idle, .checking:
+            return false
+        }
+    }
+
+    private var isCheckingUpdate: Bool {
+        if case .checking = appUpdateManager.state { return true }
+        return false
+    }
+
+    private var canDismissUpdateSheet: Bool {
+        switch appUpdateManager.state {
+        case .downloading, .verifying:
+            return false
+        default:
+            return true
+        }
+    }
 
     private var effectivePalette: LxPurePalette {
         switch settingsStore.settings.themeMode {
@@ -196,9 +228,85 @@ struct RootView: View {
         .onReceive(playerController.events) { event in
             showEvent(event)
         }
+        .onReceive(appUpdateManager.messages) { msg in
+            showToast(msg)
+        }
         .onChange(of: path) { newPath in
             if newPath.last == .settings {
                 refreshStorageStats()
+            }
+        }
+        .onChange(of: playerController.state.currentTrack?.id) { newId in
+            if newId == nil {
+                isPlayerExpanded = false
+            }
+        }
+        .onChange(of: appUpdateManager.state) { newState in
+            switch newState {
+            case .readyToInstall(let info, let localURL):
+                if autoTriggeredIpaPath != localURL.path {
+                    autoTriggeredIpaPath = localURL.path
+                    playerController.persistSnapshotNow(synchronous: true)
+                    if appUpdateManager.isTrollStoreAvailable,
+                       let tsURL = AppUpdateManager.trollStoreInstallURL(for: info.downloadUrl) {
+                        openURL(tsURL)
+                    } else {
+                        shareFileItem = ShareFileItem(url: localURL)
+                    }
+                }
+            case .idle:
+                autoTriggeredIpaPath = nil
+            default:
+                break
+            }
+        }
+        .task {
+            appUpdateManager.checkOnStartupOnce()
+        }
+        .sheet(isPresented: Binding(
+            get: { isUpdateSheetPresented },
+            set: { presented in
+                if !presented {
+                    appUpdateManager.dismiss()
+                }
+            }
+        )) {
+            AppUpdateSheetView(
+                state: appUpdateManager.state,
+                currentVersion: appUpdateManager.currentAppVersion,
+                isTrollStoreAvailable: appUpdateManager.isTrollStoreAvailable,
+                onStartDownload: { info in
+                    appUpdateManager.startDownload(info: info)
+                },
+                onCancelDownload: {
+                    appUpdateManager.cancelDownload()
+                },
+                onInstallViaTrollStore: { info in
+                    playerController.persistSnapshotNow(synchronous: true)
+                    if let tsURL = AppUpdateManager.trollStoreInstallURL(for: info.downloadUrl) {
+                        openURL(tsURL)
+                    } else if let webURL = URL(string: info.htmlUrl) {
+                        openURL(webURL)
+                    }
+                },
+                onOpenShareInstaller: { localURL in
+                    playerController.persistSnapshotNow(synchronous: true)
+                    shareFileItem = ShareFileItem(url: localURL)
+                },
+                onOpenInBrowser: { rawUrl in
+                    if let webURL = URL(string: rawUrl) {
+                        openURL(webURL)
+                    }
+                },
+                onDismiss: {
+                    appUpdateManager.dismiss()
+                }
+            )
+            .environment(\.lxPalette, effectivePalette)
+            .interactiveDismissDisabled(!canDismissUpdateSheet)
+            .presentationDetents([.medium, .large])
+            .sheet(item: $shareFileItem) { item in
+                ActivityShareSheet(activityItems: [item.url])
             }
         }
     }
@@ -224,7 +332,13 @@ struct RootView: View {
                     onOpenSourceManager: { path.append(.sourceManager) },
                     onOpenCollection: { path.append(.collection($0)) },
                     onOpenPlaylist: { path.append(.userPlaylist($0)) },
-                    onPlayTrack: { playerController.playTrack($0, inQueue: libraryStore.recentHistory) },
+                    onPlayTrack: {
+                        playerController.playTrack(
+                            $0,
+                            inQueue: libraryStore.recentHistory,
+                            queueSource: PlaybackQueueSource(type: .history, title: "最近播放")
+                        )
+                    },
                     onCreatePlaylist: { name in
                         _ = libraryStore.createPlaylist(name: name)
                         showToast("已创建歌单《\(name)》")
@@ -255,7 +369,13 @@ struct RootView: View {
                     bottomInset: bottomContentInset,
                     onSaveSearchQuery: { libraryStore.saveSearchQuery($0) },
                     onClearSearchHistory: { libraryStore.clearSearchHistory() },
-                    onPlayTracks: { tracks, idx in playerController.playTracks(tracks, startIndex: idx) },
+                    onPlayTracks: { tracks, idx in
+                        playerController.playTracks(
+                            tracks,
+                            startIndex: idx,
+                            queueSource: PlaybackQueueSource(type: .search, title: "搜索结果")
+                        )
+                    },
                     onTrackMore: { actionSheetTrack = $0 }
                 )
             }
@@ -280,7 +400,13 @@ struct RootView: View {
                     canClearHistory: false,
                     canDeleteTracks: true,
                     bottomInset: bottomContentInset,
-                    onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                    onPlayTracks: {
+                        playerController.playTracks(
+                            $0,
+                            startIndex: $1,
+                            queueSource: PlaybackQueueSource(type: .favorites, title: "我喜欢的")
+                        )
+                    },
                     onTrackMore: { actionSheetTrack = $0 },
                     onRemoveTrack: { track in
                         libraryStore.toggleFavorite(track)
@@ -300,7 +426,13 @@ struct RootView: View {
                     canClearHistory: false,
                     canDeleteTracks: true,
                     bottomInset: bottomContentInset,
-                    onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                    onPlayTracks: {
+                        playerController.playTracks(
+                            $0,
+                            startIndex: $1,
+                            queueSource: PlaybackQueueSource(type: .local, title: "本地音乐")
+                        )
+                    },
                     onTrackMore: { actionSheetTrack = $0 },
                     onScanLocal: {
                         Task {
@@ -328,7 +460,13 @@ struct RootView: View {
                     currentTrackId: playerController.state.currentTrack?.id,
                     isPlaying: playerController.state.isPlaying,
                     bottomInset: bottomContentInset,
-                    onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                    onPlayTracks: {
+                        playerController.playTracks(
+                            $0,
+                            startIndex: $1,
+                            queueSource: PlaybackQueueSource(type: .downloads, title: "离线下载")
+                        )
+                    },
                     onDeleteDownload: { record in
                         Task {
                             await container.downloadManager.deleteDownload(trackId: record.trackId)
@@ -351,7 +489,13 @@ struct RootView: View {
                     canClearHistory: true,
                     canDeleteTracks: false,
                     bottomInset: bottomContentInset,
-                    onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                    onPlayTracks: {
+                        playerController.playTracks(
+                            $0,
+                            startIndex: $1,
+                            queueSource: PlaybackQueueSource(type: .history, title: "最近播放")
+                        )
+                    },
                     onTrackMore: { actionSheetTrack = $0 },
                     onClearHistory: {
                         libraryStore.clearHistory()
@@ -373,7 +517,17 @@ struct RootView: View {
                 canClearHistory: false,
                 canDeleteTracks: true,
                 bottomInset: bottomContentInset,
-                onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                onPlayTracks: {
+                    playerController.playTracks(
+                        $0,
+                        startIndex: $1,
+                        queueSource: PlaybackQueueSource(
+                            type: .userPlaylist,
+                            title: playlist.name,
+                            userPlaylistId: playlist.id
+                        )
+                    )
+                },
                 onTrackMore: { actionSheetTrack = $0 },
                 onRemoveTrack: { track in
                     libraryStore.removeTrack(trackId: track.id, fromPlaylistId: playlist.id)
@@ -392,7 +546,17 @@ struct RootView: View {
                 currentTrackId: playerController.state.currentTrack?.id,
                 isPlaying: playerController.state.isPlaying,
                 bottomInset: bottomContentInset,
-                onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                onPlayTracks: {
+                    playerController.playTracks(
+                        $0,
+                        startIndex: $1,
+                        queueSource: PlaybackQueueSource(
+                            type: .onlinePlaylist,
+                            title: playlist.name,
+                            onlinePlaylist: playlist
+                        )
+                    )
+                },
                 onSaveToLibrary: { saveOnlinePlaylistToLibrary($0) },
                 onTrackMore: { actionSheetTrack = $0 }
             )
@@ -408,7 +572,17 @@ struct RootView: View {
                 currentTrackId: playerController.state.currentTrack?.id,
                 isPlaying: playerController.state.isPlaying,
                 bottomInset: bottomContentInset,
-                onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                onPlayTracks: {
+                    playerController.playTracks(
+                        $0,
+                        startIndex: $1,
+                        queueSource: PlaybackQueueSource(
+                            type: .leaderboard,
+                            title: board.name,
+                            leaderboard: board
+                        )
+                    )
+                },
                 onSaveToLibrary: { saveOnlinePlaylistToLibrary($0) },
                 onTrackMore: { actionSheetTrack = $0 }
             )
@@ -419,6 +593,7 @@ struct RootView: View {
                 sources: userApiManager.sources,
                 downloadedBytes: downloadedBytes,
                 cacheBytes: cacheBytes,
+                isCheckingUpdate: isCheckingUpdate,
                 bottomInset: bottomContentInset,
                 onOpenSourceManager: { path.append(.sourceManager) },
                 onSelectQuality: { q in settingsStore.update { $0.preferredQuality = q } },
@@ -437,6 +612,9 @@ struct RootView: View {
                     container.audioCacheManager.clearAllCaches()
                     refreshStorageStats()
                     showToast("已清理音频与封面缓存")
+                },
+                onCheckUpdate: {
+                    appUpdateManager.checkForUpdate(manual: true)
                 }
             )
 
@@ -487,17 +665,62 @@ struct RootView: View {
             currentIndex: playerController.state.currentIndex,
             isPlaying: playerController.state.isPlaying,
             repeatMode: playerController.state.repeatMode,
+            queueSource: playerController.state.queueSource,
             onSelectIndex: { idx in
-                playerController.playTracks(playerController.state.queue, startIndex: idx)
+                playerController.playTracks(
+                    playerController.state.queue,
+                    startIndex: idx,
+                    queueSource: playerController.state.queueSource
+                )
             },
             onRemoveIndex: { idx in
                 playerController.removeFromQueue(at: idx)
             },
             onCycleRepeat: { playerController.cycleRepeatMode() },
-            onClearQueue: { playerController.clearQueue() }
+            onClearQueue: { playerController.clearQueue() },
+            onOpenQueueSource: { source in
+                navigateToQueueSource(source)
+            }
         )
         .environment(\.lxPalette, effectivePalette)
         .presentationDetents([.medium, .large])
+    }
+
+    private func navigateToQueueSource(_ source: PlaybackQueueSource) {
+        showQueueSheet = false
+        isPlayerExpanded = false
+        let target: AppRoute?
+        switch source.type {
+        case .favorites:
+            target = .collection(.favorites)
+        case .local:
+            target = .collection(.local)
+        case .downloads:
+            target = .collection(.downloads)
+        case .history:
+            target = .collection(.history)
+        case .userPlaylist:
+            if let plId = source.userPlaylistId,
+               let matched = libraryStore.userPlaylists.first(where: { $0.id == plId }) {
+                target = .userPlaylist(matched)
+            } else {
+                target = nil
+            }
+        case .onlinePlaylist:
+            target = source.onlinePlaylist.map { .onlinePlaylist($0) }
+        case .leaderboard:
+            target = source.leaderboard.map { .leaderboard($0) }
+        case .unknown, .search:
+            target = nil
+        }
+
+        if let target {
+            if path.last != target {
+                path.append(target)
+            }
+        } else {
+            showToast("未找到原歌单，当前队列曲目仍可继续播放")
+        }
     }
 
     private func triggerTrackDownload(_ track: Track) {

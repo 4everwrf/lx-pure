@@ -454,4 +454,135 @@ class CoreProtocolTest {
         assertTrue(brokenPlanAlt.excludeResolvedTrack)
         assertTrue(brokenPlanAlt.evictStreamCache)
     }
+
+    @Test
+    fun playbackSessionStorePersistsQueuePlaylistContextAndProgressRoundTrip() {
+        val tempDir = java.nio.file.Files.createTempDirectory("lx_session_test").toFile()
+        try {
+            val store = com.lxpure.music.data.local.PlaybackSessionStore(tempDir)
+            val t1 = Track(id = "wy_1", title = "晴天", artist = "周杰伦", album = "叶惠美", source = MusicSource.WY, songmid = "1", durationMs = 269_000L)
+            val t2 = Track(id = "tx_2", title = "稻香", artist = "周杰伦", album = "魔杰座", source = MusicSource.TX, songmid = "2", durationMs = 223_000L)
+            val t3 = Track(id = "wy_3", title = "夜曲", artist = "周杰伦", album = "十一月的萧邦", source = MusicSource.WY, songmid = "3", durationMs = 226_000L)
+            val source = com.lxpure.music.domain.model.PlaybackQueueSource(
+                type = com.lxpure.music.domain.model.QueueSourceType.USER_PLAYLIST,
+                title = "通勤歌单",
+                userPlaylistId = 42L
+            )
+
+            store.saveQueueAndCursor(
+                queue = listOf(t1, t2, t3),
+                queueSource = source,
+                currentIndex = 1,
+                positionMs = 95_000L,
+                durationMs = 223_000L,
+                repeatMode = com.lxpure.music.domain.model.RepeatMode.SHUFFLE,
+                activeQualityBadge = "SQ",
+                activeProviderName = "测试源"
+            )
+
+            // Simulate cursor update during playback without rewriting queue file
+            store.saveCursorOnly(
+                currentIndex = 2,
+                currentTrackId = "wy_3",
+                positionMs = 142_500L,
+                durationMs = 226_000L,
+                repeatMode = com.lxpure.music.domain.model.RepeatMode.SINGLE_LOOP,
+                activeQualityBadge = "HR",
+                activeProviderName = "测试源"
+            )
+
+            // Cold relaunch with a brand new store instance
+            val reloaded = com.lxpure.music.data.local.PlaybackSessionStore(tempDir).loadSession()
+            assertNotNull(reloaded)
+            assertEquals(3, reloaded!!.queue.size)
+            assertEquals(2, reloaded.currentIndex)
+            assertEquals("wy_3", reloaded.queue[reloaded.currentIndex].id)
+            assertEquals(142_500L, reloaded.positionMs)
+            assertEquals(226_000L, reloaded.durationMs)
+            assertEquals(com.lxpure.music.domain.model.RepeatMode.SINGLE_LOOP, reloaded.repeatMode)
+            assertEquals("通勤歌单", reloaded.queueSource?.title)
+            assertEquals(42L, reloaded.queueSource?.userPlaylistId)
+            assertEquals("HR", reloaded.activeQualityBadge)
+
+            // Index drift reconciliation: cursor index stale, trackId still matches index 1
+            val reconciled = com.lxpure.music.data.local.PlaybackSessionStore.resolveRestoredSession(
+                queueSnapshot = com.lxpure.music.domain.model.PlaybackQueueSnapshot(queue = listOf(t1, t2, t3), queueSource = source),
+                cursorSnapshot = com.lxpure.music.domain.model.PlaybackCursorSnapshot(
+                    currentIndex = 0,
+                    currentTrackId = "tx_2",
+                    positionMs = 222_500L,
+                    durationMs = 223_000L
+                )
+            )
+            assertNotNull(reconciled)
+            assertEquals(1, reconciled!!.currentIndex)
+            // Near-end timestamp clamped back 2s so pressing Play doesn't insta-skip
+            assertEquals(221_000L, reconciled.positionMs)
+
+            // Oversized queue slicing keeps active track centered
+            val bigQueue = (0 until 6000).map { i -> Track(id = "wy_$i", title = "Song $i", artist = "Artist") }
+            val (sliced, remappedIdx) = com.lxpure.music.data.local.PlaybackSessionStore.sliceQueueForPersistence(bigQueue, 3456)
+            assertEquals(com.lxpure.music.data.local.PlaybackSessionStore.MAX_PERSISTED_QUEUE_SIZE, sliced.size)
+            assertEquals("wy_3456", sliced[remappedIdx].id)
+
+            store.clear()
+            assertNull(store.loadSession())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun appUpdateVersionComparisonAndGithubReleaseParsing() {
+        assertTrue(com.lxpure.music.core.update.AppUpdateManager.isNewerVersion("1.1.0", "1.1.1"))
+        assertTrue(com.lxpure.music.core.update.AppUpdateManager.isNewerVersion("1.1.0-debug", "v1.1.1"))
+        assertTrue(com.lxpure.music.core.update.AppUpdateManager.isNewerVersion("1.2.0", "1.10.0"))
+        assertFalse(com.lxpure.music.core.update.AppUpdateManager.isNewerVersion("1.1.1", "v1.1.1"))
+        assertFalse(com.lxpure.music.core.update.AppUpdateManager.isNewerVersion("1.2.0", "1.1.9"))
+        assertEquals(0, com.lxpure.music.core.update.AppUpdateManager.compareVersions("v1.2", "1.2.0"))
+
+        val releaseJson = """
+            {
+              "tag_name": "v1.1.1",
+              "name": "v1.1.1",
+              "draft": false,
+              "prerelease": false,
+              "html_url": "https://github.com/4everwrf/lx-pure/releases/tag/v1.1.1",
+              "body": "## 轻雪音乐 (LX Pure) v1.1.1\n\n### 本版变更记录\n- 修复播放页误触切歌\n- 新增退出后自动记录歌单与进度",
+              "assets": [
+                {
+                  "name": "lx-pure-ios-v1.1.1-unsigned.ipa",
+                  "size": 1350000,
+                  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "browser_download_url": "https://github.com/4everwrf/lx-pure/releases/download/v1.1.1/lx-pure-ios-v1.1.1-unsigned.ipa"
+                },
+                {
+                  "name": "lx-pure-v1.1.1-release.apk",
+                  "size": 8200000,
+                  "digest": "sha256:5aa7222a07e8ce0775389a3f3611bc03c08a3f48dd02108de4a97b3acd76ed10",
+                  "browser_download_url": "https://github.com/4everwrf/lx-pure/releases/download/v1.1.1/lx-pure-v1.1.1-release.apk"
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val parsed = com.lxpure.music.core.update.AppUpdateManager.parseGithubReleaseJson(releaseJson)
+        assertNotNull(parsed)
+        assertEquals("1.1.1", parsed!!.versionName)
+        assertEquals("v1.1.1", parsed.tagName)
+        assertEquals("lx-pure-v1.1.1-release.apk", parsed.assetName)
+        assertEquals(8_200_000L, parsed.assetSizeBytes)
+        assertEquals("5aa7222a07e8ce0775389a3f3611bc03c08a3f48dd02108de4a97b3acd76ed10", parsed.expectedSha256)
+        assertTrue(parsed.releaseNotes.contains("修复播放页误触切歌"))
+
+        // Draft releases must be ignored
+        assertNull(com.lxpure.music.core.update.AppUpdateManager.parseGithubReleaseJson(releaseJson.replace("\"draft\": false", "\"draft\": true")))
+
+        assertEquals(
+            "v1.2.3",
+            com.lxpure.music.core.update.AppUpdateManager.extractTagFromReleaseUrl("https://github.com/4everwrf/lx-pure/releases/tag/v1.2.3?ref=app")
+        )
+        assertTrue(com.lxpure.music.core.update.AppUpdateManager.isValidZipOrApkMagic(byteArrayOf(0x50, 0x4B, 0x03, 0x04)))
+        assertFalse(com.lxpure.music.core.update.AppUpdateManager.isValidZipOrApkMagic("<html>".toByteArray()))
+    }
 }

@@ -12,9 +12,11 @@ import com.lxpure.music.core.musicsdk.MusicAggregator
 import com.lxpure.music.core.network.NetworkQualityAdvisor
 import com.lxpure.music.core.player.MediaCacheManager
 import com.lxpure.music.core.player.PlayerController
+import com.lxpure.music.core.update.AppUpdateManager
 import com.lxpure.music.core.userapi.LxQuickJsRuntime
 import com.lxpure.music.core.userapi.UserApiManager
 import com.lxpure.music.data.local.AppDatabase
+import com.lxpure.music.data.local.PlaybackSessionStore
 import com.lxpure.music.data.local.SettingsDataStore
 import com.lxpure.music.data.repository.LibraryRepository
 import okhttp3.Cache
@@ -72,8 +74,10 @@ class AppContainer(application: Application) {
     val networkQualityAdvisor: NetworkQualityAdvisor = NetworkQualityAdvisor(application)
     val database: AppDatabase = AppDatabase.build(application)
     val settingsDataStore: SettingsDataStore = SettingsDataStore(application)
+    val playbackSessionStore: PlaybackSessionStore = PlaybackSessionStore(application)
     val libraryRepository: LibraryRepository = LibraryRepository(database)
     val musicAggregator: MusicAggregator = MusicAggregator(httpClient)
+    val appUpdateManager: AppUpdateManager = AppUpdateManager(application, httpClient)
     val userApiManager: UserApiManager = UserApiManager(
         context = application,
         dao = database.userApiDao(),
@@ -95,6 +99,7 @@ class AppContainer(application: Application) {
         mediaCacheManager = mediaCacheManager,
         settingsDataStore = settingsDataStore,
         libraryRepository = libraryRepository,
+        playbackSessionStore = playbackSessionStore,
         userApiManager = userApiManager,
         musicAggregator = musicAggregator,
         downloadManager = downloadManager

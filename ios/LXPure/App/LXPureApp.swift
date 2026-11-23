@@ -14,9 +14,12 @@ struct LXPureApp: App {
                 .environmentObject(container.userApiManager)
                 .environmentObject(container.localMusicManager)
                 .environmentObject(container.playerController)
+                .environmentObject(container.appUpdateManager)
         }
         .onChange(of: scenePhase) { newPhase in
-            if newPhase == .background {
+            if newPhase == .inactive {
+                container.playerController.persistSnapshotNow(synchronous: false)
+            } else if newPhase == .background {
                 container.handleBackgroundTransition()
             }
         }

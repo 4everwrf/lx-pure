@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import androidx.compose.ui.graphics.Color
 import androidx.media3.common.MediaItem
@@ -23,11 +24,13 @@ import com.lxpure.music.core.network.EffectiveQualityDecision
 import com.lxpure.music.core.network.NetworkQualityAdvisor
 import com.lxpure.music.core.userapi.ResolvedStream
 import com.lxpure.music.core.userapi.UserApiManager
+import com.lxpure.music.data.local.PlaybackSessionStore
 import com.lxpure.music.data.local.SettingsDataStore
 import com.lxpure.music.data.repository.LibraryRepository
 import com.lxpure.music.domain.model.AppSettings
 import com.lxpure.music.domain.model.AudioQuality
 import com.lxpure.music.domain.model.ParsedLyrics
+import com.lxpure.music.domain.model.PlaybackQueueSource
 import com.lxpure.music.domain.model.RepeatMode
 import com.lxpure.music.domain.model.Track
 import kotlinx.coroutines.CoroutineScope
@@ -68,6 +71,7 @@ data class PlayerUiEvent(
 data class PlayerState(
     val queue: List<Track> = emptyList(),
     val currentIndex: Int = -1,
+    val queueSource: PlaybackQueueSource? = null,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
     val positionMs: Long = 0L,
@@ -103,6 +107,7 @@ class PlayerController(
     private val mediaCacheManager: MediaCacheManager,
     private val settingsDataStore: SettingsDataStore,
     private val libraryRepository: LibraryRepository,
+    private val playbackSessionStore: PlaybackSessionStore,
     private val userApiManager: UserApiManager,
     private val musicAggregator: MusicAggregator,
     private val downloadManager: DownloadManager
@@ -112,6 +117,7 @@ class PlayerController(
         private const val PRELOAD_WINDOW_MS = 20_000L
         private const val MIN_TRACK_DURATION_FOR_PRELOAD_MS = 25_000L
         private const val STABLE_PLAYBACK_RESET_DELTA_MS = 8_000L
+        private const val CURSOR_PERSIST_INTERVAL_MS = 3_000L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -155,8 +161,132 @@ class PlayerController(
     private var preloadAttemptedForTrackId: String? = null
     private var preloadedNext: PreloadedNextItem? = null
 
+    // Session persistence & cold-start restoration guards
+    private var hasUserInitiatedPlayback = false
+    private var lyricsLoadedForTrackId: String? = null
+    private var lastCursorPersistRealtimeMs = 0L
+    private var queuePersistJob: Job? = null
+    private var cursorPersistJob: Job? = null
+
     init {
         startProgressTicker()
+        restoreLastSessionAsync()
+    }
+
+    private fun restoreLastSessionAsync() {
+        scope.launch {
+            val restored = withContext(Dispatchers.IO) {
+                playbackSessionStore.loadSession()
+            } ?: return@launch
+
+            if (hasUserInitiatedPlayback || _state.value.queue.isNotEmpty()) return@launch
+            val track = restored.queue.getOrNull(restored.currentIndex) ?: return@launch
+
+            pendingResumePositionMs = restored.positionMs
+            lastRecoveryStartPositionMs = restored.positionMs
+            _state.value = PlayerState(
+                queue = restored.queue,
+                currentIndex = restored.currentIndex,
+                queueSource = restored.queueSource,
+                isPlaying = false,
+                isBuffering = false,
+                positionMs = restored.positionMs,
+                durationMs = restored.durationMs,
+                repeatMode = restored.repeatMode,
+                activeQualityBadge = restored.activeQualityBadge,
+                activeProviderName = restored.activeProviderName,
+                lyrics = ParsedLyrics(),
+                isLoadingLyrics = true
+            )
+
+            loadLyricsAsync(track)
+            if (!track.coverUrl.isNullOrBlank()) {
+                extractAmbientPaletteAsync(track.coverUrl)
+            } else {
+                resolveCoverAsync(restored.currentIndex, track)
+            }
+        }
+    }
+
+    private fun resolveLivePositionAndDuration(snapshot: PlayerState): Pair<Long, Long> {
+        val ctrl = mediaController
+        val livePos = if (ctrl != null &&
+            ctrl.isConnected &&
+            !isAwaitingMediaLoad &&
+            ctrl.mediaItemCount > 0 &&
+            ctrl.currentMediaItem?.mediaId == activeExpectedMediaId
+        ) {
+            ctrl.currentPosition.coerceAtLeast(0L)
+        } else {
+            snapshot.positionMs.coerceAtLeast(0L)
+        }
+        val liveDur = if (ctrl != null && ctrl.isConnected && ctrl.duration > 0L) {
+            ctrl.duration
+        } else {
+            snapshot.durationMs
+        }
+        return livePos to liveDur
+    }
+
+    private fun persistQueueAndCursorAsync() {
+        val snapshot = _state.value
+        val (pos, dur) = resolveLivePositionAndDuration(snapshot)
+        lastCursorPersistRealtimeMs = SystemClock.elapsedRealtime()
+        queuePersistJob?.cancel()
+        queuePersistJob = scope.launch(Dispatchers.IO) {
+            playbackSessionStore.saveQueueAndCursor(
+                queue = snapshot.queue,
+                queueSource = snapshot.queueSource,
+                currentIndex = snapshot.currentIndex,
+                positionMs = pos,
+                durationMs = dur,
+                repeatMode = snapshot.repeatMode,
+                activeQualityBadge = snapshot.activeQualityBadge,
+                activeProviderName = snapshot.activeProviderName
+            )
+        }
+    }
+
+    private fun persistCursorAsync(force: Boolean) {
+        val snapshot = _state.value
+        val track = snapshot.currentTrack ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - lastCursorPersistRealtimeMs < CURSOR_PERSIST_INTERVAL_MS) return
+        lastCursorPersistRealtimeMs = now
+        val (pos, dur) = resolveLivePositionAndDuration(snapshot)
+        cursorPersistJob?.cancel()
+        cursorPersistJob = scope.launch(Dispatchers.IO) {
+            playbackSessionStore.saveCursorOnly(
+                currentIndex = snapshot.currentIndex,
+                currentTrackId = track.id,
+                positionMs = pos,
+                durationMs = dur,
+                repeatMode = snapshot.repeatMode,
+                activeQualityBadge = snapshot.activeQualityBadge,
+                activeProviderName = snapshot.activeProviderName
+            )
+        }
+    }
+
+    /**
+     * Synchronously flushes the tiny playback cursor (and clears if empty) when the app is
+     * backgrounded, swiped away, or destroyed so the latest second is never lost.
+     */
+    fun persistSnapshotNow() {
+        val snapshot = _state.value
+        val track = snapshot.currentTrack ?: return
+        val (pos, dur) = resolveLivePositionAndDuration(snapshot)
+        pendingResumePositionMs = pos
+        lastCursorPersistRealtimeMs = SystemClock.elapsedRealtime()
+        playbackSessionStore.saveCursorOnly(
+            currentIndex = snapshot.currentIndex,
+            currentTrackId = track.id,
+            positionMs = pos,
+            durationMs = dur,
+            repeatMode = snapshot.repeatMode,
+            activeQualityBadge = snapshot.activeQualityBadge,
+            activeProviderName = snapshot.activeProviderName
+        )
     }
 
     /**
@@ -231,6 +361,11 @@ class PlayerController(
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (isAwaitingMediaLoad) return
                 _state.update { it.copy(isPlaying = isPlaying) }
+                if (!isPlaying) {
+                    val (pos, _) = resolveLivePositionAndDuration(_state.value)
+                    pendingResumePositionMs = pos
+                    persistCursorAsync(force = true)
+                }
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -416,35 +551,60 @@ class PlayerController(
         } else {
             resolveCoverAsync(validIdx, next.track)
         }
+        persistCursorAsync(force = true)
         scope.launch(Dispatchers.IO) {
             libraryRepository.recordPlay(next.track)
         }
     }
 
-    fun playTracks(tracks: List<Track>, startIndex: Int = 0) {
+    fun playTracks(
+        tracks: List<Track>,
+        startIndex: Int = 0,
+        queueSource: PlaybackQueueSource? = null
+    ) {
         if (tracks.isEmpty()) return
+        hasUserInitiatedPlayback = true
         val clamped = startIndex.coerceIn(0, tracks.lastIndex)
         clearPreloadedNext(removeFromPlayer = true)
-        _state.update { it.copy(queue = tracks, currentIndex = clamped) }
+        _state.update {
+            it.copy(
+                queue = tracks,
+                currentIndex = clamped,
+                queueSource = queueSource,
+                positionMs = 0L
+            )
+        }
+        persistQueueAndCursorAsync()
         loadAndPlayIndex(clamped)
     }
 
-    fun playSingle(track: Track) {
+    fun playSingle(track: Track, queueSource: PlaybackQueueSource? = null) {
+        hasUserInitiatedPlayback = true
         clearPreloadedNext(removeFromPlayer = true)
         val currentQueue = _state.value.queue.toMutableList()
         val existingIdx = currentQueue.indexOfFirst { it.id == track.id }
         if (existingIdx >= 0) {
-            _state.update { it.copy(currentIndex = existingIdx) }
+            _state.update { it.copy(currentIndex = existingIdx, positionMs = 0L) }
+            persistCursorAsync(force = true)
             loadAndPlayIndex(existingIdx)
         } else {
             val insertAt = (_state.value.currentIndex + 1).coerceIn(0, currentQueue.size)
             currentQueue.add(insertAt, track)
-            _state.update { it.copy(queue = currentQueue, currentIndex = insertAt) }
+            _state.update {
+                it.copy(
+                    queue = currentQueue,
+                    currentIndex = insertAt,
+                    queueSource = it.queueSource ?: queueSource,
+                    positionMs = 0L
+                )
+            }
+            persistQueueAndCursorAsync()
             loadAndPlayIndex(insertAt)
         }
     }
 
     fun playNextInQueue(track: Track) {
+        hasUserInitiatedPlayback = true
         clearPreloadedNext(removeFromPlayer = true)
         val currentQueue = _state.value.queue.toMutableList()
         if (currentQueue.isEmpty()) {
@@ -464,10 +624,12 @@ class PlayerController(
         val insertAt = (curIdx + 1).coerceIn(0, currentQueue.size)
         currentQueue.add(insertAt, track)
         _state.update { it.copy(queue = currentQueue, currentIndex = curIdx) }
+        persistQueueAndCursorAsync()
         emitMessage("已加入下一首播放：《${track.title}》")
     }
 
     fun removeFromQueue(index: Int) {
+        hasUserInitiatedPlayback = true
         clearPreloadedNext(removeFromPlayer = true)
         val queue = _state.value.queue.toMutableList()
         if (index !in queue.indices) return
@@ -482,6 +644,7 @@ class PlayerController(
                 isRecoveringError = false
                 hasEnteredReadyForActiveMedia = false
                 activeExpectedMediaId = null
+                lyricsLoadedForTrackId = null
                 pendingResumePositionMs = 0L
                 mediaController?.stop()
                 mediaController?.clearMediaItems()
@@ -489,6 +652,7 @@ class PlayerController(
                     it.copy(
                         queue = emptyList(),
                         currentIndex = -1,
+                        queueSource = null,
                         isPlaying = false,
                         isBuffering = false,
                         positionMs = 0L,
@@ -496,19 +660,28 @@ class PlayerController(
                         lyrics = ParsedLyrics()
                     )
                 }
+                persistQueueAndCursorAsync()
                 PlaybackService.refreshNotificationIfNeeded()
             }
-            index < cur -> _state.update { it.copy(queue = queue, currentIndex = cur - 1) }
+            index < cur -> {
+                _state.update { it.copy(queue = queue, currentIndex = cur - 1) }
+                persistQueueAndCursorAsync()
+            }
             index == cur -> {
                 val nextIdx = cur.coerceAtMost(queue.lastIndex)
-                _state.update { it.copy(queue = queue, currentIndex = nextIdx) }
+                _state.update { it.copy(queue = queue, currentIndex = nextIdx, positionMs = 0L) }
+                persistQueueAndCursorAsync()
                 loadAndPlayIndex(nextIdx)
             }
-            else -> _state.update { it.copy(queue = queue) }
+            else -> {
+                _state.update { it.copy(queue = queue) }
+                persistQueueAndCursorAsync()
+            }
         }
     }
 
     fun clearQueue() {
+        hasUserInitiatedPlayback = true
         clearPreloadedNext(removeFromPlayer = false)
         recoveryDelayJob?.cancel()
         resolveJob?.cancel()
@@ -517,6 +690,7 @@ class PlayerController(
         isRecoveringError = false
         hasEnteredReadyForActiveMedia = false
         activeExpectedMediaId = null
+        lyricsLoadedForTrackId = null
         pendingResumePositionMs = 0L
         mediaController?.stop()
         mediaController?.clearMediaItems()
@@ -524,6 +698,7 @@ class PlayerController(
             it.copy(
                 queue = emptyList(),
                 currentIndex = -1,
+                queueSource = null,
                 isPlaying = false,
                 isBuffering = false,
                 positionMs = 0L,
@@ -531,6 +706,7 @@ class PlayerController(
                 lyrics = ParsedLyrics()
             )
         }
+        persistQueueAndCursorAsync()
         PlaybackService.refreshNotificationIfNeeded()
     }
 
@@ -566,6 +742,7 @@ class PlayerController(
         pendingResumePositionMs = clamped
         mediaController?.seekTo(clamped)
         _state.update { it.copy(positionMs = clamped) }
+        persistCursorAsync(force = true)
     }
 
     fun hasNext(): Boolean = _state.value.queue.size > 1
@@ -626,6 +803,7 @@ class PlayerController(
             } else {
                 resolveCoverAsync(readyNext.nextIndex, readyNext.track)
             }
+            persistCursorAsync(force = true)
             resolveJob = scope.launch {
                 startPlaybackOnMedia3(
                     track = readyNext.track,
@@ -671,6 +849,7 @@ class PlayerController(
             }
         }
         clearPreloadedNext(removeFromPlayer = true)
+        persistCursorAsync(force = true)
     }
 
     fun retryWithQuality(quality: AudioQuality, preferredSourceId: String? = null) {
@@ -886,23 +1065,27 @@ class PlayerController(
         }
         pendingResumePositionMs = resumePositionMs
 
+        val reuseLyrics = isRuntimeFallbackRetry || lyricsLoadedForTrackId == track.id
         _state.update {
             it.copy(
                 currentIndex = index,
                 isPlaying = false,
                 isBuffering = true,
                 positionMs = resumePositionMs,
-                durationMs = if (isRuntimeFallbackRetry && it.durationMs > 0L) it.durationMs else track.durationMs,
-                activeQualityBadge = if (isRuntimeFallbackRetry) it.activeQualityBadge else track.bestQualityBadge,
+                durationMs = if ((isRuntimeFallbackRetry || it.currentTrack?.id == track.id) && it.durationMs > 0L) it.durationMs else track.durationMs,
+                activeQualityBadge = if (isRuntimeFallbackRetry) it.activeQualityBadge else (it.activeQualityBadge?.takeIf { reuseLyrics } ?: track.bestQualityBadge),
                 activeProviderName = if (isRuntimeFallbackRetry) it.activeProviderName else null,
-                lyrics = if (isRuntimeFallbackRetry) it.lyrics else ParsedLyrics(),
-                isLoadingLyrics = !isRuntimeFallbackRetry
+                lyrics = if (reuseLyrics) it.lyrics else ParsedLyrics(),
+                isLoadingLyrics = !reuseLyrics
             )
         }
+        persistCursorAsync(force = true)
 
         // Launch parallel lyrics, cover enrichment & ambient color tasks without blocking playback resolution
         if (!isRuntimeFallbackRetry) {
-            loadLyricsAsync(track)
+            if (!reuseLyrics) {
+                loadLyricsAsync(track)
+            }
             if (!track.coverUrl.isNullOrBlank()) {
                 extractAmbientPaletteAsync(track.coverUrl)
             } else {
@@ -1033,6 +1216,7 @@ class PlayerController(
                 if (_state.value.currentTrack?.id == track.id) {
                     extractAmbientPaletteAsync(resolvedCover)
                 }
+                persistQueueAndCursorAsync()
             }
         }
     }
@@ -1103,6 +1287,7 @@ class PlayerController(
         }
         controller.prepare()
         controller.play()
+        persistCursorAsync(force = true)
 
         withContext(Dispatchers.IO) {
             libraryRepository.recordPlay(track)
@@ -1111,11 +1296,13 @@ class PlayerController(
 
     private fun loadLyricsAsync(track: Track) {
         lyricJob?.cancel()
+        lyricsLoadedForTrackId = null
         lyricJob = scope.launch {
             val parsed = withContext(Dispatchers.IO) {
                 runCatching { musicAggregator.fetchLyrics(track) }.getOrDefault(ParsedLyrics())
             }
             if (_state.value.currentTrack?.id == track.id) {
+                lyricsLoadedForTrackId = track.id
                 _state.update { it.copy(lyrics = parsed, isLoadingLyrics = false) }
             }
         }
@@ -1179,9 +1366,11 @@ class PlayerController(
                     ) {
                         val pos = ctrl.currentPosition.coerceAtLeast(0L)
                         val dur = ctrl.duration.takeIf { it > 0L } ?: _state.value.durationMs
+                        pendingResumePositionMs = pos
                         if (pos != _state.value.positionMs || dur != _state.value.durationMs) {
                             _state.update { it.copy(positionMs = pos, durationMs = dur) }
                         }
+                        persistCursorAsync(force = false)
 
                         // Once playback progresses stably by 8s after a recovery, restore fresh retry budget
                         if (runtimeRetryCount > 0 && pos >= lastRecoveryStartPositionMs + STABLE_PLAYBACK_RESET_DELTA_MS) {

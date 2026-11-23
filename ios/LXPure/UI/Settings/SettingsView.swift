@@ -5,6 +5,7 @@ struct SettingsView: View {
     let sources: [UserApiSource]
     let downloadedBytes: Int64
     let cacheBytes: Int64
+    var isCheckingUpdate: Bool = false
     let bottomInset: CGFloat
     let onOpenSourceManager: () -> Void
     let onSelectQuality: (AudioQuality) -> Void
@@ -15,6 +16,7 @@ struct SettingsView: View {
     let onToggleTranslation: (Bool) -> Void
     let onScanLocalMusic: () -> Void
     let onClearCache: () -> Void
+    var onCheckUpdate: () -> Void = {}
 
     @Environment(\.lxPalette) private var lx
 
@@ -23,7 +25,7 @@ struct SettingsView: View {
     }
 
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.1"
     }
 
     var body: some View {
@@ -218,6 +220,36 @@ struct SettingsView: View {
 
                 // 5. About
                 settingsGroup(title: "关于轻雪音乐") {
+                    Button {
+                        if !isCheckingUpdate { onCheckUpdate() }
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("检查新版本")
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundColor(lx.textPrimary)
+                                Text(isCheckingUpdate ? "正在连接 GitHub 查询最新版本…" : "当前版本 v\(appVersion)")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(lx.textSecondary)
+                            }
+                            Spacer()
+                            if isCheckingUpdate {
+                                ProgressView().tint(lx.accent).scaleEffect(0.8)
+                            } else {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(lx.textTertiary)
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isCheckingUpdate)
+
+                    Divider().overlay(lx.hairline)
+
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text("轻雪音乐 · LX Pure (iOS 纯净版)")

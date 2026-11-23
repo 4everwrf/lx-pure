@@ -44,6 +44,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     private var runtimes: [String: LxJsRuntime] = [:]
     private var platformCooldowns: [String: Date] = [:]
     private var sourcesSnapshot: [UserApiSource] = []
+    private var hasCompletedInitialStoreLoad = false
 
     private struct ResolveCandidate: Sendable {
         let track: Track
@@ -71,6 +72,24 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
         Task {
             await self.reloadAllFromStore()
+            self.withLock { self.hasCompletedInitialStoreLoad = true }
+        }
+    }
+
+    /// Waits briefly on cold launch so tapping Play on a restored track immediately after
+    /// opening the app lets custom JS source runtimes finish initializing.
+    func awaitInitialLoadIfNeeded(timeoutSec: Double = 4.0) async {
+        let deadline = Date().addingTimeInterval(timeoutSec)
+        while Date() < deadline {
+            let (loaded, list) = withLock { (hasCompletedInitialStoreLoad, sourcesSnapshot) }
+            if loaded {
+                let hasReady = list.contains { $0.enabled && $0.status == .ready }
+                let hasInitializing = list.contains { $0.enabled && $0.status == .initializing }
+                if hasReady || !hasInitializing {
+                    break
+                }
+            }
+            try? await Task.sleep(nanoseconds: 60_000_000)
         }
     }
 
@@ -493,6 +512,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         excludedSourceIds: Set<String> = [],
         excludedTrackIds: Set<String> = []
     ) async -> Result<ResolvedStream, Error> {
+        await awaitInitialLoadIfNeeded()
         let allSources = currentSources()
         let readySources = allSources
             .filter { $0.enabled && $0.status == .ready && !excludedSourceIds.contains($0.id) }

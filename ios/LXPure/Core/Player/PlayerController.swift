@@ -21,6 +21,7 @@ struct PlayerUiEvent: Identifiable, Sendable {
 struct PlayerState: Equatable {
     var queue: [Track] = []
     var currentIndex: Int = -1
+    var queueSource: PlaybackQueueSource? = nil
     var isPlaying: Bool = false
     var isBuffering: Bool = false
     var positionMs: Int64 = 0
@@ -65,12 +66,14 @@ final class PlayerController: ObservableObject {
     private static let preloadWindowMs: Int64 = 20_000
     private static let minTrackDurationForPreloadMs: Int64 = 25_000
     private static let stablePlaybackResetDeltaMs: Int64 = 8_000
+    private static let cursorPersistIntervalSec: TimeInterval = 3.0
 
     private let player = AVPlayer()
     private let networkAdvisor: NetworkQualityAdvisor
     private let audioCacheManager: AudioCacheManager
     private let settingsStore: SettingsStore
     private let libraryStore: LibraryStore
+    private let playbackSessionStore: PlaybackSessionStore
     private let userApiManager: UserApiManager
     private let musicAggregator: MusicAggregator
     private let downloadManager: DownloadManager
@@ -106,12 +109,16 @@ final class PlayerController: ObservableObject {
     private var preloadAttemptedForTrackId: String?
     private var preloadedNext: PreloadedNextItem?
     private var cachedArtworkImage: UIImage?
+    private var pendingInitialSeekMs: Int64?
+    private var lyricsLoadedForTrackId: String?
+    private var lastCursorPersistUptime: TimeInterval = 0
 
     init(
         networkAdvisor: NetworkQualityAdvisor,
         audioCacheManager: AudioCacheManager,
         settingsStore: SettingsStore,
         libraryStore: LibraryStore,
+        playbackSessionStore: PlaybackSessionStore,
         userApiManager: UserApiManager,
         musicAggregator: MusicAggregator,
         downloadManager: DownloadManager
@@ -120,6 +127,7 @@ final class PlayerController: ObservableObject {
         self.audioCacheManager = audioCacheManager
         self.settingsStore = settingsStore
         self.libraryStore = libraryStore
+        self.playbackSessionStore = playbackSessionStore
         self.userApiManager = userApiManager
         self.musicAggregator = musicAggregator
         self.downloadManager = downloadManager
@@ -129,6 +137,84 @@ final class PlayerController: ObservableObject {
         configureRemoteCommands()
         observePlayerState()
         observeAudioSessionNotifications()
+        restoreLastSession()
+    }
+
+    private func restoreLastSession() {
+        guard let restored = playbackSessionStore.loadSession(),
+              restored.queue.indices.contains(restored.currentIndex) else {
+            return
+        }
+        let track = restored.queue[restored.currentIndex]
+        pendingResumePositionMs = restored.positionMs
+        lastRecoveryStartPositionMs = restored.positionMs
+        state = PlayerState(
+            queue: restored.queue,
+            currentIndex: restored.currentIndex,
+            queueSource: restored.queueSource,
+            isPlaying: false,
+            isBuffering: false,
+            positionMs: restored.positionMs,
+            durationMs: restored.durationMs,
+            repeatMode: restored.repeatMode,
+            activeQualityBadge: restored.activeQualityBadge,
+            activeProviderName: restored.activeProviderName,
+            lyrics: ParsedLyrics(),
+            isLoadingLyrics: true,
+            ambientPalette: .default,
+            sleepTimerRemainingMs: nil
+        )
+        loadMetadataAndVisuals(for: track)
+        updateNowPlayingInfo()
+    }
+
+    private func persistQueueAndCursor(synchronous: Bool = false) {
+        lastCursorPersistUptime = ProcessInfo.processInfo.systemUptime
+        playbackSessionStore.saveQueueAndCursor(
+            queue: state.queue,
+            queueSource: state.queueSource,
+            currentIndex: state.currentIndex,
+            positionMs: state.positionMs,
+            durationMs: state.durationMs,
+            repeatMode: state.repeatMode,
+            activeQualityBadge: state.activeQualityBadge,
+            activeProviderName: state.activeProviderName,
+            synchronous: synchronous
+        )
+    }
+
+    private func persistCursor(force: Bool, synchronous: Bool = false) {
+        guard let track = state.currentTrack, state.currentIndex >= 0 else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !force && (now - lastCursorPersistUptime) < Self.cursorPersistIntervalSec {
+            return
+        }
+        lastCursorPersistUptime = now
+        playbackSessionStore.saveCursorOnly(
+            currentIndex: state.currentIndex,
+            currentTrackId: track.id,
+            positionMs: state.positionMs,
+            durationMs: state.durationMs,
+            repeatMode: state.repeatMode,
+            activeQualityBadge: state.activeQualityBadge,
+            activeProviderName: state.activeProviderName,
+            synchronous: synchronous
+        )
+    }
+
+    func persistSnapshotNow(synchronous: Bool = true) {
+        guard state.currentTrack != nil else { return }
+        if player.currentItem != nil, pendingInitialSeekMs == nil {
+            let secs = player.currentTime().seconds
+            if secs.isFinite && secs >= 0 {
+                let liveMs = Int64(secs * 1000.0)
+                if liveMs > 0 || state.positionMs == 0 {
+                    state.positionMs = liveMs
+                    pendingResumePositionMs = liveMs
+                }
+            }
+        }
+        persistCursor(force: true, synchronous: synchronous)
     }
 
     deinit {
@@ -142,21 +228,24 @@ final class PlayerController: ObservableObject {
 
     // MARK: - Public Controls
 
-    func playTrack(_ track: Track, inQueue queue: [Track]? = nil) {
+    func playTrack(_ track: Track, inQueue queue: [Track]? = nil, queueSource: PlaybackQueueSource? = nil) {
         if let queue, !queue.isEmpty {
             let idx = queue.firstIndex(where: { $0.id == track.id }) ?? 0
-            playTracks(queue, startIndex: idx)
+            playTracks(queue, startIndex: idx, queueSource: queueSource)
         } else {
-            playTracks([track], startIndex: 0)
+            playTracks([track], startIndex: 0, queueSource: queueSource)
         }
     }
 
-    func playTracks(_ tracks: [Track], startIndex: Int = 0) {
+    func playTracks(_ tracks: [Track], startIndex: Int = 0, queueSource: PlaybackQueueSource? = nil) {
         guard !tracks.isEmpty else { return }
         let safeIndex = min(max(startIndex, 0), tracks.count - 1)
         consecutiveAutoSkipCount = 0
         state.queue = tracks
         state.currentIndex = safeIndex
+        state.queueSource = queueSource
+        state.positionMs = 0
+        persistQueueAndCursor()
         loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
     }
 
@@ -177,6 +266,7 @@ final class PlayerController: ObservableObject {
         updated.insert(track, at: insertIdx)
         state.queue = updated
         clearPreloadedNext()
+        persistQueueAndCursor()
         events.send(PlayerUiEvent(message: "已将《\(track.title)》设为下一首播放"))
     }
 
@@ -187,6 +277,7 @@ final class PlayerController: ObservableObject {
         }
         if !state.queue.contains(where: { $0.id == track.id }) {
             state.queue.append(track)
+            persistQueueAndCursor()
         }
         events.send(PlayerUiEvent(message: "已加入播放队列"))
     }
@@ -203,9 +294,14 @@ final class PlayerController: ObservableObject {
         }
         if index < state.currentIndex {
             state.currentIndex -= 1
+            persistQueueAndCursor()
         } else if removingCurrent {
             state.currentIndex = min(index, state.queue.count - 1)
+            state.positionMs = 0
+            persistQueueAndCursor()
             loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+        } else {
+            persistQueueAndCursor()
         }
     }
 
@@ -216,12 +312,15 @@ final class PlayerController: ObservableObject {
     func togglePlayPause() {
         if state.currentTrack == nil { return }
         if player.currentItem == nil {
-            loadAndPlayCurrent(resetRecoveryState: true, seekToMs: state.positionMs)
+            let resumeMs = max(state.positionMs, pendingResumePositionMs)
+            loadAndPlayCurrent(resetRecoveryState: true, seekToMs: resumeMs)
             return
         }
         if state.isPlaying {
             player.pause()
             state.isPlaying = false
+            pendingResumePositionMs = state.positionMs
+            persistCursor(force: true)
             updateNowPlayingInfo()
         } else {
             activateAudioSession()
@@ -234,12 +333,21 @@ final class PlayerController: ObservableObject {
     func seek(to positionMs: Int64) {
         let clamped = max(positionMs, 0)
         state.positionMs = clamped
-        let target = CMTime(value: clamped, timescale: 1000)
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            Task { @MainActor in
-                self?.updateNowPlayingInfo()
-            }
+        pendingResumePositionMs = clamped
+        if pendingInitialSeekMs != nil {
+            pendingInitialSeekMs = clamped
         }
+        if player.currentItem != nil {
+            let target = CMTime(value: clamped, timescale: 1000)
+            player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                Task { @MainActor in
+                    self?.updateNowPlayingInfo()
+                }
+            }
+        } else {
+            updateNowPlayingInfo()
+        }
+        persistCursor(force: true)
     }
 
     func next(isAutoAdvance: Bool = false) {
@@ -255,6 +363,8 @@ final class PlayerController: ObservableObject {
             preloadedNext = nil
             preloadAttemptedForTrackId = nil
             state.currentIndex = nextIdx
+            state.positionMs = 0
+            persistCursor(force: true)
             playPreparedTrack(
                 track: preloaded.track,
                 url: preloaded.playbackURL,
@@ -271,6 +381,8 @@ final class PlayerController: ObservableObject {
         }
 
         state.currentIndex = nextIdx
+        state.positionMs = 0
+        persistCursor(force: true)
         loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
     }
 
@@ -288,12 +400,15 @@ final class PlayerController: ObservableObject {
             prevIdx = (state.currentIndex - 1 + state.queue.count) % state.queue.count
         }
         state.currentIndex = prevIdx
+        state.positionMs = 0
+        persistCursor(force: true)
         loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
     }
 
     func cycleRepeatMode() {
         state.repeatMode = state.repeatMode.next()
         clearPreloadedNext()
+        persistCursor(force: true)
         events.send(PlayerUiEvent(message: "播放模式：\(state.repeatMode.label)"))
     }
 
@@ -362,15 +477,20 @@ final class PlayerController: ObservableObject {
         let loadToken = UUID()
         activeLoadToken = loadToken
         pendingResumePositionMs = max(seekToMs, 0)
+        pendingInitialSeekMs = seekToMs > 0 ? seekToMs : nil
 
+        let reuseVisuals = resetRecoveryState && lyricsLoadedForTrackId == track.id
         state.isBuffering = true
         state.positionMs = max(seekToMs, 0)
-        state.durationMs = track.durationMs
+        state.durationMs = max(track.durationMs, reuseVisuals ? state.durationMs : 0)
         if resetRecoveryState {
-            state.activeQualityBadge = nil
-            state.activeProviderName = nil
-            loadMetadataAndVisuals(for: track)
+            if !reuseVisuals {
+                state.activeQualityBadge = nil
+                state.activeProviderName = nil
+                loadMetadataAndVisuals(for: track)
+            }
         }
+        persistCursor(force: true)
         updateNowPlayingInfo()
 
         let settings = settingsStore.settings
@@ -535,6 +655,10 @@ final class PlayerController: ObservableObject {
         }
 
         let item = AVPlayerItem(asset: asset)
+        pendingInitialSeekMs = seekToMs > 0 ? seekToMs : nil
+        if seekToMs > 0 {
+            state.positionMs = seekToMs
+        }
         observeCurrentItem(item)
         player.replaceCurrentItem(with: item)
         if seekToMs > 0 {
@@ -544,6 +668,7 @@ final class PlayerController: ObservableObject {
         player.play()
         state.isPlaying = true
         libraryStore.recordPlay(track)
+        persistCursor(force: true)
         updateNowPlayingInfo()
 
         // Opportunistically cache remote stream on disk for instant zero-data replays
@@ -726,6 +851,7 @@ final class PlayerController: ObservableObject {
 
         state.lyrics = ParsedLyrics()
         state.isLoadingLyrics = true
+        lyricsLoadedForTrackId = nil
         cachedArtworkImage = nil
 
         let trackId = track.id
@@ -741,6 +867,7 @@ final class PlayerController: ObservableObject {
                         self.state.currentIndex < self.state.queue.count &&
                         self.state.queue[self.state.currentIndex].id == trackId {
                         self.state.queue[self.state.currentIndex].coverUrl = resolved
+                        self.persistQueueAndCursor()
                     }
                 }
             }
@@ -767,6 +894,7 @@ final class PlayerController: ObservableObject {
             guard let self else { return }
             let fetched = await self.musicAggregator.fetchLyrics(for: track)
             guard !Task.isCancelled, self.state.currentTrack?.id == trackId else { return }
+            self.lyricsLoadedForTrackId = trackId
             self.state.lyrics = fetched
             self.state.isLoadingLyrics = false
         }
@@ -847,6 +975,8 @@ final class PlayerController: ObservableObject {
                 case .paused:
                     self.state.isPlaying = false
                     self.state.isBuffering = false
+                    self.pendingResumePositionMs = self.state.positionMs
+                    self.persistCursor(force: true)
                 @unknown default:
                     break
                 }
@@ -859,13 +989,15 @@ final class PlayerController: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 let posSec = time.seconds
-                if posSec.isFinite && posSec >= 0 {
+                if self.pendingInitialSeekMs == nil, posSec.isFinite && posSec >= 0 {
                     let posMs = Int64(posSec * 1000.0)
                     self.state.positionMs = posMs
+                    self.pendingResumePositionMs = posMs
                     if self.runtimeRetryCount > 0 &&
                         posMs >= self.lastRecoveryStartPositionMs + Self.stablePlaybackResetDeltaMs {
                         self.runtimeRetryCount = 0
                     }
+                    self.persistCursor(force: false)
                 }
                 if let dur = self.player.currentItem?.duration.seconds, dur.isFinite && dur > 0 {
                     self.state.durationMs = Int64(dur * 1000.0)
@@ -889,8 +1021,25 @@ final class PlayerController: ObservableObject {
                     if observedItem.duration.seconds.isFinite && observedItem.duration.seconds > 0 {
                         self.state.durationMs = Int64(observedItem.duration.seconds * 1000.0)
                     }
-                    self.updateNowPlayingInfo()
+                    if let targetMs = self.pendingInitialSeekMs {
+                        let clampedTarget = self.state.durationMs > 0
+                            ? min(targetMs, max(self.state.durationMs - 1_000, 0))
+                            : targetMs
+                        let targetTime = CMTime(value: clampedTarget, timescale: 1000)
+                        self.player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                            Task { @MainActor in
+                                guard let self else { return }
+                                self.state.positionMs = clampedTarget
+                                self.pendingResumePositionMs = clampedTarget
+                                self.pendingInitialSeekMs = nil
+                                self.updateNowPlayingInfo()
+                            }
+                        }
+                    } else {
+                        self.updateNowPlayingInfo()
+                    }
                 case .failed:
+                    self.pendingInitialSeekMs = nil
                     self.handleRuntimePlaybackError(item: observedItem, error: observedItem.error)
                 default:
                     break
@@ -1018,10 +1167,14 @@ final class PlayerController: ObservableObject {
         resolveTask?.cancel()
         recoveryTask?.cancel()
         clearPreloadedNext()
+        pendingInitialSeekMs = nil
+        pendingResumePositionMs = 0
+        lyricsLoadedForTrackId = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
         state = PlayerState(repeatMode: state.repeatMode)
         cachedArtworkImage = nil
+        playbackSessionStore.clear()
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 }

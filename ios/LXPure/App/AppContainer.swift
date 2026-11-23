@@ -8,7 +8,9 @@ final class AppContainer: ObservableObject {
     let networkAdvisor: NetworkQualityAdvisor
     let settingsStore: SettingsStore
     let libraryStore: LibraryStore
+    let playbackSessionStore: PlaybackSessionStore
     let musicAggregator: MusicAggregator
+    let appUpdateManager: AppUpdateManager
     let userApiManager: UserApiManager
     let audioCacheManager: AudioCacheManager
     let downloadManager: DownloadManager
@@ -16,6 +18,8 @@ final class AppContainer: ObservableObject {
     let playerController: PlayerController
 
     private var memoryWarningObserver: NSObjectProtocol?
+    private var willResignActiveObserver: NSObjectProtocol?
+    private var willTerminateObserver: NSObjectProtocol?
 
     init() {
         let config = URLSessionConfiguration.default
@@ -34,7 +38,9 @@ final class AppContainer: ObservableObject {
         self.networkAdvisor = NetworkQualityAdvisor(startMonitoring: true)
         self.settingsStore = SettingsStore()
         self.libraryStore = LibraryStore()
+        self.playbackSessionStore = PlaybackSessionStore()
         self.musicAggregator = MusicAggregator(session: urlSession)
+        self.appUpdateManager = AppUpdateManager(session: urlSession)
         self.userApiManager = UserApiManager(
             libraryStore: libraryStore,
             session: urlSession,
@@ -53,6 +59,7 @@ final class AppContainer: ObservableObject {
             audioCacheManager: audioCacheManager,
             settingsStore: settingsStore,
             libraryStore: libraryStore,
+            playbackSessionStore: playbackSessionStore,
             userApiManager: userApiManager,
             musicAggregator: musicAggregator,
             downloadManager: downloadManager
@@ -67,15 +74,38 @@ final class AppContainer: ObservableObject {
                 self?.handleMemoryPressure()
             }
         }
+
+        willResignActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.playerController.persistSnapshotNow(synchronous: true)
+            }
+        }
+
+        willTerminateObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.playerController.persistSnapshotNow(synchronous: true)
+            }
+        }
     }
 
     deinit {
-        if let obs = memoryWarningObserver {
-            NotificationCenter.default.removeObserver(obs)
+        [memoryWarningObserver, willResignActiveObserver, willTerminateObserver].forEach {
+            if let obs = $0 {
+                NotificationCenter.default.removeObserver(obs)
+            }
         }
     }
 
     func handleBackgroundTransition() {
+        playerController.persistSnapshotNow(synchronous: true)
         userApiManager.trimIdleRuntimes(keepTopCount: 2)
     }
 

@@ -544,6 +544,59 @@ struct AppSettings: Codable, Equatable, Sendable {
     var wifiOnlyHighQuality: Bool = true
 }
 
+enum QueueSourceType: String, Codable, Equatable, Hashable, Sendable {
+    case unknown
+    case favorites
+    case local
+    case downloads
+    case history
+    case userPlaylist
+    case onlinePlaylist
+    case leaderboard
+    case search
+}
+
+struct PlaybackQueueSource: Codable, Equatable, Hashable, Sendable {
+    var type: QueueSourceType = .unknown
+    var title: String = ""
+    var userPlaylistId: Int64? = nil
+    var onlinePlaylist: OnlinePlaylist? = nil
+    var leaderboard: LeaderboardItem? = nil
+
+    init(
+        type: QueueSourceType = .unknown,
+        title: String = "",
+        userPlaylistId: Int64? = nil,
+        onlinePlaylist: OnlinePlaylist? = nil,
+        leaderboard: LeaderboardItem? = nil
+    ) {
+        self.type = type
+        self.title = title
+        self.userPlaylistId = userPlaylistId
+        self.onlinePlaylist = onlinePlaylist
+        self.leaderboard = leaderboard
+    }
+}
+
+struct PlaybackQueueSnapshot: Codable, Sendable {
+    var version: Int = 1
+    var queue: [Track] = []
+    var queueSource: PlaybackQueueSource? = nil
+    var savedAt: Int64 = 0
+}
+
+struct PlaybackCursorSnapshot: Codable, Sendable {
+    var version: Int = 1
+    var currentIndex: Int = -1
+    var currentTrackId: String? = nil
+    var positionMs: Int64 = 0
+    var durationMs: Int64 = 0
+    var repeatMode: RepeatMode = .listLoop
+    var activeQualityBadge: String? = nil
+    var activeProviderName: String? = nil
+    var updatedAt: Int64 = 0
+}
+
 struct PlaylistDetailResult: Sendable {
     let playlist: OnlinePlaylist
     let tracks: [Track]

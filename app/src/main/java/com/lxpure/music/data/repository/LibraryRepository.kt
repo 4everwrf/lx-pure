@@ -17,7 +17,50 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 
+sealed class CreatePlaylistResult {
+    data class Created(val playlistId: Long) : CreatePlaylistResult()
+    data class LimitReached(val maxAllowed: Int) : CreatePlaylistResult()
+}
+
+data class AddTracksResult(
+    val addedCount: Int,
+    val duplicateCount: Int
+)
+
 class LibraryRepository(private val db: AppDatabase) {
+
+    companion object {
+        const val MAX_CUSTOM_PLAYLISTS = 10
+
+        fun isCustomPlaylist(sourceUrl: String?): Boolean = sourceUrl.isNullOrBlank()
+
+        fun customPlaylistCount(playlists: List<UserPlaylist>): Int =
+            playlists.count { isCustomPlaylist(it.sourceUrl) }
+
+        fun canCreateCustomPlaylist(playlists: List<UserPlaylist>): Boolean =
+            customPlaylistCount(playlists) < MAX_CUSTOM_PLAYLISTS
+
+        /**
+         * Filters out tracks already present in a playlist (and duplicates within [tracksToAdd]),
+         * preserving insertion order and returning both the unique additions and duplicate count.
+         */
+        fun filterNewTracksForPlaylist(
+            existingTrackIds: Set<String>,
+            tracksToAdd: List<Track>
+        ): Pair<List<Track>, Int> {
+            val seen = HashSet(existingTrackIds)
+            val uniqueNew = mutableListOf<Track>()
+            var duplicateCount = 0
+            tracksToAdd.forEach { track ->
+                if (seen.add(track.id)) {
+                    uniqueNew.add(track)
+                } else {
+                    duplicateCount++
+                }
+            }
+            return uniqueNew to duplicateCount
+        }
+    }
 
     val favorites: Flow<List<Track>> = db.favoriteDao().observeAll().map { list ->
         list.map { it.toTrack() }
@@ -98,7 +141,10 @@ class LibraryRepository(private val db: AppDatabase) {
         coverUrl: String? = null,
         sourceUrl: String? = null,
         tracks: List<Track> = emptyList()
-    ): Long {
+    ): CreatePlaylistResult = withContext(Dispatchers.IO) {
+        if (isCustomPlaylist(sourceUrl) && db.playlistDao().countCustomPlaylists() >= MAX_CUSTOM_PLAYLISTS) {
+            return@withContext CreatePlaylistResult.LimitReached(MAX_CUSTOM_PLAYLISTS)
+        }
         val cover = coverUrl ?: tracks.firstOrNull { !it.coverUrl.isNullOrBlank() }?.coverUrl
         val id = db.playlistDao().insert(
             PlaylistEntity(
@@ -111,32 +157,40 @@ class LibraryRepository(private val db: AppDatabase) {
         if (tracks.isNotEmpty()) {
             addTracksToPlaylist(id, tracks)
         }
-        return id
+        CreatePlaylistResult.Created(id)
     }
 
-    suspend fun addTracksToPlaylist(playlistId: Long, tracks: List<Track>) = withContext(Dispatchers.IO) {
+    suspend fun addTracksToPlaylist(playlistId: Long, tracks: List<Track>): AddTracksResult = withContext(Dispatchers.IO) {
         val existing = db.playlistDao().getTracksOnce(playlistId)
-        val startIndex = existing.size
-        val entities = tracks.mapIndexed { idx, track ->
-            PlaylistTrackEntity(
-                playlistId = playlistId,
-                trackId = track.id,
-                trackJson = roomJson.encodeToString(track),
-                position = startIndex + idx
-            )
-        }
-        // Batch SQLite inserts to support large 2,400–10,000+ track playlists cleanly
-        entities.chunked(500).forEach { batch ->
-            db.playlistDao().insertTracks(batch)
-        }
-        val playlist = db.playlistDao().getById(playlistId)
-        if (playlist != null && playlist.coverUrl.isNullOrBlank()) {
-            val cover = tracks.firstOrNull { !it.coverUrl.isNullOrBlank() }?.coverUrl
-            if (cover != null) {
-                db.playlistDao().updateMeta(playlistId, playlist.name, cover)
+        val existingIds = existing.mapTo(HashSet()) { it.trackId }
+        val (uniqueNew, duplicateCount) = filterNewTracksForPlaylist(existingIds, tracks)
+        if (uniqueNew.isNotEmpty()) {
+            val startPosition = (existing.maxOfOrNull { it.position } ?: -1) + 1
+            val entities = uniqueNew.mapIndexed { idx, track ->
+                PlaylistTrackEntity(
+                    playlistId = playlistId,
+                    trackId = track.id,
+                    trackJson = roomJson.encodeToString(track),
+                    position = startPosition + idx
+                )
+            }
+            // Batch SQLite inserts to support large 2,400–10,000+ track playlists cleanly
+            entities.chunked(500).forEach { batch ->
+                db.playlistDao().insertTracks(batch)
+            }
+            val playlist = db.playlistDao().getById(playlistId)
+            if (playlist != null && playlist.coverUrl.isNullOrBlank()) {
+                val cover = uniqueNew.firstOrNull { !it.coverUrl.isNullOrBlank() }?.coverUrl
+                if (cover != null) {
+                    db.playlistDao().updateMeta(playlistId, playlist.name, cover)
+                }
             }
         }
+        AddTracksResult(addedCount = uniqueNew.size, duplicateCount = duplicateCount)
     }
+
+    fun observePlaylistIdsForTrack(trackId: String): Flow<Set<Long>> =
+        db.playlistDao().observePlaylistIdsContainingTrack(trackId).map { it.toSet() }
 
     suspend fun removeTrackFromPlaylist(playlistId: Long, trackId: String) {
         db.playlistDao().removeTrack(playlistId, trackId)

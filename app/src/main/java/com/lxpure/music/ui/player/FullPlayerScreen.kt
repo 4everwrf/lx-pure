@@ -36,6 +36,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.Check
@@ -123,6 +124,7 @@ fun FullPlayerScreen(
     onSeek: (Long) -> Unit,
     onCycleRepeat: () -> Unit,
     onToggleFavorite: (Track) -> Unit,
+    onAddToPlaylist: (Track) -> Unit,
     onDownload: (Track) -> Unit,
     onOpenQueue: () -> Unit,
     onSelectQuality: (AudioQuality) -> Unit,
@@ -513,6 +515,14 @@ fun FullPlayerScreen(
                             modifier = Modifier.size(21.dp)
                         )
                     }
+                }
+                IconButton(onClick = { onAddToPlaylist(track) }) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.PlaylistAdd,
+                        contentDescription = "添加到歌单",
+                        tint = Color.White.copy(alpha = 0.72f),
+                        modifier = Modifier.size(24.dp)
+                    )
                 }
                 if (!track.isLocal) {
                     IconButton(onClick = { showQualitySheet = true }) {

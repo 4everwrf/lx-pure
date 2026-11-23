@@ -63,7 +63,29 @@ data class BatchUpdateSummary(
     val latestCount: Int,
     val failedCount: Int,
     val skippedLocalCount: Int
-)
+) {
+    fun formatUserMessage(): String = when {
+        updatedNames.isNotEmpty() -> {
+            val base = "已更新 ${updatedNames.size} 个音源：${updatedNames.joinToString("、")}"
+            if (failedCount > 0) "$base（另有 ${failedCount} 个拉取失败）" else base
+        }
+        failedCount == 0 && latestCount > 0 -> {
+            if (skippedLocalCount > 0) {
+                "全部 ${latestCount} 个在线音源均已是最新版本（已跳过 ${skippedLocalCount} 个本地脚本）"
+            } else {
+                "全部 ${latestCount} 个在线音源均已是最新版本"
+            }
+        }
+        latestCount > 0 ->
+            "${latestCount} 个已最新，${failedCount} 个拉取失败"
+        failedCount == 0 && skippedLocalCount > 0 ->
+            "当前均为本地导入脚本，未绑定在线更新链接"
+        failedCount == 0 ->
+            "暂无可检查更新的音源"
+        else ->
+            "更新检查失败，请检查网络连接后重试"
+    }
+}
 
 class UserApiManager(
     private val context: Context,
@@ -240,8 +262,9 @@ class UserApiManager(
         fallbackName: String = "自定义音源"
     ): Result<UserApiSource> = withContext(Dispatchers.IO) {
         runCatching {
-            require(script.isNotBlank()) { "脚本内容为空" }
-            val meta = LxScriptParser.parse(script, fallbackName)
+            val normalizedScript = LxScriptParser.normalizeScript(script)
+            require(normalizedScript.isNotBlank()) { "脚本内容为空" }
+            val meta = LxScriptParser.parse(normalizedScript, fallbackName)
             val existing = dao.getAllOnce()
             val existingMatch = existing.firstOrNull { it.id == meta.id }
             val priority = existingMatch?.priority ?: existing.size
@@ -253,7 +276,7 @@ class UserApiManager(
                 version = meta.version,
                 author = meta.author,
                 homepage = meta.homepage,
-                script = script,
+                script = normalizedScript,
                 sourceUrl = sourceUrl ?: existingMatch?.sourceUrl,
                 enabled = true,
                 priority = priority
@@ -322,7 +345,7 @@ class UserApiManager(
         for (url in candidateUrls) {
             val content = runCatching { downloadText(url) }.getOrNull()
             if (isValidDownloadedScript(content)) {
-                fetchedScript = content
+                fetchedScript = LxScriptParser.normalizeScript(content!!)
                 usedUrl = url
                 break
             }
@@ -339,7 +362,7 @@ class UserApiManager(
             )
         }
 
-        val oldHash = LxCrypto.md5Hex(current.script.trim())
+        val oldHash = LxCrypto.md5Hex(LxScriptParser.normalizeScript(current.script).trim())
         val newHash = LxCrypto.md5Hex(fetchedScript.trim())
         val parsed = LxScriptParser.parse(fetchedScript, fallbackName = current.name)
 

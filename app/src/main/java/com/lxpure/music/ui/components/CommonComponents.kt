@@ -21,10 +21,13 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -32,6 +35,8 @@ import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
@@ -544,7 +549,8 @@ fun TrackActionSheet(
     onPlayNext: () -> Unit,
     onToggleFavorite: () -> Unit,
     onAddToPlaylist: () -> Unit,
-    onDownload: () -> Unit
+    onDownload: () -> Unit,
+    onRemoveFromPlaylist: (() -> Unit)? = null
 ) {
     val lxColors = LocalLxColors.current
     ModalBottomSheet(
@@ -592,12 +598,21 @@ fun TrackActionSheet(
             ) {
                 onToggleFavorite(); onDismiss()
             }
-            SheetActionRow(Icons.AutoMirrored.Rounded.PlaylistAdd, "收藏到歌单") {
+            SheetActionRow(Icons.AutoMirrored.Rounded.PlaylistAdd, "添加到歌单") {
                 onDismiss(); onAddToPlaylist()
             }
             if (!track.isLocal) {
                 SheetActionRow(Icons.Rounded.Download, "离线下载") {
                     onDownload(); onDismiss()
+                }
+            }
+            if (onRemoveFromPlaylist != null) {
+                SheetActionRow(
+                    icon = Icons.Rounded.DeleteOutline,
+                    label = "从当前歌单移除",
+                    iconTint = lxColors.danger
+                ) {
+                    onRemoveFromPlaylist(); onDismiss()
                 }
             }
         }
@@ -627,12 +642,19 @@ private fun SheetActionRow(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddToPlaylistSheet(
+    track: Track,
     playlists: List<UserPlaylist>,
+    containedPlaylistIds: Set<Long>,
+    customPlaylistCount: Int,
+    maxCustomPlaylists: Int,
+    forceDarkStatusBar: Boolean = false,
     onDismiss: () -> Unit,
-    onSelectPlaylist: (Long) -> Unit,
-    onCreateNewPlaylist: (String) -> Unit
+    onSelectPlaylist: (UserPlaylist) -> Unit,
+    onCreateNewPlaylist: (String) -> Unit,
+    onLimitReached: () -> Unit
 ) {
     val lxColors = LocalLxColors.current
+    val isAtCustomLimit = customPlaylistCount >= maxCustomPlaylists
     var showCreateDialog by remember { mutableStateOf(false) }
 
     ModalBottomSheet(
@@ -640,7 +662,7 @@ fun AddToPlaylistSheet(
         containerColor = lxColors.surfaceElevated,
         contentColor = lxColors.textPrimary
     ) {
-        SyncDialogSystemBars(useLightSystemBars = !lxColors.isDark)
+        SyncDialogSystemBars(useLightSystemBars = !lxColors.isDark && !forceDarkStatusBar)
         Column(modifier = Modifier.padding(bottom = 28.dp)) {
             Row(
                 modifier = Modifier
@@ -649,11 +671,39 @@ fun AddToPlaylistSheet(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text("收藏到歌单", style = MaterialTheme.typography.titleLarge)
-                TextButton(onClick = { showCreateDialog = true }) {
-                    Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("新建歌单")
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("添加到歌单", style = MaterialTheme.typography.titleLarge)
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = "《${track.title}》 · ${track.artist}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = lxColors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                TextButton(
+                    onClick = {
+                        if (isAtCustomLimit) {
+                            onDismiss()
+                            onLimitReached()
+                        } else {
+                            showCreateDialog = true
+                        }
+                    }
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Add,
+                        contentDescription = null,
+                        tint = if (isAtCustomLimit) lxColors.textTertiary else lxColors.accent,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text(
+                        text = if (isAtCustomLimit) "已达上限" else "新建 ($customPlaylistCount/$maxCustomPlaylists)",
+                        color = if (isAtCustomLimit) lxColors.textTertiary else lxColors.accent
+                    )
                 }
             }
             HorizontalDivider(color = lxColors.hairline)
@@ -661,28 +711,92 @@ fun AddToPlaylistSheet(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(32.dp),
+                        .padding(horizontal = 24.dp, vertical = 32.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("还没有自建歌单，点击右上角新建", color = lxColors.textSecondary)
+                    Text(
+                        text = "还没有歌单，点击右上角「新建」创建并加入（最多自建 $maxCustomPlaylists 个）",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = lxColors.textSecondary
+                    )
                 }
             } else {
-                playlists.forEach { playlist ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                onSelectPlaylist(playlist.id)
-                                onDismiss()
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 420.dp)
+                ) {
+                    items(playlists, key = { it.id }) { playlist ->
+                        val alreadyIn = playlist.id in containedPlaylistIds
+                        val isExternal = !playlist.sourceUrl.isNullOrBlank()
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    onSelectPlaylist(playlist)
+                                    onDismiss()
+                                }
+                                .padding(horizontal = 20.dp, vertical = 11.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            AlbumArtwork(
+                                url = playlist.coverUrl,
+                                contentDescription = null,
+                                size = 46.dp,
+                                cornerRadius = 11.dp
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = playlist.name,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false)
+                                    )
+                                    if (isExternal) {
+                                        SmallPillBadge(
+                                            text = "外部导入",
+                                            background = lxColors.hairline,
+                                            contentColor = lxColors.textSecondary
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.height(2.dp))
+                                Text(
+                                    text = "${playlist.trackCount} 首歌曲",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = lxColors.textSecondary
+                                )
                             }
-                            .padding(horizontal = 20.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        AlbumArtwork(url = playlist.coverUrl, contentDescription = null, size = 44.dp, cornerRadius = 10.dp)
-                        Spacer(Modifier.width(12.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(playlist.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("${playlist.trackCount} 首歌曲", style = MaterialTheme.typography.bodyMedium, color = lxColors.textSecondary)
+                            Spacer(Modifier.width(10.dp))
+                            if (alreadyIn) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Check,
+                                        contentDescription = null,
+                                        tint = lxColors.success,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Text(
+                                        text = "已加入",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = lxColors.success
+                                    )
+                                }
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Rounded.Add,
+                                    contentDescription = "加入此歌单",
+                                    tint = lxColors.accent,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -694,6 +808,7 @@ fun AddToPlaylistSheet(
         SimpleTextInputDialog(
             title = "新建歌单",
             placeholder = "输入歌单名称",
+            supportingText = "最多支持自建 $maxCustomPlaylists 个歌单（当前 $customPlaylistCount/$maxCustomPlaylists）",
             confirmLabel = "创建并加入",
             onDismiss = { showCreateDialog = false },
             onConfirm = { name ->

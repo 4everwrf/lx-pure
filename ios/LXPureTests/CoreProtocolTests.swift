@@ -383,7 +383,10 @@ final class CoreProtocolTests: XCTestCase {
         store.recordPlay(sample)
         XCTAssertEqual(store.recentHistory.first?.id, "wy_777")
 
-        let plId = store.createPlaylist(name: "测试歌单", tracks: [sample])
+        guard case .created(let plId) = store.createPlaylist(name: "测试歌单", tracks: [sample]) else {
+            XCTFail("Expected playlist creation to succeed")
+            return
+        }
         XCTAssertEqual(store.userPlaylists.first?.name, "测试歌单")
         XCTAssertEqual(store.tracks(forPlaylistId: plId).count, 1)
 
@@ -511,5 +514,115 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertTrue(AppUpdateManager.isValidZipOrIpaMagic(Data([0x50, 0x4B, 0x03, 0x04])))
         XCTAssertFalse(AppUpdateManager.isValidZipOrIpaMagic(Data("<html>".utf8)))
         XCTAssertNotNil(AppUpdateManager.trollStoreInstallURL(for: "https://github.com/4everwrf/lx-pure/releases/download/v1.1.1/lx-pure-ios-v1.1.1-unsigned.ipa"))
+    }
+
+    func testNormalizeScriptStripsBomAndUnifiesLineEndings() {
+        let unixScript = "/**\n * @name Demo\n * @version 1\n */\nconst s = \"\\r\\n\";\n"
+        let windowsBomScript = "\u{FEFF}/**\r\n * @name Demo\r\n * @version 1\r\n */\rconst s = \"\\r\\n\";\r\n"
+
+        let normalized = LxScriptParser.normalizeScript(windowsBomScript)
+        XCTAssertEqual(normalized, unixScript)
+        XCTAssertEqual(
+            LxCrypto.md5Hex(unixScript.trimmingCharacters(in: .whitespacesAndNewlines)),
+            LxCrypto.md5Hex(normalized.trimmingCharacters(in: .whitespacesAndNewlines))
+        )
+        XCTAssertEqual(LxScriptParser.parse(windowsBomScript).name, "Demo")
+    }
+
+    func testBatchUpdateSummaryFormatsAccurateMessagesForLocalAndOnlineSources() {
+        XCTAssertEqual(
+            BatchUpdateSummary(updatedNames: [], latestCount: 0, failedCount: 0, skippedLocalCount: 7).formatUserMessage(),
+            "当前均为本地导入脚本，未绑定在线更新链接"
+        )
+        XCTAssertEqual(
+            BatchUpdateSummary(updatedNames: [], latestCount: 2, failedCount: 0, skippedLocalCount: 3).formatUserMessage(),
+            "全部 2 个在线音源均已是最新版本（已跳过 3 个本地脚本）"
+        )
+        XCTAssertEqual(
+            BatchUpdateSummary(updatedNames: [], latestCount: 2, failedCount: 0, skippedLocalCount: 0).formatUserMessage(),
+            "全部 2 个在线音源均已是最新版本"
+        )
+        XCTAssertEqual(
+            BatchUpdateSummary(updatedNames: ["源A v2.0"], latestCount: 0, failedCount: 1, skippedLocalCount: 2).formatUserMessage(),
+            "已更新 1 个音源：源A v2.0（另有 1 个拉取失败）"
+        )
+        XCTAssertEqual(
+            BatchUpdateSummary(updatedNames: [], latestCount: 1, failedCount: 2, skippedLocalCount: 0).formatUserMessage(),
+            "1 个已最新，2 个拉取失败"
+        )
+        XCTAssertEqual(
+            BatchUpdateSummary(updatedNames: [], latestCount: 0, failedCount: 2, skippedLocalCount: 3).formatUserMessage(),
+            "更新检查失败，请检查网络连接后重试"
+        )
+        XCTAssertEqual(
+            BatchUpdateSummary(updatedNames: [], latestCount: 0, failedCount: 0, skippedLocalCount: 0).formatUserMessage(),
+            "暂无可检查更新的音源"
+        )
+    }
+
+    @MainActor
+    func testCustomPlaylistLimitAndAddToExternalPlaylist() {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxpure_playlist_limit_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = LibraryStore(baseDirectory: tempDir)
+        XCTAssertEqual(LibraryStore.maxCustomPlaylists, 10)
+        XCTAssertTrue(LibraryStore.isCustomPlaylist(sourceUrl: nil))
+        XCTAssertTrue(LibraryStore.isCustomPlaylist(sourceUrl: "   "))
+        XCTAssertFalse(LibraryStore.isCustomPlaylist(sourceUrl: "https://music.163.com/playlist?id=1"))
+
+        let seedTrack = Track(id: "wy_seed", title: "原曲目", artist: "歌手A", source: .wy)
+        let extRes = store.createPlaylist(
+            name: "外部导入歌单",
+            sourceUrl: "https://music.163.com/playlist?id=888",
+            tracks: [seedTrack]
+        )
+        guard case .created(let externalId) = extRes else {
+            XCTFail("Expected external playlist creation to succeed")
+            return
+        }
+        XCTAssertEqual(store.customPlaylistCount, 0)
+        XCTAssertTrue(store.canCreateCustomPlaylist)
+
+        var createdCustomIds: [Int64] = []
+        for idx in 1...LibraryStore.maxCustomPlaylists {
+            let res = store.createPlaylist(name: "自建歌单\(idx)")
+            guard case .created(let id) = res else {
+                XCTFail("Expected custom playlist #\(idx) to succeed")
+                return
+            }
+            createdCustomIds.append(id)
+        }
+        XCTAssertEqual(store.customPlaylistCount, 10)
+        XCTAssertFalse(store.canCreateCustomPlaylist)
+
+        // 11th custom playlist must be rejected
+        XCTAssertEqual(
+            store.createPlaylist(name: "超出上限歌单"),
+            .limitReached(LibraryStore.maxCustomPlaylists)
+        )
+        XCTAssertEqual(store.userPlaylists.count, 11)
+
+        // Adding a song to an externally imported playlist works and deduplicates properly
+        let addedTrack = Track(id: "tx_new", title: "晴天", artist: "周杰伦", source: .tx, coverUrl: "https://example.com/c.jpg")
+        let addRes = store.addTracks([addedTrack], toPlaylistId: externalId)
+        XCTAssertEqual(addRes, AddTracksResult(addedCount: 1, duplicateCount: 0))
+        XCTAssertTrue(store.playlistIdsContaining(trackId: "tx_new").contains(externalId))
+        XCTAssertEqual(store.tracks(forPlaylistId: externalId).map(\.id), ["wy_seed", "tx_new"])
+
+        let dupRes = store.addTracks([addedTrack], toPlaylistId: externalId)
+        XCTAssertEqual(dupRes, AddTracksResult(addedCount: 0, duplicateCount: 1))
+        XCTAssertEqual(store.tracks(forPlaylistId: externalId).count, 2)
+
+        // Deleting one custom playlist frees a slot
+        store.deletePlaylist(id: createdCustomIds[0])
+        XCTAssertEqual(store.customPlaylistCount, 9)
+        XCTAssertTrue(store.canCreateCustomPlaylist)
+        if case .created = store.createPlaylist(name: "补建歌单") {
+            XCTAssertEqual(store.customPlaylistCount, 10)
+        } else {
+            XCTFail("Expected creating playlist after deletion to succeed")
+        }
     }
 }

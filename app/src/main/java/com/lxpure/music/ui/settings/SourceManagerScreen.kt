@@ -143,17 +143,7 @@ fun SourceManagerScreen(
                             isUpdatingAll = true
                             val summary = userApiManager.updateAllSources()
                             isUpdatingAll = false
-                            val msg = when {
-                                summary.updatedNames.isNotEmpty() ->
-                                    "已更新 ${summary.updatedNames.size} 个音源：${summary.updatedNames.joinToString("、")}"
-                                summary.failedCount == 0 && summary.latestCount > 0 ->
-                                    "全部 ${summary.latestCount} 个在线音源均已是最新版本"
-                                summary.latestCount > 0 ->
-                                    "${summary.latestCount} 个已最新，${summary.failedCount} 个拉取失败"
-                                else ->
-                                    "更新检查失败，请检查网络连接后重试"
-                            }
-                            onMessage(msg)
+                            onMessage(summary.formatUserMessage())
                         }
                     },
                     modifier = Modifier.padding(end = 4.dp)

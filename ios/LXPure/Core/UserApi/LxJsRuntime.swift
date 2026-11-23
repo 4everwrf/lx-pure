@@ -197,6 +197,7 @@ final class LxJsRuntime: @unchecked Sendable {
                     return
                 }
 
+                let normalizedScript = LxScriptParser.normalizeScript(self.source.script)
                 if let setupFn = ctx.objectForKeyedSubscript("lx_setup"), !setupFn.isUndefined {
                     setupFn.call(withArguments: [
                         self.secretKey,
@@ -206,7 +207,7 @@ final class LxJsRuntime: @unchecked Sendable {
                         self.source.version,
                         self.source.author,
                         self.source.homepage,
-                        self.source.script
+                        normalizedScript
                     ])
                 } else {
                     timeoutTask.cancel()
@@ -221,7 +222,7 @@ final class LxJsRuntime: @unchecked Sendable {
                 }
 
                 ctx.evaluateScript(
-                    self.source.script,
+                    normalizedScript,
                     withSourceURL: URL(string: "lxpure://\(self.source.id).js")
                 )
 

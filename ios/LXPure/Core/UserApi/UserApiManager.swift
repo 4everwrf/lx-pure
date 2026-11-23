@@ -25,6 +25,29 @@ struct BatchUpdateSummary: Sendable {
     let latestCount: Int
     let failedCount: Int
     let skippedLocalCount: Int
+
+    func formatUserMessage() -> String {
+        if !updatedNames.isEmpty {
+            let base = "已更新 \(updatedNames.count) 个音源：\(updatedNames.joined(separator: "、"))"
+            return failedCount > 0 ? "\(base)（另有 \(failedCount) 个拉取失败）" : base
+        }
+        if failedCount == 0 && latestCount > 0 {
+            if skippedLocalCount > 0 {
+                return "全部 \(latestCount) 个在线音源均已是最新版本（已跳过 \(skippedLocalCount) 个本地脚本）"
+            }
+            return "全部 \(latestCount) 个在线音源均已是最新版本"
+        }
+        if latestCount > 0 {
+            return "\(latestCount) 个已最新，\(failedCount) 个拉取失败"
+        }
+        if failedCount == 0 && skippedLocalCount > 0 {
+            return "当前均为本地导入脚本，未绑定在线更新链接"
+        }
+        if failedCount == 0 {
+            return "暂无可检查更新的音源"
+        }
+        return "更新检查失败，请检查网络连接后重试"
+    }
 }
 
 final class UserApiManager: ObservableObject, @unchecked Sendable {
@@ -200,11 +223,12 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         sourceUrl: String? = nil,
         fallbackName: String = "自定义音源"
     ) async -> Result<UserApiSource, Error> {
-        guard !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let normalizedScript = LxScriptParser.normalizeScript(script)
+        guard !normalizedScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .failure(LxRuntimeError.message("脚本内容为空"))
         }
 
-        let meta = LxScriptParser.parse(script, fallbackName: fallbackName)
+        let meta = LxScriptParser.parse(normalizedScript, fallbackName: fallbackName)
         var existing = await MainActor.run { libraryStore.loadSavedUserApis() }
         let existingIdx = existing.firstIndex { $0.id == meta.id }
         let priority = existingIdx.map { existing[$0].priority } ?? existing.count
@@ -217,7 +241,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             version: meta.version,
             author: meta.author,
             homepage: meta.homepage,
-            script: script,
+            script: normalizedScript,
             sourceUrl: mergedSourceUrl,
             enabled: true,
             priority: priority,
@@ -320,7 +344,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         var usedUrl: String?
         for url in candidateUrls {
             if let content = await downloadText(urlString: url), Self.isValidDownloadedScript(content) {
-                fetchedScript = content
+                fetchedScript = LxScriptParser.normalizeScript(content)
                 usedUrl = url
                 break
             }
@@ -333,7 +357,9 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             )
         }
 
-        let oldHash = LxCrypto.md5Hex(current.script.trimmingCharacters(in: .whitespacesAndNewlines))
+        let oldHash = LxCrypto.md5Hex(
+            LxScriptParser.normalizeScript(current.script).trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         let newHash = LxCrypto.md5Hex(fetchedScript.trimmingCharacters(in: .whitespacesAndNewlines))
         let parsed = LxScriptParser.parse(fetchedScript, fallbackName: current.name)
 

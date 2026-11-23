@@ -293,6 +293,7 @@ struct TrackActionSheetView: View {
     let onToggleFavorite: () -> Void
     let onAddToPlaylist: () -> Void
     let onDownload: () -> Void
+    var onRemoveFromPlaylist: (() -> Void)? = nil
 
     @Environment(\.lxPalette) private var lx
     @Environment(\.dismiss) private var dismiss
@@ -331,8 +332,9 @@ struct TrackActionSheetView: View {
                 ) {
                     dismiss(); onToggleFavorite()
                 }
-                sheetRow(icon: "text.badge.plus", title: "收藏到歌单") {
-                    dismiss(); onAddToPlaylist()
+                sheetRow(icon: "text.badge.plus", title: "添加到歌单") {
+                    onAddToPlaylist()
+                    dismiss()
                 }
                 if !track.isLocal {
                     sheetRow(
@@ -341,6 +343,11 @@ struct TrackActionSheetView: View {
                         tint: isDownloaded ? lx.success : lx.textPrimary
                     ) {
                         dismiss(); onDownload()
+                    }
+                }
+                if let onRemoveFromPlaylist {
+                    sheetRow(icon: "trash", title: "从当前歌单移除", tint: lx.danger) {
+                        dismiss(); onRemoveFromPlaylist()
                     }
                 }
             }
@@ -373,19 +380,49 @@ struct TrackActionSheetView: View {
 struct AddToPlaylistSheetView: View {
     let track: Track
     let playlists: [UserPlaylist]
+    let containedPlaylistIds: Set<Int64>
+    let customPlaylistCount: Int
+    let maxCustomPlaylists: Int
     let onSelectPlaylist: (UserPlaylist) -> Void
     let onCreateAndAdd: (String) -> Void
+    let onLimitReached: () -> Void
 
     @Environment(\.lxPalette) private var lx
     @Environment(\.dismiss) private var dismiss
     @State private var newName: String = ""
     @State private var showCreate = false
 
+    private var isAtCustomLimit: Bool {
+        customPlaylistCount >= maxCustomPlaylists
+    }
+
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    if showCreate {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(track.title)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(lx.textPrimary)
+                            .lineLimit(1)
+                        Text(track.artist)
+                            .font(.system(size: 12))
+                            .foregroundColor(lx.textSecondary)
+                            .lineLimit(1)
+                    }
+
+                    if isAtCustomLimit {
+                        Button {
+                            onLimitReached()
+                            dismiss()
+                        } label: {
+                            Label(
+                                "自建歌单已达上限 (\(customPlaylistCount)/\(maxCustomPlaylists))",
+                                systemImage: "exclamationmark.circle"
+                            )
+                            .foregroundColor(lx.textTertiary)
+                        }
+                    } else if showCreate {
                         HStack {
                             TextField("输入新歌单名称", text: $newName)
                             Button("创建") {
@@ -400,40 +437,68 @@ struct AddToPlaylistSheetView: View {
                         Button {
                             showCreate = true
                         } label: {
-                            Label("新建歌单并加入", systemImage: "plus.circle.fill")
-                                .foregroundColor(lx.accent)
+                            Label(
+                                "新建歌单并加入 (\(customPlaylistCount)/\(maxCustomPlaylists))",
+                                systemImage: "plus.circle.fill"
+                            )
+                            .foregroundColor(lx.accent)
                         }
                     }
                 }
 
-                Section("我的歌单") {
+                Section("选择歌单（含外部导入）") {
                     if playlists.isEmpty {
-                        Text("暂无自建歌单")
+                        Text("暂无歌单，点击上方新建（最多自建 \(maxCustomPlaylists) 个）")
                             .foregroundColor(lx.textSecondary)
                     } else {
                         ForEach(playlists) { pl in
+                            let alreadyIn = containedPlaylistIds.contains(pl.id)
+                            let isExternal = !LibraryStore.isCustomPlaylist(sourceUrl: pl.sourceUrl)
                             Button {
                                 onSelectPlaylist(pl)
                                 dismiss()
                             } label: {
                                 HStack(spacing: 12) {
                                     AlbumArtworkView(url: pl.coverUrl, size: 42, cornerRadius: 10)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(pl.name)
-                                            .font(.system(size: 15, weight: .medium))
-                                            .foregroundColor(lx.textPrimary)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack(spacing: 6) {
+                                            Text(pl.name)
+                                                .font(.system(size: 15, weight: .medium))
+                                                .foregroundColor(lx.textPrimary)
+                                                .lineLimit(1)
+                                            if isExternal {
+                                                SmallPillBadge(
+                                                    text: "外部导入",
+                                                    color: lx.textSecondary,
+                                                    background: lx.surfaceElevated
+                                                )
+                                            }
+                                        }
                                         Text("\(pl.trackCount) 首歌曲")
                                             .font(.system(size: 12))
                                             .foregroundColor(lx.textSecondary)
                                     }
                                     Spacer()
+                                    if alreadyIn {
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .font(.system(size: 13))
+                                            Text("已加入")
+                                                .font(.system(size: 12, weight: .medium))
+                                        }
+                                        .foregroundColor(lx.success)
+                                    } else {
+                                        Image(systemName: "plus")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundColor(lx.accent)
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            .navigationTitle("收藏到歌单")
+            .navigationTitle("添加到歌单")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

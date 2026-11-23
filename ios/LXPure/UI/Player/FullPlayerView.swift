@@ -14,6 +14,7 @@ struct FullPlayerView: View {
     let onSeek: (Int64) -> Void
     let onCycleRepeat: () -> Void
     let onToggleFavorite: (Track) -> Void
+    let onAddToPlaylist: (Track) -> Void
     let onDownload: (Track) -> Void
     let onOpenQueue: () -> Void
     let onSelectQuality: (AudioQuality) -> Void
@@ -227,8 +228,8 @@ struct FullPlayerView: View {
                         }
                         .padding(.vertical, 4)
 
-                        // Bottom Utility Bar (Lyrics / Translation / Download)
-                        HStack(spacing: 28) {
+                        // Bottom Utility Bar (Lyrics / Translation / Playlist / Download)
+                        HStack(spacing: 12) {
                             Button {
                                 showLyrics.toggle()
                             } label: {
@@ -255,6 +256,21 @@ struct FullPlayerView: View {
                                         .background(Color.white.opacity(showTranslation ? 0.16 : 0.08))
                                         .clipShape(Circle())
                                 }
+                            }
+
+                            Button {
+                                onAddToPlaylist(track)
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "text.badge.plus")
+                                    Text("歌单")
+                                }
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.82))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.white.opacity(0.08))
+                                .clipShape(Capsule())
                             }
 
                             if !track.isLocal {

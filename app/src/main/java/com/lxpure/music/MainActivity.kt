@@ -76,6 +76,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.lxpure.music.core.update.AppUpdateState
+import com.lxpure.music.data.repository.CreatePlaylistResult
+import com.lxpure.music.data.repository.LibraryRepository
 import com.lxpure.music.domain.model.AppSettings
 import com.lxpure.music.domain.model.DownloadStatus
 import com.lxpure.music.domain.model.LeaderboardItem
@@ -462,8 +464,12 @@ private fun LxPureRoot(container: AppContainer) {
                         },
                         onCreatePlaylist = { name ->
                             scope.launch {
-                                container.libraryRepository.createPlaylist(name)
-                                showToast("已创建歌单《$name》")
+                                when (val result = container.libraryRepository.createPlaylist(name)) {
+                                    is CreatePlaylistResult.Created ->
+                                        showToast("已创建歌单《$name》")
+                                    is CreatePlaylistResult.LimitReached ->
+                                        showToast("最多支持自建 ${result.maxAllowed} 个歌单，请先删除不需要的歌单")
+                                }
                             }
                         },
                         onImportExternalPlaylist = { raw ->
@@ -486,6 +492,9 @@ private fun LxPureRoot(container: AppContainer) {
                                     }
                                 isImportingPlaylist = false
                             }
+                        },
+                        onPlaylistLimitReached = {
+                            showToast("最多支持自建 ${LibraryRepository.MAX_CUSTOM_PLAYLISTS} 个歌单，请先删除不需要的歌单")
                         }
                     )
 
@@ -656,7 +665,7 @@ private fun LxPureRoot(container: AppContainer) {
                             isPlaying = playerState.isPlaying,
                             bottomPadding = contentBottomPadding,
                             showDeletePlaylistAction = true,
-                            emptyHint = "歌单里还没有歌曲",
+                            emptyHint = "歌单里还没有歌曲，可在播放页或歌曲菜单中添加",
                             onBack = { backStack.removeAt(backStack.lastIndex) },
                             onPlayAll = { container.playerController.playTracks(plTracks, 0, plSource) },
                             onPlayTrackAt = { idx -> container.playerController.playTracks(plTracks, idx, plSource) },
@@ -730,6 +739,7 @@ private fun LxPureRoot(container: AppContainer) {
                                     name = res.playlist.name,
                                     description = res.playlist.description,
                                     coverUrl = res.playlist.coverUrl,
+                                    sourceUrl = "leaderboard:${topRoute.board.source.code}:${topRoute.board.id}",
                                     tracks = res.tracks
                                 )
                                 showToast("已收藏榜单：《${res.playlist.name}》")
@@ -865,6 +875,7 @@ private fun LxPureRoot(container: AppContainer) {
                                 showToast(if (liked) "已添加到我喜欢" else "已取消喜欢")
                             }
                         },
+                        onAddToPlaylist = { track -> addToPlaylistTrack = track },
                         onDownload = { track -> triggerTrackDownload(track) },
                         onOpenQueue = { showQueueSheet = true },
                         onSelectQuality = { q ->
@@ -922,6 +933,7 @@ private fun LxPureRoot(container: AppContainer) {
         }
 
         actionSheetTrack?.let { track ->
+            val activeUserPlaylist = (backStack.lastOrNull() as? SubRoute.UserPlaylistDetail)?.playlist
             TrackActionSheet(
                 track = track,
                 isFavorite = track.id in favoriteIds,
@@ -934,25 +946,55 @@ private fun LxPureRoot(container: AppContainer) {
                     }
                 },
                 onAddToPlaylist = { addToPlaylistTrack = track },
-                onDownload = { triggerTrackDownload(track) }
+                onDownload = { triggerTrackDownload(track) },
+                onRemoveFromPlaylist = activeUserPlaylist?.let { playlist ->
+                    {
+                        scope.launch {
+                            container.libraryRepository.removeTrackFromPlaylist(playlist.id, track.id)
+                            showToast("已从《${playlist.name}》移除")
+                        }
+                    }
+                }
             )
         }
 
         addToPlaylistTrack?.let { track ->
+            val containedIds by remember(track.id) {
+                container.libraryRepository.observePlaylistIdsForTrack(track.id)
+            }.collectAsState(initial = emptySet())
+            val customPlaylistCount = remember(playlists) {
+                LibraryRepository.customPlaylistCount(playlists)
+            }
             AddToPlaylistSheet(
+                track = track,
                 playlists = playlists,
+                containedPlaylistIds = containedIds,
+                customPlaylistCount = customPlaylistCount,
+                maxCustomPlaylists = LibraryRepository.MAX_CUSTOM_PLAYLISTS,
+                forceDarkStatusBar = isPlayerExpanded,
                 onDismiss = { addToPlaylistTrack = null },
-                onSelectPlaylist = { plId ->
+                onSelectPlaylist = { playlist ->
                     scope.launch {
-                        container.libraryRepository.addTracksToPlaylist(plId, listOf(track))
-                        showToast("已加入歌单")
+                        val res = container.libraryRepository.addTracksToPlaylist(playlist.id, listOf(track))
+                        if (res.addedCount > 0) {
+                            showToast("已添加到《${playlist.name}》")
+                        } else {
+                            showToast("《${track.title}》已在《${playlist.name}》中")
+                        }
                     }
                 },
                 onCreateNewPlaylist = { name ->
                     scope.launch {
-                        container.libraryRepository.createPlaylist(name, tracks = listOf(track))
-                        showToast("已创建《$name》并加入歌曲")
+                        when (val res = container.libraryRepository.createPlaylist(name, tracks = listOf(track))) {
+                            is CreatePlaylistResult.Created ->
+                                showToast("已创建《$name》并加入歌曲")
+                            is CreatePlaylistResult.LimitReached ->
+                                showToast("最多支持自建 ${res.maxAllowed} 个歌单，请先删除不需要的歌单")
+                        }
                     }
+                },
+                onLimitReached = {
+                    showToast("最多支持自建 ${LibraryRepository.MAX_CUSTOM_PLAYLISTS} 个歌单，请先删除不需要的歌单")
                 }
             )
         }

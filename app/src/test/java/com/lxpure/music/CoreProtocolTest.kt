@@ -585,4 +585,151 @@ class CoreProtocolTest {
         assertTrue(com.lxpure.music.core.update.AppUpdateManager.isValidZipOrApkMagic(byteArrayOf(0x50, 0x4B, 0x03, 0x04)))
         assertFalse(com.lxpure.music.core.update.AppUpdateManager.isValidZipOrApkMagic("<html>".toByteArray()))
     }
+
+    @Test
+    fun normalizeScriptStripsBomAndUnifiesLineEndings() {
+        val unixScript = "/**\n * @name Demo\n * @version 1\n */\nconst s = \"\\r\\n\";\n"
+        val windowsBomScript = "\uFEFF/**\r\n * @name Demo\r\n * @version 1\r\n */\rconst s = \"\\r\\n\";\r\n"
+
+        val normalized = LxScriptParser.normalizeScript(windowsBomScript)
+        assertEquals(unixScript, normalized)
+        assertEquals(
+            com.lxpure.music.core.userapi.LxCrypto.md5Hex(unixScript.trim()),
+            com.lxpure.music.core.userapi.LxCrypto.md5Hex(normalized.trim())
+        )
+        assertEquals("Demo", LxScriptParser.parse(windowsBomScript).name)
+    }
+
+    @Test
+    fun batchUpdateSummaryFormatsAccurateMessagesForLocalAndOnlineSources() {
+        assertEquals(
+            "当前均为本地导入脚本，未绑定在线更新链接",
+            com.lxpure.music.core.userapi.BatchUpdateSummary(
+                updatedNames = emptyList(),
+                latestCount = 0,
+                failedCount = 0,
+                skippedLocalCount = 7
+            ).formatUserMessage()
+        )
+        assertEquals(
+            "全部 2 个在线音源均已是最新版本（已跳过 3 个本地脚本）",
+            com.lxpure.music.core.userapi.BatchUpdateSummary(
+                updatedNames = emptyList(),
+                latestCount = 2,
+                failedCount = 0,
+                skippedLocalCount = 3
+            ).formatUserMessage()
+        )
+        assertEquals(
+            "全部 2 个在线音源均已是最新版本",
+            com.lxpure.music.core.userapi.BatchUpdateSummary(
+                updatedNames = emptyList(),
+                latestCount = 2,
+                failedCount = 0,
+                skippedLocalCount = 0
+            ).formatUserMessage()
+        )
+        assertEquals(
+            "已更新 1 个音源：源A v2.0（另有 1 个拉取失败）",
+            com.lxpure.music.core.userapi.BatchUpdateSummary(
+                updatedNames = listOf("源A v2.0"),
+                latestCount = 0,
+                failedCount = 1,
+                skippedLocalCount = 2
+            ).formatUserMessage()
+        )
+        assertEquals(
+            "1 个已最新，2 个拉取失败",
+            com.lxpure.music.core.userapi.BatchUpdateSummary(
+                updatedNames = emptyList(),
+                latestCount = 1,
+                failedCount = 2,
+                skippedLocalCount = 0
+            ).formatUserMessage()
+        )
+        assertEquals(
+            "更新检查失败，请检查网络连接后重试",
+            com.lxpure.music.core.userapi.BatchUpdateSummary(
+                updatedNames = emptyList(),
+                latestCount = 0,
+                failedCount = 2,
+                skippedLocalCount = 3
+            ).formatUserMessage()
+        )
+        assertEquals(
+            "暂无可检查更新的音源",
+            com.lxpure.music.core.userapi.BatchUpdateSummary(
+                updatedNames = emptyList(),
+                latestCount = 0,
+                failedCount = 0,
+                skippedLocalCount = 0
+            ).formatUserMessage()
+        )
+    }
+
+    @Test
+    fun customPlaylistLimitAndTrackDeduplicationRules() {
+        assertEquals(10, com.lxpure.music.data.repository.LibraryRepository.MAX_CUSTOM_PLAYLISTS)
+        assertTrue(com.lxpure.music.data.repository.LibraryRepository.isCustomPlaylist(null))
+        assertTrue(com.lxpure.music.data.repository.LibraryRepository.isCustomPlaylist("   "))
+        assertFalse(com.lxpure.music.data.repository.LibraryRepository.isCustomPlaylist("https://music.163.com/playlist?id=1"))
+        assertFalse(com.lxpure.music.data.repository.LibraryRepository.isCustomPlaylist("wy:123456"))
+
+        val nineCustomAndTwoExternal = (1L..9L).map { id ->
+            com.lxpure.music.domain.model.UserPlaylist(
+                id = id,
+                name = "自建$id",
+                coverUrl = null,
+                description = "",
+                sourceUrl = null,
+                trackCount = 0,
+                createdAt = id
+            )
+        } + listOf(
+            com.lxpure.music.domain.model.UserPlaylist(
+                id = 100L,
+                name = "网易导入",
+                coverUrl = null,
+                description = "",
+                sourceUrl = "https://music.163.com/playlist?id=1",
+                trackCount = 12,
+                createdAt = 100L
+            ),
+            com.lxpure.music.domain.model.UserPlaylist(
+                id = 101L,
+                name = "飙升榜",
+                coverUrl = null,
+                description = "",
+                sourceUrl = "leaderboard:wy:19723756",
+                trackCount = 50,
+                createdAt = 101L
+            )
+        )
+        assertEquals(9, com.lxpure.music.data.repository.LibraryRepository.customPlaylistCount(nineCustomAndTwoExternal))
+        assertTrue(com.lxpure.music.data.repository.LibraryRepository.canCreateCustomPlaylist(nineCustomAndTwoExternal))
+
+        val tenCustomAndTwoExternal = nineCustomAndTwoExternal +
+            com.lxpure.music.domain.model.UserPlaylist(
+                id = 10L,
+                name = "自建10",
+                coverUrl = null,
+                description = "",
+                sourceUrl = null,
+                trackCount = 0,
+                createdAt = 10L
+            )
+        assertEquals(10, com.lxpure.music.data.repository.LibraryRepository.customPlaylistCount(tenCustomAndTwoExternal))
+        assertFalse(com.lxpure.music.data.repository.LibraryRepository.canCreateCustomPlaylist(tenCustomAndTwoExternal))
+
+        val t1 = Track(id = "wy_1", title = "Song 1", artist = "A")
+        val t2 = Track(id = "tx_2", title = "Song 2", artist = "B")
+        val t3 = Track(id = "kw_3", title = "Song 3", artist = "C")
+        val t4 = Track(id = "wy_4", title = "Song 4", artist = "D")
+        val (uniqueNew, dupCount) = com.lxpure.music.data.repository.LibraryRepository.filterNewTracksForPlaylist(
+            existingTrackIds = setOf("wy_1", "tx_2"),
+            tracksToAdd = listOf(t1, t3, t3, t2, t4)
+        )
+        assertEquals(listOf("kw_3", "wy_4"), uniqueNew.map { it.id })
+        assertEquals(3, dupCount)
+    }
 }

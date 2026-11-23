@@ -7,8 +7,31 @@ private struct HistoryEntry: Codable {
     var playCount: Int
 }
 
+enum CreatePlaylistResult: Equatable, Sendable {
+    case created(Int64)
+    case limitReached(Int)
+}
+
+struct AddTracksResult: Equatable, Sendable {
+    let addedCount: Int
+    let duplicateCount: Int
+}
+
 @MainActor
 final class LibraryStore: ObservableObject {
+    nonisolated static let maxCustomPlaylists = 10
+
+    nonisolated static func isCustomPlaylist(sourceUrl: String?) -> Bool {
+        (sourceUrl ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var customPlaylistCount: Int {
+        userPlaylists.filter { Self.isCustomPlaylist(sourceUrl: $0.sourceUrl) }.count
+    }
+
+    var canCreateCustomPlaylist: Bool {
+        customPlaylistCount < Self.maxCustomPlaylists
+    }
     @Published private(set) var favorites: [Track] = []
     @Published private(set) var favoriteIds: Set<String> = []
     @Published private(set) var recentHistory: [Track] = []
@@ -139,25 +162,30 @@ final class LibraryStore: ObservableObject {
         coverUrl: String? = nil,
         sourceUrl: String? = nil,
         tracks: [Track] = []
-    ) -> Int64 {
+    ) -> CreatePlaylistResult {
+        if Self.isCustomPlaylist(sourceUrl: sourceUrl) && customPlaylistCount >= Self.maxCustomPlaylists {
+            return .limitReached(Self.maxCustomPlaylists)
+        }
+        var seen = Set<String>()
+        let uniqueTracks = tracks.filter { seen.insert($0.id).inserted }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let nextId = max((userPlaylists.map(\.id).max() ?? 0) + 1, now)
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedCover = coverUrl ?? tracks.first(where: { !($0.coverUrl?.isEmpty ?? true) })?.coverUrl
+        let resolvedCover = coverUrl ?? uniqueTracks.first(where: { !($0.coverUrl?.isEmpty ?? true) })?.coverUrl
         let playlist = UserPlaylist(
             id: nextId,
             name: trimmedName.isEmpty ? "未命名歌单" : trimmedName,
             coverUrl: resolvedCover,
             description: description,
             sourceUrl: sourceUrl,
-            trackCount: tracks.count,
+            trackCount: uniqueTracks.count,
             createdAt: now
         )
         userPlaylists.insert(playlist, at: 0)
-        playlistTracksCache[nextId] = tracks
+        playlistTracksCache[nextId] = uniqueTracks
         writeJson(userPlaylists, to: "playlists.json")
-        writeJson(tracks, to: "playlist_\(nextId).json")
-        return nextId
+        writeJson(uniqueTracks, to: "playlist_\(nextId).json")
+        return .created(nextId)
     }
 
     func tracks(forPlaylistId playlistId: Int64) -> [Track] {
@@ -169,23 +197,46 @@ final class LibraryStore: ObservableObject {
         return loaded
     }
 
-    func addTracks(_ tracksToAdd: [Track], toPlaylistId playlistId: Int64) {
+    func playlistIdsContaining(trackId: String) -> Set<Int64> {
+        var result = Set<Int64>()
+        for pl in userPlaylists {
+            if tracks(forPlaylistId: pl.id).contains(where: { $0.id == trackId }) {
+                result.insert(pl.id)
+            }
+        }
+        return result
+    }
+
+    @discardableResult
+    func addTracks(_ tracksToAdd: [Track], toPlaylistId playlistId: Int64) -> AddTracksResult {
         var existing = tracks(forPlaylistId: playlistId)
         var existingIds = Set(existing.map(\.id))
-        for t in tracksToAdd where existingIds.insert(t.id).inserted {
-            existing.append(t)
-        }
-        playlistTracksCache[playlistId] = existing
-        writeJson(existing, to: "playlist_\(playlistId).json")
-
-        if let idx = userPlaylists.firstIndex(where: { $0.id == playlistId }) {
-            userPlaylists[idx].trackCount = existing.count
-            if (userPlaylists[idx].coverUrl ?? "").isEmpty,
-               let cover = tracksToAdd.first(where: { !($0.coverUrl?.isEmpty ?? true) })?.coverUrl {
-                userPlaylists[idx].coverUrl = cover
+        var addedCount = 0
+        var duplicateCount = 0
+        var addedTracks: [Track] = []
+        for t in tracksToAdd {
+            if existingIds.insert(t.id).inserted {
+                existing.append(t)
+                addedTracks.append(t)
+                addedCount += 1
+            } else {
+                duplicateCount += 1
             }
-            writeJson(userPlaylists, to: "playlists.json")
         }
+        if addedCount > 0 {
+            playlistTracksCache[playlistId] = existing
+            writeJson(existing, to: "playlist_\(playlistId).json")
+
+            if let idx = userPlaylists.firstIndex(where: { $0.id == playlistId }) {
+                userPlaylists[idx].trackCount = existing.count
+                if (userPlaylists[idx].coverUrl ?? "").isEmpty,
+                   let cover = addedTracks.first(where: { !($0.coverUrl?.isEmpty ?? true) })?.coverUrl {
+                    userPlaylists[idx].coverUrl = cover
+                }
+                writeJson(userPlaylists, to: "playlists.json")
+            }
+        }
+        return AddTracksResult(addedCount: addedCount, duplicateCount: duplicateCount)
     }
 
     func removeTrack(trackId: String, fromPlaylistId playlistId: Int64) {

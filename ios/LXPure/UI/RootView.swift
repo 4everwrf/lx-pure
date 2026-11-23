@@ -56,6 +56,8 @@ struct RootView: View {
     @State private var showQueueSheet = false
     @State private var actionSheetTrack: Track?
     @State private var addToPlaylistTrack: Track?
+    @State private var pendingAddToPlaylistTrack: Track?
+    @State private var playerAddToPlaylistTrack: Track?
     @State private var isImportingPlaylist = false
     @State private var downloadedBytes: Int64 = 0
     @State private var cacheBytes: Int64 = 0
@@ -159,31 +161,55 @@ struct RootView: View {
         .environment(\.lxPalette, effectivePalette)
         .preferredColorScheme(settingsStore.settings.themeMode.preferredColorScheme)
         .fullScreenCover(isPresented: $isPlayerExpanded) {
-            FullPlayerView(
-                state: playerController.state,
-                isFavorite: playerController.state.currentTrack.map { libraryStore.favoriteIds.contains($0.id) } ?? false,
-                downloadRecord: playerController.state.currentTrack.flatMap { libraryStore.downloadRecord(for: $0.id) },
-                preferredQuality: settingsStore.settings.preferredQuality,
-                fluidAmbientEnabled: settingsStore.settings.fluidAmbientBackground,
-                showTranslationDefault: settingsStore.settings.showTranslationLyrics,
-                onCollapse: { isPlayerExpanded = false },
-                onTogglePlayPause: { playerController.togglePlayPause() },
-                onNext: { playerController.next() },
-                onPrevious: { playerController.previous() },
-                onSeek: { playerController.seek(to: $0) },
-                onCycleRepeat: { playerController.cycleRepeatMode() },
-                onToggleFavorite: { track in
-                    let added = libraryStore.toggleFavorite(track)
-                    showToast(added ? "已添加到我喜欢的" : "已取消喜欢")
-                },
-                onDownload: { triggerTrackDownload($0) },
-                onOpenQueue: { showQueueSheet = true },
-                onSelectQuality: { playerController.changePreferredQuality($0) },
-                onSetSleepTimer: { playerController.setSleepTimer(minutes: $0) }
-            )
+            ZStack(alignment: .bottom) {
+                FullPlayerView(
+                    state: playerController.state,
+                    isFavorite: playerController.state.currentTrack.map { libraryStore.favoriteIds.contains($0.id) } ?? false,
+                    downloadRecord: playerController.state.currentTrack.flatMap { libraryStore.downloadRecord(for: $0.id) },
+                    preferredQuality: settingsStore.settings.preferredQuality,
+                    fluidAmbientEnabled: settingsStore.settings.fluidAmbientBackground,
+                    showTranslationDefault: settingsStore.settings.showTranslationLyrics,
+                    onCollapse: { isPlayerExpanded = false },
+                    onTogglePlayPause: { playerController.togglePlayPause() },
+                    onNext: { playerController.next() },
+                    onPrevious: { playerController.previous() },
+                    onSeek: { playerController.seek(to: $0) },
+                    onCycleRepeat: { playerController.cycleRepeatMode() },
+                    onToggleFavorite: { track in
+                        let added = libraryStore.toggleFavorite(track)
+                        showToast(added ? "已添加到我喜欢的" : "已取消喜欢")
+                    },
+                    onAddToPlaylist: { track in
+                        playerAddToPlaylistTrack = track
+                    },
+                    onDownload: { triggerTrackDownload($0) },
+                    onOpenQueue: { showQueueSheet = true },
+                    onSelectQuality: { playerController.changePreferredQuality($0) },
+                    onSetSleepTimer: { playerController.setSleepTimer(minutes: $0) }
+                )
+                .sheet(isPresented: $showQueueSheet) {
+                    queueSheet
+                }
+
+                if let activeToast {
+                    ToastBannerView(
+                        event: activeToast,
+                        onAction: activeToast.openSourceManager ? {
+                            self.activeToast = nil
+                            isPlayerExpanded = false
+                            if path.last != .sourceManager {
+                                path.append(.sourceManager)
+                            }
+                        } : nil
+                    )
+                    .padding(.bottom, 76)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.22), value: activeToast?.id)
             .environment(\.lxPalette, effectivePalette)
-            .sheet(isPresented: $showQueueSheet) {
-                queueSheet
+            .sheet(item: $playerAddToPlaylistTrack) { track in
+                addToPlaylistSheet(for: track)
             }
         }
         .sheet(isPresented: Binding(
@@ -192,7 +218,12 @@ struct RootView: View {
         )) {
             queueSheet
         }
-        .sheet(item: $actionSheetTrack) { track in
+        .sheet(item: $actionSheetTrack, onDismiss: {
+            if let pending = pendingAddToPlaylistTrack {
+                pendingAddToPlaylistTrack = nil
+                addToPlaylistTrack = pending
+            }
+        }) { track in
             TrackActionSheetView(
                 track: track,
                 isFavorite: libraryStore.favoriteIds.contains(track.id),
@@ -203,27 +234,15 @@ struct RootView: View {
                     let added = libraryStore.toggleFavorite(track)
                     showToast(added ? "已添加到我喜欢的" : "已取消喜欢")
                 },
-                onAddToPlaylist: { addToPlaylistTrack = track },
-                onDownload: { triggerTrackDownload(track) }
+                onAddToPlaylist: { pendingAddToPlaylistTrack = track },
+                onDownload: { triggerTrackDownload(track) },
+                onRemoveFromPlaylist: removeFromCurrentPlaylistHandler(for: track)
             )
             .environment(\.lxPalette, effectivePalette)
             .presentationDetents([.medium])
         }
         .sheet(item: $addToPlaylistTrack) { track in
-            AddToPlaylistSheetView(
-                track: track,
-                playlists: libraryStore.userPlaylists,
-                onSelectPlaylist: { pl in
-                    libraryStore.addTracks([track], toPlaylistId: pl.id)
-                    showToast("已收藏到《\(pl.name)》")
-                },
-                onCreateAndAdd: { name in
-                    _ = libraryStore.createPlaylist(name: name, tracks: [track])
-                    showToast("已创建歌单《\(name)》并加入")
-                }
-            )
-            .environment(\.lxPalette, effectivePalette)
-            .presentationDetents([.medium])
+            addToPlaylistSheet(for: track)
         }
         .onReceive(playerController.events) { event in
             showEvent(event)
@@ -340,8 +359,12 @@ struct RootView: View {
                         )
                     },
                     onCreatePlaylist: { name in
-                        _ = libraryStore.createPlaylist(name: name)
-                        showToast("已创建歌单《\(name)》")
+                        switch libraryStore.createPlaylist(name: name) {
+                        case .created:
+                            showToast("已创建歌单《\(name)》")
+                        case .limitReached(let limit):
+                            showToast("最多支持自建 \(limit) 个歌单，请先删除不需要的歌单")
+                        }
                     },
                     onImportExternalPlaylist: { input in
                         importExternalPlaylist(input)
@@ -349,6 +372,9 @@ struct RootView: View {
                     onDeletePlaylist: { pl in
                         libraryStore.deletePlaylist(id: pl.id)
                         showToast("已删除歌单《\(pl.name)》")
+                    },
+                    onPlaylistLimitReached: {
+                        showToast("最多支持自建 \(LibraryStore.maxCustomPlaylists) 个歌单，请先删除不需要的歌单")
                     }
                 )
 
@@ -508,7 +534,7 @@ struct RootView: View {
             let tracks = libraryStore.tracks(forPlaylistId: playlist.id)
             CollectionDetailView(
                 title: playlist.name,
-                subtitle: "歌单内还没有歌曲，可在搜索或发现页收藏添加",
+                subtitle: "歌单内还没有歌曲，可在播放页或歌曲菜单中添加",
                 tracks: tracks,
                 currentTrackId: playerController.state.currentTrack?.id,
                 isPlaying: playerController.state.isPlaying,
@@ -769,11 +795,51 @@ struct RootView: View {
         }
     }
 
+    private func removeFromCurrentPlaylistHandler(for track: Track) -> (() -> Void)? {
+        guard case .userPlaylist(let pl) = path.last else { return nil }
+        return {
+            libraryStore.removeTrack(trackId: track.id, fromPlaylistId: pl.id)
+            showToast("已从《\(pl.name)》移除")
+        }
+    }
+
+    private func addToPlaylistSheet(for track: Track) -> some View {
+        AddToPlaylistSheetView(
+            track: track,
+            playlists: libraryStore.userPlaylists,
+            containedPlaylistIds: libraryStore.playlistIdsContaining(trackId: track.id),
+            customPlaylistCount: libraryStore.customPlaylistCount,
+            maxCustomPlaylists: LibraryStore.maxCustomPlaylists,
+            onSelectPlaylist: { pl in
+                let res = libraryStore.addTracks([track], toPlaylistId: pl.id)
+                if res.addedCount > 0 {
+                    showToast("已添加到《\(pl.name)》")
+                } else {
+                    showToast("《\(track.title)》已在《\(pl.name)》中")
+                }
+            },
+            onCreateAndAdd: { name in
+                switch libraryStore.createPlaylist(name: name, tracks: [track]) {
+                case .created:
+                    showToast("已创建歌单《\(name)》并加入")
+                case .limitReached(let limit):
+                    showToast("最多支持自建 \(limit) 个歌单，请先删除不需要的歌单")
+                }
+            },
+            onLimitReached: {
+                showToast("最多支持自建 \(LibraryStore.maxCustomPlaylists) 个歌单，请先删除不需要的歌单")
+            }
+        )
+        .environment(\.lxPalette, effectivePalette)
+        .presentationDetents([.medium, .large])
+    }
+
     private func saveOnlinePlaylistToLibrary(_ detail: PlaylistDetailResult) {
         _ = libraryStore.createPlaylist(
             name: detail.playlist.name,
             description: detail.playlist.description,
             coverUrl: detail.playlist.coverUrl,
+            sourceUrl: "\(detail.playlist.source.code):\(detail.playlist.id)",
             tracks: detail.tracks
         )
         showToast("已收藏《\(detail.playlist.name)》到我的歌单")

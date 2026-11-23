@@ -35,12 +35,17 @@ struct LibraryView: View {
     let onCreatePlaylist: (String) -> Void
     let onImportExternalPlaylist: (String) -> Void
     let onDeletePlaylist: (UserPlaylist) -> Void
+    var onPlaylistLimitReached: () -> Void = {}
 
     @Environment(\.lxPalette) private var lx
     @State private var showCreateAlert = false
     @State private var newPlaylistName = ""
     @State private var showImportSheet = false
     @State private var importInput = ""
+
+    private var customPlaylistCount: Int {
+        playlists.filter { LibraryStore.isCustomPlaylist(sourceUrl: $0.sourceUrl) }.count
+    }
 
     var body: some View {
         ScrollView {
@@ -198,14 +203,21 @@ struct LibraryView: View {
 
                 // My Playlists
                 VStack(alignment: .leading, spacing: 12) {
-                    HStack {
+                    HStack(spacing: 8) {
                         Text("我的歌单")
                             .font(.system(size: 18, weight: .semibold))
                             .foregroundColor(lx.textPrimary)
+                        Text("自建 \(customPlaylistCount)/\(LibraryStore.maxCustomPlaylists)")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(lx.textTertiary)
                         Spacer()
                         Button {
-                            newPlaylistName = ""
-                            showCreateAlert = true
+                            if customPlaylistCount >= LibraryStore.maxCustomPlaylists {
+                                onPlaylistLimitReached()
+                            } else {
+                                newPlaylistName = ""
+                                showCreateAlert = true
+                            }
                         } label: {
                             HStack(spacing: 4) {
                                 Image(systemName: "plus")
@@ -227,7 +239,7 @@ struct LibraryView: View {
                                 Text("还没有自建歌单")
                                     .font(.system(size: 15, weight: .semibold))
                                     .foregroundColor(lx.textPrimary)
-                                Text("点击右上角“新建”创建歌单，或点击顶部链接图标导入网易云 / QQ / 酷我歌单")
+                                Text("点击右上角“新建”创建歌单（最多自建 \(LibraryStore.maxCustomPlaylists) 个），或点击顶部链接图标导入网易云 / QQ / 酷我歌单")
                                     .font(.system(size: 12))
                                     .foregroundColor(lx.textSecondary)
                                     .multilineTextAlignment(.center)
@@ -240,6 +252,7 @@ struct LibraryView: View {
                     } else {
                         VStack(spacing: 10) {
                             ForEach(playlists) { pl in
+                                let isExternal = !LibraryStore.isCustomPlaylist(sourceUrl: pl.sourceUrl)
                                 Button {
                                     onOpenPlaylist(pl)
                                 } label: {
@@ -251,7 +264,7 @@ struct LibraryView: View {
                                                     .font(.system(size: 15, weight: .semibold))
                                                     .foregroundColor(lx.textPrimary)
                                                     .lineLimit(1)
-                                                Text("\(pl.trackCount) 首歌曲")
+                                                Text(isExternal ? "\(pl.trackCount) 首歌曲 · 外部导入" : "\(pl.trackCount) 首歌曲")
                                                     .font(.system(size: 12))
                                                     .foregroundColor(lx.textSecondary)
                                             }
@@ -286,6 +299,8 @@ struct LibraryView: View {
                 let name = newPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !name.isEmpty { onCreatePlaylist(name) }
             }
+        } message: {
+            Text("最多支持自建 \(LibraryStore.maxCustomPlaylists) 个歌单（当前 \(customPlaylistCount)/\(LibraryStore.maxCustomPlaylists)）")
         }
         .sheet(isPresented: $showImportSheet) {
             NavigationStack {

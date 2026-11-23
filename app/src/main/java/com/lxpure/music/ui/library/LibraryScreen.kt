@@ -81,9 +81,14 @@ fun LibraryScreen(
     onOpenPlaylist: (UserPlaylist) -> Unit,
     onPlayTrack: (Track) -> Unit,
     onCreatePlaylist: (String) -> Unit,
-    onImportExternalPlaylist: (String) -> Unit
+    onImportExternalPlaylist: (String) -> Unit,
+    onPlaylistLimitReached: () -> Unit = {}
 ) {
     val lxColors = LocalLxColors.current
+    val customPlaylistCount = remember(playlists) {
+        com.lxpure.music.data.repository.LibraryRepository.customPlaylistCount(playlists)
+    }
+    val maxCustomPlaylists = com.lxpure.music.data.repository.LibraryRepository.MAX_CUSTOM_PLAYLISTS
     var showCreateDialog by remember { mutableStateOf(false) }
     var showImportDialog by remember { mutableStateOf(false) }
 
@@ -304,11 +309,21 @@ fun LibraryScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(
-                    text = "我的歌单",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = lxColors.textPrimary
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "我的歌单",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = lxColors.textPrimary
+                    )
+                    Text(
+                        text = "自建 $customPlaylistCount/$maxCustomPlaylists",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = lxColors.textTertiary
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     SmallActionPill(
                         icon = Icons.Rounded.Link,
@@ -318,7 +333,13 @@ fun LibraryScreen(
                     SmallActionPill(
                         icon = Icons.Rounded.Add,
                         label = "新建",
-                        onClick = { showCreateDialog = true }
+                        onClick = {
+                            if (customPlaylistCount >= maxCustomPlaylists) {
+                                onPlaylistLimitReached()
+                            } else {
+                                showCreateDialog = true
+                            }
+                        }
                     )
                 }
             }
@@ -395,6 +416,7 @@ fun LibraryScreen(
         SimpleTextInputDialog(
             title = "新建歌单",
             placeholder = "例如：深夜独处、通勤节奏",
+            supportingText = "最多支持自建 $maxCustomPlaylists 个歌单（当前 $customPlaylistCount/$maxCustomPlaylists）",
             confirmLabel = "创建",
             onDismiss = { showCreateDialog = false },
             onConfirm = { name ->

@@ -198,6 +198,7 @@ class LxQuickJsRuntime(
                     "es-polyfill.js"
                 )
                 ctx.evaluate(preloadScript, "user-api-preload.js")
+                val normalizedScript = LxScriptParser.normalizeScript(source.script)
                 ctx.globalObject.getJSFunction("lx_setup").call(
                     secretKey,
                     source.id,
@@ -206,9 +207,9 @@ class LxQuickJsRuntime(
                     source.version,
                     source.author,
                     source.homepage,
-                    source.script
+                    normalizedScript
                 )
-                ctx.evaluate(source.script, "${source.name}.js")
+                ctx.evaluate(normalizedScript, "${source.name}.js")
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to initialize script ${source.name}", t)
                 if (!initDeferred.isCompleted) {

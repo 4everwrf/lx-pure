@@ -73,19 +73,7 @@ struct SourceManagerView: View {
                             isUpdatingAll = true
                             let summary = await userApiManager.updateAllSources()
                             isUpdatingAll = false
-                            let msg: String
-                            if !summary.updatedNames.isEmpty {
-                                msg = "已更新 \(summary.updatedNames.count) 个音源：\(summary.updatedNames.joined(separator: "、"))"
-                            } else if summary.failedCount == 0 && summary.latestCount > 0 {
-                                msg = "全部 \(summary.latestCount) 个在线音源均已是最新版本"
-                            } else if summary.latestCount > 0 {
-                                msg = "\(summary.latestCount) 个已最新，\(summary.failedCount) 个拉取失败"
-                            } else if summary.skippedLocalCount > 0 && summary.failedCount == 0 {
-                                msg = "当前均为本地导入脚本，未绑定在线更新链接"
-                            } else {
-                                msg = "更新检查失败，请检查网络连接后重试"
-                            }
-                            onMessage(msg)
+                            onMessage(summary.formatUserMessage())
                         }
                     } label: {
                         HStack(spacing: 4) {

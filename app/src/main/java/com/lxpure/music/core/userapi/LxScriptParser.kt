@@ -16,9 +16,24 @@ object LxScriptParser {
     private val headerBlockRegex = Regex("/\\*[*!]([\\s\\S]*?)\\*/")
     private val tagRegex = Regex("@([a-zA-Z_]+)\\s+(.+)")
 
+    /**
+     * Strips any leading UTF-8 BOM and normalizes CRLF/CR line endings to Unix LF (`\n`)
+     * so scripts that verify MD5 checksums of `lx.currentScriptInfo.rawScript` behave
+     * identically whether imported from Windows files, clipboard, or remote URLs.
+     */
+    fun normalizeScript(raw: String): String {
+        val withoutBom = raw.removePrefix("\uFEFF")
+        return if ('\r' in withoutBom) {
+            withoutBom.replace("\r\n", "\n").replace('\r', '\n')
+        } else {
+            withoutBom
+        }
+    }
+
     fun parse(script: String, fallbackName: String = "自定义音源"): ParsedScriptMeta {
+        val normalized = normalizeScript(script)
         val tags = mutableMapOf<String, String>()
-        val header = headerBlockRegex.find(script)?.groupValues?.getOrNull(1)
+        val header = headerBlockRegex.find(normalized)?.groupValues?.getOrNull(1)
         if (header != null) {
             header.lines().forEach { rawLine ->
                 val line = rawLine.trim().removePrefix("*").trim()

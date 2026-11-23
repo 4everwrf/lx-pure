@@ -19,12 +19,29 @@ enum LxScriptParser {
         options: []
     )
 
+    /// Strips any leading UTF-8 BOM and normalizes CRLF/CR line endings to Unix LF (`\n`)
+    /// so scripts that verify MD5 checksums of `lx.currentScriptInfo.rawScript` behave
+    /// identically whether imported from Windows files, clipboard, or remote URLs.
+    static func normalizeScript(_ raw: String) -> String {
+        var normalized = raw
+        if normalized.unicodeScalars.first == "\u{FEFF}" {
+            normalized = String(normalized.unicodeScalars.dropFirst())
+        }
+        if normalized.unicodeScalars.contains("\r") {
+            normalized = normalized
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+        }
+        return normalized
+    }
+
     static func parse(_ script: String, fallbackName: String = "自定义音源") -> ParsedScriptMeta {
+        let normalized = normalizeScript(script)
         var tags: [String: String] = [:]
-        let nsScript = script as NSString
+        let nsScript = normalized as NSString
         let fullRange = NSRange(location: 0, length: nsScript.length)
 
-        if let match = headerBlockRegex.firstMatch(in: script, options: [], range: fullRange),
+        if let match = headerBlockRegex.firstMatch(in: normalized, options: [], range: fullRange),
            match.numberOfRanges > 1 {
             let headerRange = match.range(at: 1)
             if headerRange.location != NSNotFound {

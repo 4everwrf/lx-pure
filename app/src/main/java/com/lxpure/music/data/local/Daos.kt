@@ -33,6 +33,9 @@ interface PlaylistDao {
     @Query("SELECT * FROM playlists WHERE id = :id LIMIT 1")
     suspend fun getById(id: Long): PlaylistEntity?
 
+    @Query("SELECT COUNT(*) FROM playlists WHERE sourceUrl IS NULL OR TRIM(sourceUrl) = ''")
+    suspend fun countCustomPlaylists(): Int
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(entity: PlaylistEntity): Long
 
@@ -53,6 +56,9 @@ interface PlaylistDao {
 
     @Query("SELECT playlistId, COUNT(*) as count FROM playlist_tracks GROUP BY playlistId")
     fun observeAllTrackCounts(): Flow<List<PlaylistCountTuple>>
+
+    @Query("SELECT playlistId FROM playlist_tracks WHERE trackId = :trackId")
+    fun observePlaylistIdsContainingTrack(trackId: String): Flow<List<Long>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertTracks(tracks: List<PlaylistTrackEntity>)

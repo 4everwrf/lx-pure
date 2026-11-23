@@ -161,11 +161,10 @@ class LibraryRepository(private val db: AppDatabase) {
     }
 
     suspend fun addTracksToPlaylist(playlistId: Long, tracks: List<Track>): AddTracksResult = withContext(Dispatchers.IO) {
-        val existing = db.playlistDao().getTracksOnce(playlistId)
-        val existingIds = existing.mapTo(HashSet()) { it.trackId }
+        val existingIds = db.playlistDao().getTrackIdsOnce(playlistId).toHashSet()
         val (uniqueNew, duplicateCount) = filterNewTracksForPlaylist(existingIds, tracks)
         if (uniqueNew.isNotEmpty()) {
-            val startPosition = (existing.maxOfOrNull { it.position } ?: -1) + 1
+            val startPosition = db.playlistDao().getMaxPosition(playlistId) + 1
             val entities = uniqueNew.mapIndexed { idx, track ->
                 PlaylistTrackEntity(
                     playlistId = playlistId,

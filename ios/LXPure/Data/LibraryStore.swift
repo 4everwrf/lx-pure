@@ -1,10 +1,15 @@
 import Combine
 import Foundation
+import UIKit
 
 private struct HistoryEntry: Codable {
     var track: Track
     var playedAt: Int64
     var playCount: Int
+}
+
+private struct TrackIdOnly: Decodable {
+    let id: String
 }
 
 enum CreatePlaylistResult: Equatable, Sendable {
@@ -20,6 +25,8 @@ struct AddTracksResult: Equatable, Sendable {
 @MainActor
 final class LibraryStore: ObservableObject {
     nonisolated static let maxCustomPlaylists = 10
+    nonisolated static let maxCachedTrackLists = 3
+    nonisolated static let maxCachedTracksTotal = 3_000
 
     nonisolated static func isCustomPlaylist(sourceUrl: String?) -> Bool {
         (sourceUrl ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -32,6 +39,19 @@ final class LibraryStore: ObservableObject {
     var canCreateCustomPlaylist: Bool {
         customPlaylistCount < Self.maxCustomPlaylists
     }
+
+    var cachedTrackListCount: Int {
+        playlistTracksCache.count
+    }
+
+    var cachedTrackTotalCount: Int {
+        playlistTracksCache.values.reduce(0) { $0 + $1.count }
+    }
+
+    var cachedTrackIdSetCount: Int {
+        playlistTrackIdsCache.count
+    }
+
     @Published private(set) var favorites: [Track] = []
     @Published private(set) var favoriteIds: Set<String> = []
     @Published private(set) var recentHistory: [Track] = []
@@ -41,7 +61,10 @@ final class LibraryStore: ObservableObject {
 
     private var historyEntries: [HistoryEntry] = []
     private var playlistTracksCache: [Int64: [Track]] = [:]
+    private var playlistTracksCacheOrder: [Int64] = []
+    private var playlistTrackIdsCache: [Int64: Set<String>] = [:]
     private var savedUserApis: [UserApiSource] = []
+    private var memoryWarningCancellable: AnyCancellable?
 
     private let baseDir: URL
     private let ioQueue = DispatchQueue(label: "com.lxpure.library.io", qos: .utility)
@@ -56,6 +79,23 @@ final class LibraryStore: ObservableObject {
         }
         try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
         loadAllSync()
+
+        memoryWarningCancellable = NotificationCenter.default
+            .publisher(for: UIApplication.didReceiveMemoryWarningNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.evictTrackCaches()
+            }
+    }
+
+    func evictTrackCaches() {
+        playlistTracksCache.removeAll(keepingCapacity: false)
+        playlistTracksCacheOrder.removeAll(keepingCapacity: false)
+        playlistTrackIdsCache.removeAll(keepingCapacity: false)
+    }
+
+    func flushPendingWrites() {
+        ioQueue.sync {}
     }
 
     private func fileURL(_ name: String) -> URL {
@@ -76,6 +116,7 @@ final class LibraryStore: ObservableObject {
     }
 
     private func readJson<T: Decodable>(_ filename: String) -> T? {
+        ioQueue.sync {}
         let url = fileURL(filename)
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(T.self, from: data)
@@ -182,7 +223,7 @@ final class LibraryStore: ObservableObject {
             createdAt: now
         )
         userPlaylists.insert(playlist, at: 0)
-        playlistTracksCache[nextId] = uniqueTracks
+        cachePlaylistTracks(uniqueTracks, for: nextId)
         writeJson(userPlaylists, to: "playlists.json")
         writeJson(uniqueTracks, to: "playlist_\(nextId).json")
         return .created(nextId)
@@ -190,19 +231,31 @@ final class LibraryStore: ObservableObject {
 
     func tracks(forPlaylistId playlistId: Int64) -> [Track] {
         if let cached = playlistTracksCache[playlistId] {
+            touchTrackCacheOrder(playlistId)
             return cached
         }
         let loaded: [Track] = readJson("playlist_\(playlistId).json") ?? []
-        playlistTracksCache[playlistId] = loaded
+        cachePlaylistTracks(loaded, for: playlistId)
         return loaded
     }
 
     func playlistIdsContaining(trackId: String) -> Set<Int64> {
         var result = Set<Int64>()
         for pl in userPlaylists {
-            if tracks(forPlaylistId: pl.id).contains(where: { $0.id == trackId }) {
-                result.insert(pl.id)
+            if let cachedIds = playlistTrackIdsCache[pl.id] {
+                if cachedIds.contains(trackId) { result.insert(pl.id) }
+                continue
             }
+            if let cachedTracks = playlistTracksCache[pl.id] {
+                let ids = Set(cachedTracks.map(\.id))
+                playlistTrackIdsCache[pl.id] = ids
+                if ids.contains(trackId) { result.insert(pl.id) }
+                continue
+            }
+            let minimal: [TrackIdOnly] = readJson("playlist_\(pl.id).json") ?? []
+            let ids = Set(minimal.map(\.id))
+            playlistTrackIdsCache[pl.id] = ids
+            if ids.contains(trackId) { result.insert(pl.id) }
         }
         return result
     }
@@ -224,7 +277,7 @@ final class LibraryStore: ObservableObject {
             }
         }
         if addedCount > 0 {
-            playlistTracksCache[playlistId] = existing
+            cachePlaylistTracks(existing, for: playlistId)
             writeJson(existing, to: "playlist_\(playlistId).json")
 
             if let idx = userPlaylists.firstIndex(where: { $0.id == playlistId }) {
@@ -242,7 +295,7 @@ final class LibraryStore: ObservableObject {
     func removeTrack(trackId: String, fromPlaylistId playlistId: Int64) {
         var existing = tracks(forPlaylistId: playlistId)
         existing.removeAll { $0.id == trackId }
-        playlistTracksCache[playlistId] = existing
+        cachePlaylistTracks(existing, for: playlistId)
         writeJson(existing, to: "playlist_\(playlistId).json")
 
         if let idx = userPlaylists.firstIndex(where: { $0.id == playlistId }) {
@@ -254,10 +307,36 @@ final class LibraryStore: ObservableObject {
     func deletePlaylist(id playlistId: Int64) {
         userPlaylists.removeAll { $0.id == playlistId }
         playlistTracksCache.removeValue(forKey: playlistId)
+        playlistTracksCacheOrder.removeAll { $0 == playlistId }
+        playlistTrackIdsCache.removeValue(forKey: playlistId)
         writeJson(userPlaylists, to: "playlists.json")
         let url = fileURL("playlist_\(playlistId).json")
         ioQueue.async {
             try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func cachePlaylistTracks(_ tracks: [Track], for playlistId: Int64) {
+        playlistTracksCache[playlistId] = tracks
+        playlistTrackIdsCache[playlistId] = Set(tracks.map(\.id))
+        touchTrackCacheOrder(playlistId)
+        enforceTrackCacheLimits()
+    }
+
+    private func touchTrackCacheOrder(_ playlistId: Int64) {
+        if playlistTracksCacheOrder.last == playlistId { return }
+        playlistTracksCacheOrder.removeAll { $0 == playlistId }
+        playlistTracksCacheOrder.append(playlistId)
+    }
+
+    private func enforceTrackCacheLimits() {
+        var totalTracks = playlistTracksCache.values.reduce(0) { $0 + $1.count }
+        while playlistTracksCacheOrder.count > 1 &&
+            (playlistTracksCache.count > Self.maxCachedTrackLists || totalTracks > Self.maxCachedTracksTotal) {
+            let oldestId = playlistTracksCacheOrder.removeFirst()
+            if let evicted = playlistTracksCache.removeValue(forKey: oldestId) {
+                totalTracks -= evicted.count
+            }
         }
     }
 

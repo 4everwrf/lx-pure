@@ -625,4 +625,91 @@ final class CoreProtocolTests: XCTestCase {
             XCTFail("Expected creating playlist after deletion to succeed")
         }
     }
+
+    @MainActor
+    func testLargePlaylistsAndTracksMemoryBoundsAndNoRetainCycle() {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxpure_mem_stress_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        weak var weakStore: LibraryStore?
+        var createdIds: [Int64] = []
+
+        do {
+            let store = LibraryStore(baseDirectory: tempDir)
+            weakStore = store
+
+            // Create 8 large external playlists (600 tracks each) + 10 custom playlists (200 tracks each) = 6,800 tracks
+            for extIdx in 1...8 {
+                let tracks = (0..<600).map { i in
+                    Track(
+                        id: "ext_\(extIdx)_\(i)",
+                        title: "外部歌单曲目 \(extIdx)-\(i)",
+                        artist: "歌手 \(i)",
+                        album: "专辑 \(extIdx)",
+                        source: .wy,
+                        coverUrl: "https://p2.music.126.net/ext_\(extIdx)_\(i).jpg"
+                    )
+                }
+                if case .created(let id) = store.createPlaylist(
+                    name: "外部大歌单\(extIdx)",
+                    sourceUrl: "https://music.163.com/playlist?id=\(10_000 + extIdx)",
+                    tracks: tracks
+                ) {
+                    createdIds.append(id)
+                } else {
+                    XCTFail("Expected external playlist \(extIdx) creation to succeed")
+                }
+            }
+
+            for customIdx in 1...LibraryStore.maxCustomPlaylists {
+                let tracks = (0..<200).map { i in
+                    Track(id: "cus_\(customIdx)_\(i)", title: "自建曲目 \(i)", artist: "歌手", source: .tx)
+                }
+                if case .created(let id) = store.createPlaylist(name: "自建大歌单\(customIdx)", tracks: tracks) {
+                    createdIds.append(id)
+                } else {
+                    XCTFail("Expected custom playlist \(customIdx) creation to succeed")
+                }
+            }
+
+            XCTAssertEqual(createdIds.count, 18)
+            XCTAssertLessThanOrEqual(store.cachedTrackListCount, LibraryStore.maxCachedTrackLists)
+            XCTAssertLessThanOrEqual(store.cachedTrackTotalCount, LibraryStore.maxCachedTracksTotal)
+
+            // Flush writes, clear memory caches, and verify membership lookup uses ID-only decoding without inflating full-track cache
+            store.flushPendingWrites()
+            store.evictTrackCaches()
+            XCTAssertEqual(store.cachedTrackListCount, 0)
+            XCTAssertEqual(store.cachedTrackIdSetCount, 0)
+
+            let matches = store.playlistIdsContaining(trackId: "ext_3_420")
+            XCTAssertEqual(matches, Set([createdIds[2]]))
+            XCTAssertEqual(store.cachedTrackListCount, 0, "Membership scan must not load full Track arrays into RAM")
+
+            // Repeatedly browsing all 18 playlists keeps LRU track cache strictly bounded
+            for id in createdIds {
+                let loaded = store.tracks(forPlaylistId: id)
+                XCTAssertFalse(loaded.isEmpty)
+                XCTAssertLessThanOrEqual(store.cachedTrackListCount, LibraryStore.maxCachedTrackLists)
+                XCTAssertLessThanOrEqual(store.cachedTrackTotalCount, LibraryStore.maxCachedTracksTotal)
+            }
+
+            // Deleting all playlists leaves zero cached lists, zero ID sets, and zero disk playlist files
+            for id in createdIds {
+                store.deletePlaylist(id: id)
+            }
+            store.flushPendingWrites()
+            XCTAssertTrue(store.userPlaylists.isEmpty)
+            XCTAssertEqual(store.cachedTrackListCount, 0)
+            XCTAssertEqual(store.cachedTrackIdSetCount, 0)
+            for id in createdIds {
+                let path = tempDir.appendingPathComponent("playlist_\(id).json").path
+                XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+            }
+        }
+
+        // Proves zero retain cycles in LibraryStore (Combine memory-warning subscription / ioQueue closures)
+        XCTAssertNil(weakStore)
+    }
 }

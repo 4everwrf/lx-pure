@@ -648,14 +648,17 @@ private fun LxPureRoot(container: AppContainer) {
                     }
 
                     is SubRoute.UserPlaylistDetail -> {
-                        val plTracks by container.libraryRepository
-                            .observePlaylistTracks(topRoute.playlist.id)
-                            .collectAsState(initial = emptyList())
-                        val plSource = PlaybackQueueSource(
-                            type = QueueSourceType.USER_PLAYLIST,
-                            title = topRoute.playlist.name,
-                            userPlaylistId = topRoute.playlist.id
-                        )
+                        val plTracksFlow = remember(topRoute.playlist.id) {
+                            container.libraryRepository.observePlaylistTracks(topRoute.playlist.id)
+                        }
+                        val plTracks by plTracksFlow.collectAsState(initial = emptyList())
+                        val plSource = remember(topRoute.playlist.id, topRoute.playlist.name) {
+                            PlaybackQueueSource(
+                                type = QueueSourceType.USER_PLAYLIST,
+                                title = topRoute.playlist.name,
+                                userPlaylistId = topRoute.playlist.id
+                            )
+                        }
 
                         CollectionDetailScreen(
                             title = topRoute.playlist.name,

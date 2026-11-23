@@ -107,10 +107,12 @@ final class AppContainer: ObservableObject {
     func handleBackgroundTransition() {
         playerController.persistSnapshotNow(synchronous: true)
         userApiManager.trimIdleRuntimes(keepTopCount: 2)
+        libraryStore.evictTrackCaches()
     }
 
     func handleMemoryPressure() {
         ImageMemoryCache.shared.clear()
         userApiManager.trimIdleRuntimes(keepTopCount: 1)
+        libraryStore.evictTrackCaches()
     }
 }

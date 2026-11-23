@@ -51,6 +51,12 @@ interface PlaylistDao {
     @Query("SELECT * FROM playlist_tracks WHERE playlistId = :playlistId ORDER BY position ASC, addedAt DESC")
     suspend fun getTracksOnce(playlistId: Long): List<PlaylistTrackEntity>
 
+    @Query("SELECT trackId FROM playlist_tracks WHERE playlistId = :playlistId")
+    suspend fun getTrackIdsOnce(playlistId: Long): List<String>
+
+    @Query("SELECT COALESCE(MAX(position), -1) FROM playlist_tracks WHERE playlistId = :playlistId")
+    suspend fun getMaxPosition(playlistId: Long): Int
+
     @Query("SELECT COUNT(*) FROM playlist_tracks WHERE playlistId = :playlistId")
     fun observeTrackCount(playlistId: Long): Flow<Int>
 

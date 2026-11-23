@@ -732,4 +732,88 @@ class CoreProtocolTest {
         assertEquals(listOf("kw_3", "wy_4"), uniqueNew.map { it.id })
         assertEquals(3, dupCount)
     }
+
+    @Test
+    fun largePlaylistStressAndMemoryLeakGuard() {
+        val tempDir = java.nio.file.Files.createTempDirectory("lxpure_stress_test").toFile()
+        try {
+            val store = com.lxpure.music.data.local.PlaybackSessionStore(tempDir)
+            val runtime = Runtime.getRuntime()
+            System.gc()
+            Thread.sleep(30)
+            val baselineUsedBytes = runtime.totalMemory() - runtime.freeMemory()
+
+            // Stress 20 playlists (10 custom + 10 large external) x 2,000 tracks = 40,000 tracks processed
+            var weakLastLargeQueue: java.lang.ref.WeakReference<List<Track>>? = null
+            for (round in 1..20) {
+                val largeTracks = (0 until 2_000).map { idx ->
+                    Track(
+                        id = "wy_${round}_$idx",
+                        title = "大歌单压测曲目 $round-$idx",
+                        artist = "歌手 $idx",
+                        album = "专辑 $round",
+                        source = MusicSource.WY,
+                        songmid = "${round * 10_000 + idx}",
+                        durationMs = 210_000L,
+                        coverUrl = "https://p2.music.126.net/test_${round}_$idx.jpg"
+                    )
+                }
+                val existingIds = largeTracks.take(1_000).mapTo(HashSet()) { it.id }
+                val (uniqueNew, dupCount) = com.lxpure.music.data.repository.LibraryRepository.filterNewTracksForPlaylist(
+                    existingTrackIds = existingIds,
+                    tracksToAdd = largeTracks
+                )
+                assertEquals(1_000, uniqueNew.size)
+                assertEquals(1_000, dupCount)
+
+                // Verify persistence strictly bounds huge 6,000-track queues without memory blowup
+                if (round % 5 == 0) {
+                    val giantQueue = (0 until 6_000).map { idx ->
+                        Track(id = "tx_${round}_$idx", title = "Giant $idx", artist = "Artist")
+                    }
+                    val source = com.lxpure.music.domain.model.PlaybackQueueSource(
+                        type = com.lxpure.music.domain.model.QueueSourceType.USER_PLAYLIST,
+                        title = "超大外部歌单 $round",
+                        userPlaylistId = round.toLong()
+                    )
+                    store.saveQueueAndCursor(
+                        queue = giantQueue,
+                        currentIndex = 4_321,
+                        positionMs = 88_000L,
+                        durationMs = 240_000L,
+                        repeatMode = com.lxpure.music.domain.model.RepeatMode.LIST_LOOP,
+                        queueSource = source,
+                        activeQualityBadge = "SQ",
+                        activeProviderName = null
+                    )
+                    val restored = store.loadSession()
+                    assertNotNull(restored)
+                    assertEquals(com.lxpure.music.data.local.PlaybackSessionStore.MAX_PERSISTED_QUEUE_SIZE, restored!!.queue.size)
+                    assertEquals("tx_${round}_4321", restored.queue[restored.currentIndex].id)
+                    weakLastLargeQueue = java.lang.ref.WeakReference(giantQueue)
+                }
+            }
+
+            store.clear()
+            assertNull(store.loadSession())
+
+            // Verify temporary large playlist allocations are reclaimable (no static/cache retention leak)
+            var reclaimed = false
+            for (attempt in 0 until 6) {
+                System.gc()
+                Thread.sleep(30)
+                if (weakLastLargeQueue?.get() == null) {
+                    reclaimed = true
+                    break
+                }
+            }
+            assertTrue("Expected temporary 6,000-track list to be GC-reclaimable", reclaimed)
+
+            val afterUsedBytes = runtime.totalMemory() - runtime.freeMemory()
+            val retainedDeltaMb = (afterUsedBytes - baselineUsedBytes) / (1024L * 1024L)
+            assertTrue("Retained heap delta after stress test should stay bounded, was ${retainedDeltaMb}MB", retainedDeltaMb < 48L)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

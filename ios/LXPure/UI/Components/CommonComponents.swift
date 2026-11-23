@@ -43,12 +43,17 @@ struct AlbumArtworkView: View {
 }
 
 struct GlassCard<Content: View>: View {
-    var cornerRadius: CGFloat = 18
-    @ViewBuilder let content: () -> Content
+    let cornerRadius: CGFloat
+    let content: Content
     @Environment(\.lxPalette) private var lx
 
+    init(cornerRadius: CGFloat = 18, @ViewBuilder content: () -> Content) {
+        self.cornerRadius = cornerRadius
+        self.content = content()
+    }
+
     var body: some View {
-        content()
+        content
             .background(lx.surface)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay(

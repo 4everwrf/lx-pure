@@ -116,45 +116,45 @@ final class LxJsRuntime: @unchecked Sendable {
         }
 
         return await withCheckedContinuation { cont in
-            let timeoutItem = DispatchWorkItem { [weak self] in
-                self?.completeInit(
-                    ScriptInitResult(success: false, errorMessage: "脚本初始化超时 (\(Int(timeoutSeconds))s)")
-                )
+            let timeoutTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(max(timeoutSeconds, 0.1) * 1_000_000_000))
+                if !Task.isCancelled {
+                    self?.completeInit(
+                        ScriptInitResult(success: false, errorMessage: "脚本初始化超时 (\(Int(timeoutSeconds))s)")
+                    )
+                }
             }
 
             stateLock.lock()
             if isDestroyed {
                 stateLock.unlock()
+                timeoutTask.cancel()
                 cont.resume(returning: ScriptInitResult(success: false, errorMessage: "音源已停用"))
                 return
             }
             if let cached = initResultCached {
                 stateLock.unlock()
+                timeoutTask.cancel()
                 cont.resume(returning: cached)
                 return
             }
             initContinuation = cont
             stateLock.unlock()
 
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(
-                deadline: .now() + timeoutSeconds,
-                execute: timeoutItem
-            )
-
             jsQueue.async { [weak self] in
                 guard let self else {
-                    timeoutItem.cancel()
+                    timeoutTask.cancel()
                     return
                 }
                 if self.checkDestroyed() {
-                    timeoutItem.cancel()
+                    timeoutTask.cancel()
                     self.completeInit(ScriptInitResult(success: false, errorMessage: "音源已停用"))
                     return
                 }
 
                 let vm = JSVirtualMachine()
                 guard let ctx = JSContext(virtualMachine: vm) else {
-                    timeoutItem.cancel()
+                    timeoutTask.cancel()
                     self.completeInit(ScriptInitResult(success: false, errorMessage: "脚本引擎初始化失败"))
                     return
                 }
@@ -192,7 +192,7 @@ final class LxJsRuntime: @unchecked Sendable {
 
                 ctx.evaluateScript(preloadScript, withSourceURL: URL(string: "lxpure://user-api-preload.js"))
                 if let err = lastEvalException {
-                    timeoutItem.cancel()
+                    timeoutTask.cancel()
                     self.completeInit(ScriptInitResult(success: false, errorMessage: Self.formatFriendlyError(err)))
                     return
                 }
@@ -209,13 +209,13 @@ final class LxJsRuntime: @unchecked Sendable {
                         self.source.script
                     ])
                 } else {
-                    timeoutItem.cancel()
+                    timeoutTask.cancel()
                     self.completeInit(ScriptInitResult(success: false, errorMessage: "脚本桥接初始化失败"))
                     return
                 }
 
                 if let err = lastEvalException {
-                    timeoutItem.cancel()
+                    timeoutTask.cancel()
                     self.completeInit(ScriptInitResult(success: false, errorMessage: Self.formatFriendlyError(err)))
                     return
                 }
@@ -226,7 +226,7 @@ final class LxJsRuntime: @unchecked Sendable {
                 )
 
                 if let err = lastEvalException {
-                    timeoutItem.cancel()
+                    timeoutTask.cancel()
                     self.completeInit(ScriptInitResult(success: false, errorMessage: Self.formatFriendlyError(err)))
                 }
             }

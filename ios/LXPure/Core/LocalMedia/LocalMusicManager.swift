@@ -7,7 +7,7 @@ final class LocalMusicManager: ObservableObject {
     @Published private(set) var localTracks: [Track] = []
     @Published private(set) var isScanning: Bool = false
 
-    private static let supportedExtensions: Set<String> = [
+    private nonisolated static let supportedExtensions: Set<String> = [
         "mp3", "flac", "m4a", "wav", "aac", "alac", "aiff", "caf", "mp4"
     ]
 
@@ -115,7 +115,7 @@ final class LocalMusicManager: ObservableObject {
         return candidate
     }
 
-    private static func extractMetadata(from url: URL, artworkDir: URL) async -> Track? {
+    private nonisolated static func extractMetadata(from url: URL, artworkDir: URL) async -> Track? {
         let asset = AVURLAsset(url: url)
         let durationSeconds: Double = (try? await asset.load(.duration).seconds) ?? 0
         let durationMs = durationSeconds.isFinite && durationSeconds > 0 ? Int64(durationSeconds * 1000.0) : 0

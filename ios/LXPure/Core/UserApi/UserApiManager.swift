@@ -210,7 +210,8 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         } else {
             existing.append(model)
         }
-        await MainActor.run { libraryStore.saveUserApis(existing) }
+        let toSave = existing
+        await MainActor.run { libraryStore.saveUserApis(toSave) }
         await reloadAllFromStore()
 
         if let live = currentSources().first(where: { $0.id == model.id }) {
@@ -223,7 +224,8 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         var saved = await MainActor.run { libraryStore.loadSavedUserApis() }
         if let idx = saved.firstIndex(where: { $0.id == id }) {
             saved[idx].enabled = enabled
-            await MainActor.run { libraryStore.saveUserApis(saved) }
+            let toSave = saved
+            await MainActor.run { libraryStore.saveUserApis(toSave) }
         }
 
         if !enabled {
@@ -254,7 +256,8 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         var saved = await MainActor.run { libraryStore.loadSavedUserApis() }
         saved.removeAll { $0.id == id }
         for idx in saved.indices { saved[idx].priority = idx }
-        await MainActor.run { libraryStore.saveUserApis(saved) }
+        let toSave = saved
+        await MainActor.run { libraryStore.saveUserApis(toSave) }
 
         let updated = currentSources().filter { $0.id != id }
         await publishSources(updated)
@@ -266,7 +269,8 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         let item = saved.remove(at: idx)
         saved.insert(item, at: idx - 1)
         for i in saved.indices { saved[i].priority = i }
-        await MainActor.run { libraryStore.saveUserApis(saved) }
+        let toSave = saved
+        await MainActor.run { libraryStore.saveUserApis(toSave) }
 
         var live = currentSources()
         if let liveIdx = live.firstIndex(where: { $0.id == id }), liveIdx > 0 {
@@ -332,30 +336,32 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         updatedModel.homepage = parsed.homepage.isEmpty ? current.homepage : parsed.homepage
         updatedModel.script = fetchedScript
         updatedModel.sourceUrl = usedUrl ?? current.sourceUrl
+        let finalModel = updatedModel
 
         var saved = await MainActor.run { libraryStore.loadSavedUserApis() }
         if let idx = saved.firstIndex(where: { $0.id == current.id }) {
-            saved[idx] = updatedModel
-            await MainActor.run { libraryStore.saveUserApis(saved) }
+            saved[idx] = finalModel
+            let toSave = saved
+            await MainActor.run { libraryStore.saveUserApis(toSave) }
         }
 
         await updateSourceState(id: current.id) { item in
-            item.name = updatedModel.name
-            item.description = updatedModel.description
-            item.version = updatedModel.version
-            item.author = updatedModel.author
-            item.homepage = updatedModel.homepage
-            item.script = updatedModel.script
-            item.sourceUrl = updatedModel.sourceUrl
+            item.name = finalModel.name
+            item.description = finalModel.description
+            item.version = finalModel.version
+            item.author = finalModel.author
+            item.homepage = finalModel.homepage
+            item.script = finalModel.script
+            item.sourceUrl = finalModel.sourceUrl
         }
-        if updatedModel.enabled {
-            await startRuntime(for: updatedModel)
+        if finalModel.enabled {
+            await startRuntime(for: finalModel)
         }
 
         return SourceUpdateResult(
-            sourceName: updatedModel.name,
+            sourceName: finalModel.name,
             oldVersion: current.version,
-            newVersion: updatedModel.version,
+            newVersion: finalModel.version,
             updated: true,
             alreadyLatest: false,
             errorMessage: nil

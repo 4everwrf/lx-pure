@@ -816,4 +816,80 @@ class CoreProtocolTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun updateRoutesErrorMessagesNotesParsingAndFastScrollBounds() {
+        val rawUrl = "https://github.com/4everwrf/lx-pure/releases/download/v1.1.2/lx-pure-v1.1.2-release.apk"
+        val routes = com.lxpure.music.core.update.AppUpdateManager.buildDownloadRoutes(rawUrl)
+        assertEquals(3, routes.size)
+        assertEquals("GitHub 直连", routes[0].label)
+        assertEquals(rawUrl, routes[0].url)
+        assertTrue(routes[1].url.endsWith(rawUrl))
+        assertTrue(routes[2].url.endsWith(rawUrl))
+
+        val timeoutMsg = com.lxpure.music.core.update.AppUpdateManager.formatDownloadError(
+            java.net.SocketTimeoutException("connect timed out"),
+            triedMirrors = true
+        )
+        assertTrue(timeoutMsg.contains("超时"))
+        assertTrue(timeoutMsg.contains("代理"))
+
+        val unreachableMsg = com.lxpure.music.core.update.AppUpdateManager.formatDownloadError(
+            java.net.UnknownHostException("github.com"),
+            triedMirrors = true
+        )
+        assertTrue(unreachableMsg.contains("无法连接"))
+
+        val rawReleaseBody = """
+            ## 轻雪音乐 (LX Pure) v1.1.2
+
+            ### 本版变更记录
+            - feat: 支持播放页添加到歌单 (6f4900e)
+            - perf(android): 修复大歌单内存抖动 (fb036db)
+
+            ### 重要提示
+            - Android 与 iOS 安装包均为**开源纯净版**
+
+            ### 校验信息
+            - SHA-256: `abc`
+        """.trimIndent()
+        val parsedItems = com.lxpure.music.core.update.AppUpdateManager.parseReleaseNoteItems(rawReleaseBody)
+        assertEquals(
+            listOf("支持播放页添加到歌单", "修复大歌单内存抖动"),
+            parsedItems
+        )
+
+        // Prepend-to-top O(1) position ordering math
+        val firstPrependPos = com.lxpure.music.data.repository.LibraryRepository.computeInsertStartPosition(
+            minPosition = 0,
+            maxPosition = 99,
+            insertCount = 1,
+            prepend = true
+        )
+        assertEquals(-1, firstPrependPos)
+        val secondPrependPos = com.lxpure.music.data.repository.LibraryRepository.computeInsertStartPosition(
+            minPosition = firstPrependPos,
+            maxPosition = 99,
+            insertCount = 2,
+            prepend = true
+        )
+        assertEquals(-3, secondPrependPos)
+        assertEquals(
+            100,
+            com.lxpure.music.data.repository.LibraryRepository.computeInsertStartPosition(
+                minPosition = -3,
+                maxPosition = 99,
+                insertCount = 1,
+                prepend = false
+            )
+        )
+
+        // Fast-scroll drag fraction boundary checks
+        assertEquals(0, com.lxpure.music.ui.components.computeFastScrollTrackIndex(0f, 500))
+        assertEquals(0, com.lxpure.music.ui.components.computeFastScrollTrackIndex(-0.5f, 500))
+        assertEquals(499, com.lxpure.music.ui.components.computeFastScrollTrackIndex(1f, 500))
+        assertEquals(499, com.lxpure.music.ui.components.computeFastScrollTrackIndex(1.5f, 500))
+        assertEquals(250, com.lxpure.music.ui.components.computeFastScrollTrackIndex(0.5f, 501))
+        assertEquals(0, com.lxpure.music.ui.components.computeFastScrollTrackIndex(0.8f, 1))
+    }
 }

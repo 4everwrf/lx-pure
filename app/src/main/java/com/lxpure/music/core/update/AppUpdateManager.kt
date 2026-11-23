@@ -26,16 +26,20 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.CacheControl
+import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLException
 
 data class AppUpdateInfo(
     val versionName: String,
@@ -49,6 +53,11 @@ data class AppUpdateInfo(
     val expectedSha256: String? = null
 )
 
+data class UpdateDownloadRoute(
+    val label: String,
+    val url: String
+)
+
 sealed interface AppUpdateState {
     data object Idle : AppUpdateState
     data class Checking(val manual: Boolean) : AppUpdateState
@@ -57,7 +66,8 @@ sealed interface AppUpdateState {
         val info: AppUpdateInfo,
         val downloadedBytes: Long,
         val totalBytes: Long,
-        val progress: Float
+        val progress: Float,
+        val routeLabel: String = "GitHub 直连"
     ) : AppUpdateState
     data class Verifying(val info: AppUpdateInfo) : AppUpdateState
     data class ReadyToInstall(val info: AppUpdateInfo, val apkFile: File) : AppUpdateState
@@ -78,6 +88,14 @@ class AppUpdateManager(
             "https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/latest"
 
         private const val MIN_VALID_APK_BYTES = 100L * 1024L
+        private val COMMIT_HASH_SUFFIX_REGEX = Regex("\\s*\\([0-9a-fA-F]{6,10}\\)\\s*$")
+        private val CONVENTIONAL_PREFIX_REGEX =
+            Regex("^(feat|fix|perf|refactor|chore|style|docs|test|build)(\\([^)]+\\))?:\\s*", RegexOption.IGNORE_CASE)
+
+        private val GITHUB_MIRROR_PREFIXES = listOf(
+            "镜像加速 1" to "https://gh-proxy.org/",
+            "镜像加速 2" to "https://ghfast.top/"
+        )
 
         private val json = Json {
             ignoreUnknownKeys = true
@@ -147,22 +165,90 @@ class AppUpdateManager(
                 header[2] == 0x03.toByte() &&
                 header[3] == 0x04.toByte()
 
-        fun sanitizeReleaseNotes(body: String?): String {
-            if (body.isNullOrBlank()) return "常规体验优化与问题修复"
-            val lines = body.lines()
-                .map { it.trim() }
-                .filter { line ->
-                    line.isNotBlank() &&
-                        !line.startsWith("## ") &&
-                        !line.startsWith("### 校验信息") &&
-                        !line.startsWith("- **Android APK**") &&
-                        !line.startsWith("- **iOS IPA**") &&
-                        !line.startsWith("- SHA-256:") &&
-                        !line.startsWith("- 签名证书")
+        /**
+         * Builds ordered download candidates: direct GitHub first (fastest when proxy is active
+         * or outside mainland China), followed by verified mirror accelerators (still protected
+         * by strict APK magic + size + SHA-256 verification).
+         */
+        fun buildDownloadRoutes(originalUrl: String): List<UpdateDownloadRoute> {
+            val clean = originalUrl.trim()
+            if (clean.isBlank()) return emptyList()
+            val routes = mutableListOf(UpdateDownloadRoute("GitHub 直连", clean))
+            if (clean.startsWith("https://github.com/", ignoreCase = true)) {
+                GITHUB_MIRROR_PREFIXES.forEach { (label, prefix) ->
+                    routes.add(UpdateDownloadRoute(label, "$prefix$clean"))
                 }
-            val cleaned = lines.joinToString("\n").trim()
-            return cleaned.ifBlank { "常规体验优化与问题修复" }
+            }
+            return routes
         }
+
+        fun formatDownloadError(error: Throwable?, triedMirrors: Boolean = true): String {
+            val rawMsg = error?.message.orEmpty()
+            val lower = rawMsg.lowercase()
+            val isTimeout = error is SocketTimeoutException ||
+                lower.contains("timeout") ||
+                lower.contains("timed out")
+            val isUnreachable = error is UnknownHostException ||
+                error is ConnectException ||
+                error is SSLException ||
+                lower.contains("unable to resolve host") ||
+                lower.contains("failed to connect") ||
+                lower.contains("connection reset") ||
+                lower.contains("connection refused") ||
+                lower.contains("handshake")
+            val isVerifyError = lower.contains("校验")
+
+            return when {
+                isVerifyError ->
+                    "安装包校验未通过，请点击「重试下载」或通过「浏览器下载」手动安装。"
+                isTimeout && triedMirrors ->
+                    "连接 GitHub 下载超时（直连与加速通道均未响应）。国内网络请检查代理/加速后重试，或点击「浏览器下载」。"
+                isTimeout ->
+                    "连接 GitHub 下载超时，请检查网络或开启代理后重试，也可点击「浏览器下载」。"
+                isUnreachable ->
+                    "无法连接 GitHub 下载服务器，请检查网络或开启代理后重试，也可点击「浏览器下载」。"
+                rawMsg.contains("HTTP ") ->
+                    "$rawMsg，请稍后重试或点击「浏览器下载」。"
+                else ->
+                    "下载更新失败，请检查网络（国内建议开启代理）后重试，或点击「浏览器下载」。"
+            }
+        }
+
+        fun parseReleaseNoteItems(body: String?): List<String> {
+            if (body.isNullOrBlank()) return listOf("常规体验优化与问题修复")
+            val items = mutableListOf<String>()
+            for (rawLine in body.lines()) {
+                val trimmed = rawLine.trim()
+                if (trimmed.isEmpty()) continue
+                if (trimmed.startsWith("### 重要提示") || trimmed.startsWith("### 校验信息")) {
+                    break
+                }
+                if (trimmed.startsWith("#")) continue
+                if (trimmed.startsWith("- **Android") ||
+                    trimmed.startsWith("- **iOS") ||
+                    trimmed.startsWith("- SHA-256:") ||
+                    trimmed.startsWith("- 签名证书")
+                ) {
+                    continue
+                }
+                val cleaned = trimmed
+                    .removePrefix("- ")
+                    .removePrefix("* ")
+                    .removePrefix("• ")
+                    .replace(CONVENTIONAL_PREFIX_REGEX, "")
+                    .replace(COMMIT_HASH_SUFFIX_REGEX, "")
+                    .replace("**", "")
+                    .replace("`", "")
+                    .trim()
+                if (cleaned.isNotEmpty()) {
+                    items.add(cleaned)
+                }
+            }
+            return items.ifEmpty { listOf("常规体验优化与问题修复") }
+        }
+
+        fun sanitizeReleaseNotes(body: String?): String =
+            parseReleaseNoteItems(body).joinToString("\n")
 
         /**
          * Parses GitHub Releases API JSON and selects the matching Android `.apk` asset.
@@ -223,7 +309,7 @@ class AppUpdateManager(
                 versionName = versionName,
                 tagName = cleanTag,
                 releaseTitle = cleanTag,
-                releaseNotes = "发现新版本 $cleanTag，点击更新下载安装。",
+                releaseNotes = "发现新版本 $cleanTag，点击立即更新即可下载安装。",
                 htmlUrl = "https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/tag/$cleanTag",
                 assetName = assetName,
                 downloadUrl = "https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/download/$cleanTag/$assetName",
@@ -237,16 +323,17 @@ class AppUpdateManager(
 
     private val apiClient = baseHttpClient.newBuilder()
         .cache(null)
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
 
+    // Snappy per-route timeouts so blocked direct GitHub fails over to mirror quickly
     private val downloadClient = baseHttpClient.newBuilder()
         .cache(null)
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(18, TimeUnit.SECONDS)
         .callTimeout(0, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
@@ -260,6 +347,8 @@ class AppUpdateManager(
 
     private var checkJob: Job? = null
     private var downloadJob: Job? = null
+    @Volatile
+    private var activeDownloadCall: Call? = null
     private var hasAutoChecked = false
 
     private val updatesDir: File
@@ -285,7 +374,7 @@ class AppUpdateManager(
             if (info == null) {
                 _state.value = AppUpdateState.Idle
                 if (manual) {
-                    _messages.tryEmit("检查更新失败，请检查网络后重试")
+                    _messages.tryEmit("连接 GitHub 检查更新超时或失败，国内网络建议开启代理后重试")
                 }
                 return@launch
             }
@@ -314,91 +403,127 @@ class AppUpdateManager(
                 return@launch
             }
 
-            _state.value = AppUpdateState.Downloading(
-                info = info,
-                downloadedBytes = 0L,
-                totalBytes = info.assetSizeBytes,
-                progress = 0f
-            )
+            val routes = buildDownloadRoutes(info.downloadUrl)
+            if (routes.isEmpty()) {
+                _state.value = AppUpdateState.Error(info, "更新包下载地址无效，请通过浏览器下载")
+                return@launch
+            }
 
-            try {
-                val request = Request.Builder()
-                    .url(info.downloadUrl)
-                    .cacheControl(CacheControl.FORCE_NETWORK)
-                    .header("User-Agent", "LXPure/${normalizeVersion(BuildConfig.VERSION_NAME)}")
-                    .build()
+            var lastError: Throwable? = null
+            for (route in routes) {
+                if (!isActive) throw CancellationException("下载已取消")
 
-                downloadClient.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        throw IllegalStateException("下载失败（HTTP ${response.code}）")
-                    }
-                    val body = response.body ?: throw IllegalStateException("服务器返回空安装包")
-                    val contentLength = body.contentLength().takeIf { it > 0L } ?: info.assetSizeBytes
-
-                    if (partFile.exists()) partFile.delete()
-                    var downloaded = 0L
-                    var lastEmitTime = 0L
-
-                    body.byteStream().use { input ->
-                        FileOutputStream(partFile).use { output ->
-                            val buffer = ByteArray(16 * 1024)
-                            while (true) {
-                                if (!isActive) throw CancellationException("下载已取消")
-                                val read = input.read(buffer)
-                                if (read == -1) break
-                                output.write(buffer, 0, read)
-                                downloaded += read
-
-                                val now = System.currentTimeMillis()
-                                if (now - lastEmitTime >= 100L) {
-                                    lastEmitTime = now
-                                    val progress = if (contentLength > 0L) {
-                                        (downloaded.toFloat() / contentLength.toFloat()).coerceIn(0f, 1f)
-                                    } else {
-                                        0f
-                                    }
-                                    _state.value = AppUpdateState.Downloading(
-                                        info = info,
-                                        downloadedBytes = downloaded,
-                                        totalBytes = contentLength,
-                                        progress = progress
-                                    )
-                                }
-                            }
-                            output.flush()
-                        }
-                    }
-                }
-
-                _state.value = AppUpdateState.Verifying(info)
-                if (!isValidApkFile(partFile, info)) {
-                    partFile.delete()
-                    _state.value = AppUpdateState.Error(info, "安装包校验未通过，请重新下载")
-                    return@launch
-                }
-
-                if (finalFile.exists()) finalFile.delete()
-                if (!partFile.renameTo(finalFile)) {
-                    partFile.copyTo(finalFile, overwrite = true)
-                    partFile.delete()
-                }
-                _state.value = AppUpdateState.ReadyToInstall(info, finalFile)
-            } catch (ce: CancellationException) {
-                runCatching { if (partFile.exists()) partFile.delete() }
-                _state.value = AppUpdateState.Available(info)
-                throw ce
-            } catch (t: Throwable) {
-                Log.w(TAG, "APK download failed: ${t.message}")
-                runCatching { if (partFile.exists()) partFile.delete() }
-                _state.value = AppUpdateState.Error(
+                _state.value = AppUpdateState.Downloading(
                     info = info,
-                    message = t.message?.takeIf { it.isNotBlank() } ?: "下载更新失败，请检查网络或通过浏览器下载"
+                    downloadedBytes = 0L,
+                    totalBytes = info.assetSizeBytes,
+                    progress = 0f,
+                    routeLabel = route.label
                 )
+
+                try {
+                    downloadFromRoute(route, info, partFile)
+                    _state.value = AppUpdateState.Verifying(info)
+                    if (!isValidApkFile(partFile, info)) {
+                        runCatching { if (partFile.exists()) partFile.delete() }
+                        lastError = IllegalStateException("安装包校验未通过")
+                        Log.w(TAG, "APK verification failed via ${route.label}, trying next route")
+                        continue
+                    }
+
+                    if (finalFile.exists()) finalFile.delete()
+                    if (!partFile.renameTo(finalFile)) {
+                        partFile.copyTo(finalFile, overwrite = true)
+                        partFile.delete()
+                    }
+                    _state.value = AppUpdateState.ReadyToInstall(info, finalFile)
+                    return@launch
+                } catch (ce: CancellationException) {
+                    runCatching { if (partFile.exists()) partFile.delete() }
+                    _state.value = AppUpdateState.Available(info)
+                    throw ce
+                } catch (t: Throwable) {
+                    Log.w(TAG, "APK download failed via ${route.label}: ${t.message}")
+                    runCatching { if (partFile.exists()) partFile.delete() }
+                    lastError = t
+                }
+            }
+
+            _state.value = AppUpdateState.Error(
+                info = info,
+                message = formatDownloadError(lastError, triedMirrors = routes.size > 1)
+            )
+        }
+    }
+
+    private fun downloadFromRoute(
+        route: UpdateDownloadRoute,
+        info: AppUpdateInfo,
+        partFile: File
+    ) {
+        val request = Request.Builder()
+            .url(route.url)
+            .cacheControl(CacheControl.FORCE_NETWORK)
+            .header("User-Agent", "LXPure/${normalizeVersion(BuildConfig.VERSION_NAME)}")
+            .build()
+
+        val call = downloadClient.newCall(request)
+        activeDownloadCall = call
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IllegalStateException("下载失败（HTTP ${response.code}）")
+                }
+                val body = response.body ?: throw IllegalStateException("服务器返回空安装包")
+                val contentLength = body.contentLength().takeIf { it > 0L } ?: info.assetSizeBytes
+
+                if (partFile.exists()) partFile.delete()
+                var downloaded = 0L
+                var lastEmitTime = 0L
+
+                body.byteStream().use { input ->
+                    FileOutputStream(partFile).use { output ->
+                        val buffer = ByteArray(16 * 1024)
+                        while (true) {
+                            if (Thread.currentThread().isInterrupted || call.isCanceled()) {
+                                throw CancellationException("下载已取消")
+                            }
+                            val read = input.read(buffer)
+                            if (read == -1) break
+                            output.write(buffer, 0, read)
+                            downloaded += read
+
+                            val now = System.currentTimeMillis()
+                            if (now - lastEmitTime >= 100L) {
+                                lastEmitTime = now
+                                val progress = if (contentLength > 0L) {
+                                    (downloaded.toFloat() / contentLength.toFloat()).coerceIn(0f, 1f)
+                                } else {
+                                    0f
+                                }
+                                _state.value = AppUpdateState.Downloading(
+                                    info = info,
+                                    downloadedBytes = downloaded,
+                                    totalBytes = contentLength,
+                                    progress = progress,
+                                    routeLabel = route.label
+                                )
+                            }
+                        }
+                        output.flush()
+                    }
+                }
+            }
+        } finally {
+            if (activeDownloadCall === call) {
+                activeDownloadCall = null
             }
         }
     }
 
     fun cancelDownload() {
+        activeDownloadCall?.cancel()
+        activeDownloadCall = null
         downloadJob?.cancel()
         downloadJob = null
         val cur = _state.value
@@ -409,6 +534,8 @@ class AppUpdateManager(
 
     fun dismiss() {
         if (_state.value is AppUpdateState.Downloading) {
+            activeDownloadCall?.cancel()
+            activeDownloadCall = null
             downloadJob?.cancel()
             downloadJob = null
         }
@@ -445,37 +572,51 @@ class AppUpdateManager(
     }
 
     private fun fetchLatestRelease(): AppUpdateInfo? {
-        val apiReq = Request.Builder()
-            .url(LATEST_RELEASE_API_URL)
-            .cacheControl(CacheControl.FORCE_NETWORK)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "LXPure/${normalizeVersion(BuildConfig.VERSION_NAME)}")
-            .build()
+        runCatching {
+            val apiReq = Request.Builder()
+                .url(LATEST_RELEASE_API_URL)
+                .cacheControl(CacheControl.FORCE_NETWORK)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "LXPure/${normalizeVersion(BuildConfig.VERSION_NAME)}")
+                .build()
 
-        apiClient.newCall(apiReq).execute().use { resp ->
-            if (resp.isSuccessful) {
-                val body = resp.body?.string()
-                if (!body.isNullOrBlank()) {
-                    parseGithubReleaseJson(body)?.let { return it }
+            apiClient.newCall(apiReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val body = resp.body?.string()
+                    if (!body.isNullOrBlank()) {
+                        parseGithubReleaseJson(body)?.let { return it }
+                    }
+                } else if (resp.code == 403 || resp.code == 429) {
+                    Log.w(TAG, "GitHub API rate-limited (${resp.code}); falling back to release redirect")
                 }
-            } else if (resp.code == 403 || resp.code == 429) {
-                Log.w(TAG, "GitHub API rate-limited (${resp.code}); falling back to release redirect")
             }
         }
 
-        // Rate-limit / API fallback: follow github.com/releases/latest redirect to discover tag
-        val webReq = Request.Builder()
-            .url(LATEST_RELEASE_WEB_URL)
-            .head()
-            .cacheControl(CacheControl.FORCE_NETWORK)
-            .header("User-Agent", "LXPure/${normalizeVersion(BuildConfig.VERSION_NAME)}")
-            .build()
+        // Fallback via direct or mirror release redirect when API is blocked or rate-limited
+        val redirectCandidates = listOf(
+            LATEST_RELEASE_WEB_URL,
+            "https://ghfast.top/$LATEST_RELEASE_WEB_URL",
+            "https://gh-proxy.org/$LATEST_RELEASE_WEB_URL"
+        )
+        val noRedirectClient = apiClient.newBuilder().followRedirects(false).followSslRedirects(false).build()
+        for (candidate in redirectCandidates) {
+            val found = runCatching {
+                val webReq = Request.Builder()
+                    .url(candidate)
+                    .head()
+                    .cacheControl(CacheControl.FORCE_NETWORK)
+                    .header("User-Agent", "LXPure/${normalizeVersion(BuildConfig.VERSION_NAME)}")
+                    .build()
 
-        apiClient.newCall(webReq).execute().use { resp ->
-            val finalUrl = resp.request.url.toString()
-            val tag = extractTagFromReleaseUrl(finalUrl) ?: return null
-            return buildFallbackReleaseInfo(tag)
+                noRedirectClient.newCall(webReq).execute().use { resp ->
+                    val targetUrl = resp.header("Location") ?: resp.request.url.toString()
+                    val tag = extractTagFromReleaseUrl(targetUrl) ?: return@use null
+                    buildFallbackReleaseInfo(tag)
+                }
+            }.getOrNull()
+            if (found != null) return found
         }
+        return null
     }
 
     private fun isValidApkFile(file: File, info: AppUpdateInfo): Boolean {

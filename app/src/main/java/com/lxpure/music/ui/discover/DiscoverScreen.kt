@@ -63,6 +63,7 @@ import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.OnlinePlaylist
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.ui.components.AlbumArtwork
+import com.lxpure.music.ui.components.TrackListFastScroller
 import com.lxpure.music.ui.components.TrackListItem
 import com.lxpure.music.ui.theme.LocalLxColors
 
@@ -388,80 +389,99 @@ fun OnlinePlaylistDetailScreen(
             }
             detail != null -> {
                 val res = detail!!
-                LazyColumn(
-                    state = listState,
-                    contentPadding = PaddingValues(bottom = bottomPadding)
+                val currentTrackIndex = remember(res.tracks, currentTrackId) {
+                    currentTrackId?.let { id -> res.tracks.indexOfFirst { it.id == id } } ?: -1
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
                 ) {
-                    item {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 20.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            AlbumArtwork(
-                                url = res.playlist.coverUrl.ifBlank { coverUrl },
-                                contentDescription = res.playlist.name,
-                                size = 98.dp,
-                                cornerRadius = 18.dp
-                            )
-                            Spacer(Modifier.width(16.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = res.playlist.name,
-                                    style = MaterialTheme.typography.titleLarge,
-                                    color = lxColors.textPrimary,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(bottom = bottomPadding)
+                    ) {
+                        item {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AlbumArtwork(
+                                    url = res.playlist.coverUrl.ifBlank { coverUrl },
+                                    contentDescription = res.playlist.name,
+                                    size = 98.dp,
+                                    cornerRadius = 18.dp
                                 )
-                                Spacer(Modifier.height(4.dp))
-                                Text(
-                                    text = buildString {
-                                        if (res.playlist.author.isNotBlank()) append(res.playlist.author)
-                                        append(" · ${res.tracks.size} 首")
-                                    },
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = lxColors.textSecondary
-                                )
-                                Spacer(Modifier.height(10.dp))
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Button(
-                                        onClick = { if (res.tracks.isNotEmpty()) onPlayTracks(res.tracks, 0) },
-                                        shape = RoundedCornerShape(50),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = lxColors.accent,
-                                            contentColor = onPrimaryColor
-                                        ),
-                                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)
-                                    ) {
-                                        Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
-                                        Spacer(Modifier.width(4.dp))
-                                        Text("播放全部", style = MaterialTheme.typography.labelMedium)
-                                    }
-                                    OutlinedButton(
-                                        onClick = { onSaveToLibrary(res) },
-                                        shape = RoundedCornerShape(50),
-                                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
-                                    ) {
-                                        Icon(Icons.Rounded.BookmarkAdd, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(4.dp))
-                                        Text("收藏", style = MaterialTheme.typography.labelMedium)
+                                Spacer(Modifier.width(16.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = res.playlist.name,
+                                        style = MaterialTheme.typography.titleLarge,
+                                        color = lxColors.textPrimary,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(
+                                        text = buildString {
+                                            if (res.playlist.author.isNotBlank()) append(res.playlist.author)
+                                            append(" · ${res.tracks.size} 首")
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = lxColors.textSecondary
+                                    )
+                                    Spacer(Modifier.height(10.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(
+                                            onClick = { if (res.tracks.isNotEmpty()) onPlayTracks(res.tracks, 0) },
+                                            shape = RoundedCornerShape(50),
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = lxColors.accent,
+                                                contentColor = onPrimaryColor
+                                            ),
+                                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)
+                                        ) {
+                                            Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("播放全部", style = MaterialTheme.typography.labelMedium)
+                                        }
+                                        OutlinedButton(
+                                            onClick = { onSaveToLibrary(res) },
+                                            shape = RoundedCornerShape(50),
+                                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                                        ) {
+                                            Icon(Icons.Rounded.BookmarkAdd, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("收藏", style = MaterialTheme.typography.labelMedium)
+                                        }
                                     }
                                 }
                             }
                         }
+
+                        itemsIndexed(res.tracks, key = { idx, t -> "${t.id}_$idx" }) { index, track ->
+                            TrackListItem(
+                                track = track,
+                                isCurrent = track.id == currentTrackId,
+                                isPlaying = isPlaying && track.id == currentTrackId,
+                                indexLabel = index + 1,
+                                onClick = { onPlayTracks(res.tracks, index) },
+                                onMoreClick = { onTrackMore(track) }
+                            )
+                        }
                     }
 
-                    itemsIndexed(res.tracks, key = { idx, t -> "${t.id}_$idx" }) { index, track ->
-                        TrackListItem(
-                            track = track,
-                            isCurrent = track.id == currentTrackId,
-                            isPlaying = isPlaying && track.id == currentTrackId,
-                            indexLabel = index + 1,
-                            onClick = { onPlayTracks(res.tracks, index) },
-                            onMoreClick = { onTrackMore(track) }
-                        )
-                    }
+                    TrackListFastScroller(
+                        listState = listState,
+                        trackCount = res.tracks.size,
+                        headerItemCount = 1,
+                        currentTrackIndex = currentTrackIndex,
+                        bottomPadding = bottomPadding,
+                        modifier = Modifier.fillMaxSize()
+                    )
                 }
             }
         }

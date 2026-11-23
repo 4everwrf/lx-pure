@@ -539,3 +539,124 @@ struct ToastBannerView: View {
         .padding(.horizontal, 20)
     }
 }
+
+enum TrackListScrollHelper {
+    static func targetIndex(forFraction fraction: Double, trackCount: Int) -> Int {
+        guard trackCount > 1 else { return 0 }
+        let clamped = min(max(fraction, 0.0), 1.0)
+        return min(max(Int((clamped * Double(trackCount - 1)).rounded()), 0), trackCount - 1)
+    }
+}
+
+struct TrackListFastScrollerOverlay: View {
+    let trackCount: Int
+    let currentTrackIndex: Int?
+    let bottomInset: CGFloat
+    let onJumpTop: () -> Void
+    let onJumpBottom: () -> Void
+    let onJumpToIndex: (Int) -> Void
+
+    @Environment(\.lxPalette) private var lx
+    @State private var isDragging = false
+    @State private var dragFraction: Double = 0
+    @State private var lastScrubIndex: Int = -1
+
+    var body: some View {
+        if trackCount >= 15 {
+            ZStack(alignment: .bottomTrailing) {
+                if trackCount >= 20 {
+                    GeometryReader { geo in
+                        let barHeight = max(geo.size.height, 1)
+                        let thumbHeight: CGFloat = 46
+                        let thumbOffset = CGFloat(dragFraction) * max(barHeight - thumbHeight, 0)
+                        let activeIdx = TrackListScrollHelper.targetIndex(forFraction: dragFraction, trackCount: trackCount)
+
+                        ZStack(alignment: .topTrailing) {
+                            if isDragging {
+                                Capsule()
+                                    .fill(lx.hairline)
+                                    .frame(width: 3, height: barHeight)
+                                    .padding(.trailing, 7)
+
+                                Text("#\(activeIdx + 1) / \(trackCount)")
+                                    .font(.system(size: 12, weight: .bold).monospacedDigit())
+                                    .foregroundColor(lx.accent)
+                                    .fixedSize()
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(lx.surfaceElevated)
+                                    .clipShape(Capsule())
+                                    .overlay(Capsule().stroke(lx.accent.opacity(0.45), lineWidth: 0.8))
+                                    .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
+                                    .offset(x: -36, y: max(thumbOffset + 4, 0))
+                            }
+
+                            Capsule()
+                                .fill(isDragging ? lx.accent : lx.textTertiary.opacity(0.45))
+                                .frame(width: isDragging ? 7 : 5, height: thumbHeight)
+                                .padding(.trailing, 5)
+                                .offset(y: thumbOffset)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    isDragging = true
+                                    let fraction = min(max(Double(value.location.y / barHeight), 0), 1)
+                                    dragFraction = fraction
+                                    let idx = TrackListScrollHelper.targetIndex(forFraction: fraction, trackCount: trackCount)
+                                    if idx != lastScrubIndex {
+                                        lastScrubIndex = idx
+                                        onJumpToIndex(idx)
+                                    }
+                                }
+                                .onEnded { _ in
+                                    isDragging = false
+                                    lastScrubIndex = -1
+                                }
+                        )
+                    }
+                    .frame(width: 28)
+                    .padding(.top, 12)
+                    .padding(.bottom, bottomInset + 148)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                }
+
+                VStack(spacing: 8) {
+                    if let idx = currentTrackIndex, idx >= 0 && idx < trackCount {
+                        quickJumpButton(icon: "location.fill", tint: lx.accent) {
+                            dragFraction = trackCount > 1 ? Double(idx) / Double(trackCount - 1) : 0
+                            onJumpToIndex(idx)
+                        }
+                    }
+                    quickJumpButton(icon: "arrow.up.to.line", tint: lx.textPrimary) {
+                        dragFraction = 0
+                        onJumpTop()
+                    }
+                    quickJumpButton(icon: "arrow.down.to.line", tint: lx.textPrimary) {
+                        dragFraction = 1
+                        onJumpBottom()
+                    }
+                }
+                .padding(.trailing, 14)
+                .padding(.bottom, bottomInset + 12)
+            }
+        }
+    }
+
+    private func quickJumpButton(icon: String, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(tint)
+                .frame(width: 38, height: 38)
+                .background(.ultraThinMaterial)
+                .background(lx.surfaceElevated.opacity(0.85))
+                .clipShape(Circle())
+                .overlay(Circle().stroke(lx.hairline, lineWidth: 0.8))
+                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+    }
+}

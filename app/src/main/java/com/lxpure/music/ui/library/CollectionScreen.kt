@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -31,6 +32,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,6 +45,7 @@ import com.lxpure.music.domain.model.DownloadRecord
 import com.lxpure.music.domain.model.DownloadStatus
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.ui.components.AlbumArtwork
+import com.lxpure.music.ui.components.TrackListFastScroller
 import com.lxpure.music.ui.components.TrackListItem
 import com.lxpure.music.ui.theme.LocalLxColors
 
@@ -144,41 +147,62 @@ fun CollectionDetailScreen(
                 }
             }
         } else {
-            LazyColumn(
-                contentPadding = PaddingValues(bottom = bottomPadding)
+            val listState = rememberLazyListState()
+            val currentTrackIndex = remember(tracks, currentTrackId) {
+                currentTrackId?.let { id -> tracks.indexOfFirst { it.id == id } } ?: -1
+            }
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
             ) {
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 18.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Button(
-                            onClick = onPlayAll,
-                            shape = RoundedCornerShape(50),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = lxColors.accent,
-                                contentColor = MaterialTheme.colorScheme.onPrimary
-                            ),
-                            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(bottom = bottomPadding)
+                ) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 18.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("播放全部 (${tracks.size})")
+                            Button(
+                                onClick = onPlayAll,
+                                shape = RoundedCornerShape(50),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = lxColors.accent,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary
+                                ),
+                                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+                            ) {
+                                Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("播放全部 (${tracks.size})")
+                            }
                         }
+                    }
+
+                    itemsIndexed(tracks, key = { idx, t -> "${t.id}_$idx" }) { index, track ->
+                        TrackListItem(
+                            track = track,
+                            isCurrent = track.id == currentTrackId,
+                            isPlaying = isPlaying && track.id == currentTrackId,
+                            onClick = { onPlayTrackAt(index) },
+                            onMoreClick = { onTrackMore(track) }
+                        )
                     }
                 }
 
-                itemsIndexed(tracks, key = { idx, t -> "${t.id}_$idx" }) { index, track ->
-                    TrackListItem(
-                        track = track,
-                        isCurrent = track.id == currentTrackId,
-                        isPlaying = isPlaying && track.id == currentTrackId,
-                        onClick = { onPlayTrackAt(index) },
-                        onMoreClick = { onTrackMore(track) }
-                    )
-                }
+                TrackListFastScroller(
+                    listState = listState,
+                    trackCount = tracks.size,
+                    headerItemCount = 1,
+                    currentTrackIndex = currentTrackIndex,
+                    bottomPadding = bottomPadding,
+                    modifier = Modifier.fillMaxSize()
+                )
             }
         }
     }

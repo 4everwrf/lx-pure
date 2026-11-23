@@ -41,6 +41,18 @@ class LibraryRepository(private val db: AppDatabase) {
             customPlaylistCount(playlists) < MAX_CUSTOM_PLAYLISTS
 
         /**
+         * Computes the starting `position` value for inserting [insertCount] tracks.
+         * Prepending assigns strictly smaller negative positions (`minPosition - insertCount`)
+         * so `ORDER BY position ASC` places newly added songs at #1 in O(1) without rewriting rows.
+         */
+        fun computeInsertStartPosition(
+            minPosition: Int,
+            maxPosition: Int,
+            insertCount: Int,
+            prepend: Boolean
+        ): Int = if (prepend) minPosition - insertCount else maxPosition + 1
+
+        /**
          * Filters out tracks already present in a playlist (and duplicates within [tracksToAdd]),
          * preserving insertion order and returning both the unique additions and duplicate count.
          */
@@ -155,16 +167,32 @@ class LibraryRepository(private val db: AppDatabase) {
             )
         )
         if (tracks.isNotEmpty()) {
-            addTracksToPlaylist(id, tracks)
+            addTracksToPlaylist(id, tracks, prepend = false)
         }
         CreatePlaylistResult.Created(id)
     }
 
-    suspend fun addTracksToPlaylist(playlistId: Long, tracks: List<Track>): AddTracksResult = withContext(Dispatchers.IO) {
+    /**
+     * Adds unique tracks to a playlist.
+     * When [prepend] is true (default for manually adding songs from the player or track menu),
+     * newly added songs are placed at the very top of the playlist using O(1) negative positions
+     * without rewriting existing rows. When [prepend] is false (importing an external playlist),
+     * original track order is preserved.
+     */
+    suspend fun addTracksToPlaylist(
+        playlistId: Long,
+        tracks: List<Track>,
+        prepend: Boolean = true
+    ): AddTracksResult = withContext(Dispatchers.IO) {
         val existingIds = db.playlistDao().getTrackIdsOnce(playlistId).toHashSet()
         val (uniqueNew, duplicateCount) = filterNewTracksForPlaylist(existingIds, tracks)
         if (uniqueNew.isNotEmpty()) {
-            val startPosition = db.playlistDao().getMaxPosition(playlistId) + 1
+            val startPosition = computeInsertStartPosition(
+                minPosition = if (prepend) db.playlistDao().getMinPosition(playlistId) else 0,
+                maxPosition = if (prepend) 0 else db.playlistDao().getMaxPosition(playlistId),
+                insertCount = uniqueNew.size,
+                prepend = prepend
+            )
             val entities = uniqueNew.mapIndexed { idx, track ->
                 PlaylistTrackEntity(
                     playlistId = playlistId,

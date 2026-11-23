@@ -11,6 +11,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,6 +29,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,8 +45,11 @@ import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.VerticalAlignBottom
+import androidx.compose.material.icons.rounded.VerticalAlignTop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -58,10 +64,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,6 +80,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
@@ -88,6 +98,8 @@ import com.lxpure.music.core.player.PlayerState
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.domain.model.UserPlaylist
 import com.lxpure.music.ui.theme.LocalLxColors
+import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -861,4 +873,222 @@ fun SimpleTextInputDialog(
             TextButton(onClick = onDismiss) { Text("取消") }
         }
     )
+}
+
+/**
+ * Pure helper mapping a vertical fast-scroll drag fraction `[0f..1f]` to a 0-based track index.
+ */
+fun computeFastScrollTrackIndex(fraction: Float, trackCount: Int): Int {
+    if (trackCount <= 1) return 0
+    return (fraction.coerceIn(0f, 1f) * (trackCount - 1)).roundToInt().coerceIn(0, trackCount - 1)
+}
+
+/**
+ * Reusable interactive right-edge fast-scroll bar + floating top/bottom/current-track jump dock
+ * for long playlists so users can reach the very bottom or any track in a single swipe/tap.
+ */
+@Composable
+fun TrackListFastScroller(
+    listState: LazyListState,
+    trackCount: Int,
+    headerItemCount: Int,
+    currentTrackIndex: Int,
+    bottomPadding: Dp,
+    modifier: Modifier = Modifier
+) {
+    if (trackCount < 15) return
+
+    val lxColors = LocalLxColors.current
+    val density = LocalDensity.current
+    val scope = rememberCoroutineScope()
+
+    var isDragging by remember { mutableStateOf(false) }
+    var dragFraction by remember { mutableFloatStateOf(0f) }
+    var barHeightPx by remember { mutableIntStateOf(0) }
+
+    val canScrollBackward by remember(listState) {
+        derivedStateOf { listState.canScrollBackward }
+    }
+    val canScrollForward by remember(listState) {
+        derivedStateOf { listState.canScrollForward }
+    }
+    val scrollFraction by remember(listState, trackCount, headerItemCount) {
+        derivedStateOf {
+            if (!listState.canScrollBackward) return@derivedStateOf 0f
+            if (!listState.canScrollForward) return@derivedStateOf 1f
+            val visibleCount = (listState.layoutInfo.visibleItemsInfo.size - 1).coerceAtLeast(1)
+            val maxFirstTrack = (trackCount - visibleCount).coerceAtLeast(1)
+            val currentFirstTrack = (listState.firstVisibleItemIndex - headerItemCount).coerceAtLeast(0)
+            (currentFirstTrack.toFloat() / maxFirstTrack.toFloat()).coerceIn(0f, 1f)
+        }
+    }
+
+    val activeFraction = if (isDragging) dragFraction else scrollFraction
+    val dragTrackIdx = computeFastScrollTrackIndex(dragFraction, trackCount)
+
+    fun jumpToListItem(targetItemIndex: Int) {
+        scope.launch {
+            val clamped = targetItemIndex.coerceIn(0, (headerItemCount + trackCount - 1).coerceAtLeast(0))
+            if (abs(listState.firstVisibleItemIndex - clamped) > 45) {
+                listState.scrollToItem(clamped)
+            } else {
+                listState.animateScrollToItem(clamped)
+            }
+        }
+    }
+
+    fun scrubToY(yPx: Float) {
+        val height = barHeightPx.toFloat()
+        if (height <= 1f) return
+        val fraction = (yPx / height).coerceIn(0f, 1f)
+        dragFraction = fraction
+        val trackIdx = computeFastScrollTrackIndex(fraction, trackCount)
+        val targetItem = if (trackIdx == 0) 0 else headerItemCount + trackIdx
+        scope.launch {
+            listState.scrollToItem(targetItem)
+        }
+    }
+
+    Box(modifier = modifier) {
+        // Right-edge interactive fast-scroll thumb (shown for 20+ tracks)
+        if (trackCount >= 20) {
+            val thumbHeightDp = 46.dp
+            val thumbHeightPx = with(density) { thumbHeightDp.toPx() }
+            val thumbTopPx = ((barHeightPx - thumbHeightPx).coerceAtLeast(0f) * activeFraction).roundToInt()
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .fillMaxHeight()
+                    .padding(top = 12.dp, bottom = bottomPadding + 146.dp, end = 2.dp)
+                    .width(28.dp)
+                    .onSizeChanged { barHeightPx = it.height }
+                    .pointerInput(trackCount, headerItemCount) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            down.consume()
+                            isDragging = true
+                            scrubToY(down.position.y)
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id }
+                                    if (change == null || !change.pressed) break
+                                    change.consume()
+                                    scrubToY(change.position.y)
+                                }
+                            } finally {
+                                isDragging = false
+                            }
+                        }
+                    }
+            ) {
+                if (isDragging) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.CenterEnd)
+                            .padding(end = 5.dp)
+                            .width(3.dp)
+                            .fillMaxHeight()
+                            .clip(CircleShape)
+                            .background(lxColors.hairline)
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .offset { IntOffset(0, thumbTopPx) }
+                        .padding(end = 3.dp)
+                        .width(if (isDragging) 7.dp else 5.dp)
+                        .height(thumbHeightDp)
+                        .clip(CircleShape)
+                        .background(
+                            if (isDragging) lxColors.accent else lxColors.textTertiary.copy(alpha = 0.48f)
+                        )
+                )
+            }
+
+            if (isDragging) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 12.dp, end = 38.dp)
+                        .offset { IntOffset(0, (thumbTopPx + 4).coerceAtLeast(0)) },
+                    shape = RoundedCornerShape(50),
+                    color = lxColors.surfaceElevated,
+                    border = BorderStroke(0.8.dp, lxColors.accent.copy(alpha = 0.45f)),
+                    shadowElevation = 10.dp
+                ) {
+                    Text(
+                        text = "#${dragTrackIdx + 1} / $trackCount",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                        color = lxColors.accent,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
+
+        // Bottom-right quick jump dock (locate current / top / bottom)
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 14.dp, bottom = bottomPadding + 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            if (currentTrackIndex in 0 until trackCount) {
+                QuickJumpCircleButton(
+                    icon = Icons.Rounded.MyLocation,
+                    contentDescription = "定位当前播放",
+                    tint = lxColors.accent,
+                    onClick = { jumpToListItem((headerItemCount + currentTrackIndex - 2).coerceAtLeast(0)) }
+                )
+            }
+            if (canScrollBackward) {
+                QuickJumpCircleButton(
+                    icon = Icons.Rounded.VerticalAlignTop,
+                    contentDescription = "回到顶部",
+                    tint = lxColors.textPrimary,
+                    onClick = { jumpToListItem(0) }
+                )
+            }
+            if (canScrollForward) {
+                QuickJumpCircleButton(
+                    icon = Icons.Rounded.VerticalAlignBottom,
+                    contentDescription = "直达底部",
+                    tint = lxColors.textPrimary,
+                    onClick = { jumpToListItem(headerItemCount + trackCount - 1) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuickJumpCircleButton(
+    icon: ImageVector,
+    contentDescription: String,
+    tint: Color,
+    onClick: () -> Unit
+) {
+    val lxColors = LocalLxColors.current
+    Surface(
+        onClick = onClick,
+        shape = CircleShape,
+        color = lxColors.surfaceElevated.copy(alpha = 0.94f),
+        border = BorderStroke(0.8.dp, lxColors.hairline),
+        shadowElevation = 6.dp,
+        modifier = Modifier.size(38.dp)
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                tint = tint,
+                modifier = Modifier.size(19.dp)
+            )
+        }
+    }
 }

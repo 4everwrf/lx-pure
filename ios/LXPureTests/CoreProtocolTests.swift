@@ -604,16 +604,22 @@ final class CoreProtocolTests: XCTestCase {
         )
         XCTAssertEqual(store.userPlaylists.count, 11)
 
-        // Adding a song to an externally imported playlist works and deduplicates properly
+        // Adding a song to an externally imported playlist prepends to #1 and deduplicates properly
         let addedTrack = Track(id: "tx_new", title: "晴天", artist: "周杰伦", source: .tx, coverUrl: "https://example.com/c.jpg")
         let addRes = store.addTracks([addedTrack], toPlaylistId: externalId)
         XCTAssertEqual(addRes, AddTracksResult(addedCount: 1, duplicateCount: 0))
         XCTAssertTrue(store.playlistIdsContaining(trackId: "tx_new").contains(externalId))
-        XCTAssertEqual(store.tracks(forPlaylistId: externalId).map(\.id), ["wy_seed", "tx_new"])
+        XCTAssertEqual(store.tracks(forPlaylistId: externalId).map(\.id), ["tx_new", "wy_seed"])
+
+        // Appending explicitly (prepend: false) places track at bottom
+        let tailTrack = Track(id: "kw_tail", title: "七里香", artist: "周杰伦", source: .kw)
+        let tailRes = store.addTracks([tailTrack], toPlaylistId: externalId, prepend: false)
+        XCTAssertEqual(tailRes, AddTracksResult(addedCount: 1, duplicateCount: 0))
+        XCTAssertEqual(store.tracks(forPlaylistId: externalId).map(\.id), ["tx_new", "wy_seed", "kw_tail"])
 
         let dupRes = store.addTracks([addedTrack], toPlaylistId: externalId)
         XCTAssertEqual(dupRes, AddTracksResult(addedCount: 0, duplicateCount: 1))
-        XCTAssertEqual(store.tracks(forPlaylistId: externalId).count, 2)
+        XCTAssertEqual(store.tracks(forPlaylistId: externalId).count, 3)
 
         // Deleting one custom playlist frees a slot
         store.deletePlaylist(id: createdCustomIds[0])
@@ -711,5 +717,49 @@ final class CoreProtocolTests: XCTestCase {
 
         // Proves zero retain cycles in LibraryStore (Combine memory-warning subscription / ioQueue closures)
         XCTAssertNil(weakStore)
+    }
+
+    func testUpdateRoutesErrorMessagesNotesParsingAndFastScrollBounds() {
+        let rawUrl = "https://github.com/4everwrf/lx-pure/releases/download/v1.1.2/lx-pure-ios-v1.1.2-unsigned.ipa"
+        let routes = AppUpdateManager.buildDownloadRoutes(originalUrl: rawUrl)
+        XCTAssertEqual(routes.count, 3)
+        XCTAssertEqual(routes[0].label, "GitHub 直连")
+        XCTAssertEqual(routes[0].url, rawUrl)
+        XCTAssertTrue(routes[1].url.hasSuffix(rawUrl))
+        XCTAssertTrue(routes[2].url.hasSuffix(rawUrl))
+
+        let timeoutErr = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut, userInfo: [NSLocalizedDescriptionKey: "The request timed out."])
+        let timeoutMsg = AppUpdateManager.formatDownloadError(timeoutErr, triedMirrors: true)
+        XCTAssertTrue(timeoutMsg.contains("超时"))
+        XCTAssertTrue(timeoutMsg.contains("代理"))
+
+        let hostErr = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: nil)
+        let hostMsg = AppUpdateManager.formatDownloadError(hostErr, triedMirrors: true)
+        XCTAssertTrue(hostMsg.contains("无法连接"))
+
+        let rawReleaseBody = """
+        ## 轻雪音乐 (LX Pure) v1.1.2
+
+        ### 本版变更记录
+        - feat: 支持播放页添加到歌单 (6f4900e)
+        - perf(ios): 修复大歌单缓存占用 (fb036db)
+
+        ### 重要提示
+        - Android 与 iOS 安装包均为**开源纯净版**
+
+        ### 校验信息
+        - SHA-256: `abc`
+        """
+        XCTAssertEqual(
+            AppUpdateManager.parseReleaseNoteItems(rawReleaseBody),
+            ["支持播放页添加到歌单", "修复大歌单缓存占用"]
+        )
+
+        XCTAssertEqual(TrackListScrollHelper.targetIndex(forFraction: 0.0, trackCount: 500), 0)
+        XCTAssertEqual(TrackListScrollHelper.targetIndex(forFraction: -0.5, trackCount: 500), 0)
+        XCTAssertEqual(TrackListScrollHelper.targetIndex(forFraction: 1.0, trackCount: 500), 499)
+        XCTAssertEqual(TrackListScrollHelper.targetIndex(forFraction: 1.5, trackCount: 500), 499)
+        XCTAssertEqual(TrackListScrollHelper.targetIndex(forFraction: 0.5, trackCount: 501), 250)
+        XCTAssertEqual(TrackListScrollHelper.targetIndex(forFraction: 0.8, trackCount: 1), 0)
     }
 }

@@ -260,8 +260,15 @@ final class LibraryStore: ObservableObject {
         return result
     }
 
+    /// Adds unique tracks to a playlist.
+    /// When `prepend` is true (default for manually adding songs from the player or track menu),
+    /// newly added tracks appear at the very top of the playlist (#1).
     @discardableResult
-    func addTracks(_ tracksToAdd: [Track], toPlaylistId playlistId: Int64) -> AddTracksResult {
+    func addTracks(
+        _ tracksToAdd: [Track],
+        toPlaylistId playlistId: Int64,
+        prepend: Bool = true
+    ) -> AddTracksResult {
         var existing = tracks(forPlaylistId: playlistId)
         var existingIds = Set(existing.map(\.id))
         var addedCount = 0
@@ -269,7 +276,6 @@ final class LibraryStore: ObservableObject {
         var addedTracks: [Track] = []
         for t in tracksToAdd {
             if existingIds.insert(t.id).inserted {
-                existing.append(t)
                 addedTracks.append(t)
                 addedCount += 1
             } else {
@@ -277,6 +283,11 @@ final class LibraryStore: ObservableObject {
             }
         }
         if addedCount > 0 {
+            if prepend {
+                existing.insert(contentsOf: addedTracks, at: 0)
+            } else {
+                existing.append(contentsOf: addedTracks)
+            }
             cachePlaylistTracks(existing, for: playlistId)
             writeJson(existing, to: "playlist_\(playlistId).json")
 

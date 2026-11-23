@@ -9,7 +9,7 @@ and copyright notices.
 Upstream Attribution
 ========================================================================
 
-This project is an independent, unofficial native Android implementation
+This project is an independent, unofficial native Android & iOS implementation
 compatible with the LX Music custom source script protocol. It is NOT
 affiliated with or endorsed by the official LX Music maintainers.
 
@@ -19,10 +19,11 @@ This product includes software derived from:
    - Repository: https://github.com/lyswhut/lx-music-mobile
    - License: Apache License, Version 2.0 (with upstream supplemental
      non-commercial and copyright disclaimer terms)
-   - Included / adapted component:
+   - Included / adapted components:
      `app/src/main/assets/script/user-api-preload.js`
-     (QuickJS custom source preload sandbox bridge script, adapted for
-     Android QuickJS native bindings in LX Pure)
+     `ios/LXPure/Resources/user-api-preload.js`
+     (Custom source preload sandbox bridge scripts, adapted for Android QuickJS
+     and iOS JavaScriptCore native bindings in LX Pure)
 
 ========================================================================
 Third-Party Open-Source Components

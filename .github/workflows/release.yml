@@ -1,4 +1,4 @@
-name: Auto Release APK
+name: Auto Release APK & IPA
 
 on:
   push:
@@ -21,9 +21,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  meta:
     runs-on: ubuntu-latest
-
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      version_code: ${{ steps.meta.outputs.version_code }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+      release_exists: ${{ steps.meta.outputs.release_exists }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,21 +41,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
+          VERSION=$(grep -oE 'versionName\s*=\s*"[^"]+"' app/build.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)"/\1/')
+          VERSION_CODE=$(grep -oE 'versionCode\s*=\s*[0-9]+' app/build.gradle.kts | head -n 1 | sed -E 's/.*=\s*([0-9]+)/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "Failed to read versionName from app/build.gradle.kts" >&2
+            exit 1
+          fi
+          if [ -z "$VERSION_CODE" ]; then
+            VERSION_CODE="1"
+          fi
+
           if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
           elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             TAG="${GITHUB_REF_NAME}"
           else
-            VERSION=$(grep -oE 'versionName\s*=\s*"[^"]+"' app/build.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)"/\1/')
-            if [ -z "$VERSION" ]; then
-              echo "Failed to read versionName from app/build.gradle.kts" >&2
-              exit 1
-            fi
             TAG="v${VERSION}"
           fi
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
@@ -68,27 +79,34 @@ jobs:
             echo "New release detected: ${TAG}"
           fi
 
+  android-build:
+    needs: meta
+    if: needs.meta.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      apk_name: ${{ steps.package.outputs.apk_name }}
+      apk_sha256: ${{ steps.package.outputs.apk_sha256 }}
+      cert_sha256: ${{ steps.package.outputs.cert_sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up JDK 17
-        if: steps.meta.outputs.should_release == 'true'
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
       - name: Setup Gradle
-        if: steps.meta.outputs.should_release == 'true'
         uses: gradle/actions/setup-gradle@v4
 
       - name: Grant execute permission for gradlew
-        if: steps.meta.outputs.should_release == 'true'
         run: chmod +x gradlew
 
-      - name: Run unit tests
-        if: steps.meta.outputs.should_release == 'true'
+      - name: Run Android unit tests
         run: ./gradlew testDebugUnitTest --stacktrace
 
       - name: Prepare release signing keystore
-        if: steps.meta.outputs.should_release == 'true'
         env:
           KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
         run: |
@@ -102,7 +120,6 @@ jobs:
           fi
 
       - name: Build signed Release APK
-        if: steps.meta.outputs.should_release == 'true'
         env:
           RELEASE_STORE_FILE: ${{ env.has_keystore == 'true' && 'keystore/lx-pure-release.jks' || '' }}
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
@@ -110,23 +127,199 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: ./gradlew assembleRelease --stacktrace
 
-      - name: Verify APK signature and generate checksums & release notes
-        if: steps.meta.outputs.should_release == 'true'
+      - name: Verify APK signature and prepare artifact
+        id: package
         env:
-          TAG: ${{ steps.meta.outputs.tag }}
-          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
         run: |
-          mkdir -p release_out
+          mkdir -p android_out
           APK_NAME="lx-pure-${TAG}-release.apk"
-          cp app/build/outputs/apk/release/app-release.apk "release_out/${APK_NAME}"
+          cp app/build/outputs/apk/release/app-release.apk "android_out/${APK_NAME}"
 
           APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -name apksigner | sort -V | tail -n 1)
-          CERT_INFO=$("$APKSIGNER" verify --print-certs "release_out/${APK_NAME}")
+          CERT_INFO=$("$APKSIGNER" verify --print-certs "android_out/${APK_NAME}")
           echo "$CERT_INFO"
           CERT_SHA256=$(echo "$CERT_INFO" | grep -i "SHA-256 digest:" | head -n 1 | awk '{print $NF}')
+          APK_SHA256=$(sha256sum "android_out/${APK_NAME}" | awk '{print $1}')
 
-          (cd release_out && sha256sum "${APK_NAME}" > SHA256SUMS.txt)
-          APK_SHA256=$(awk '{print $1}' release_out/SHA256SUMS.txt)
+          echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "cert_sha256=${CERT_SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Android release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-out
+          path: android_out/
+          retention-days: 1
+
+      - name: Clean up temporary keystore
+        if: always()
+        run: rm -rf keystore
+
+  ios-build:
+    needs: meta
+    if: needs.meta.outputs.should_release == 'true'
+    runs-on: macos-15
+    outputs:
+      ipa_name: ${{ steps.package.outputs.ipa_name }}
+      ipa_sha256: ${{ steps.package.outputs.ipa_sha256 }}
+      ipa_signed_mode: ${{ steps.package.outputs.ipa_signed_mode }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Select available iOS Simulator
+        id: sim
+        run: |
+          SIM_ID=$(xcrun simctl list devices available --json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)['devices']
+          candidates = []
+          for runtime, devs in data.items():
+              if 'iOS' in runtime:
+                  for d in devs:
+                      if d.get('isAvailable') and 'iPhone' in d.get('name', ''):
+                          candidates.append((runtime, d['name'], d['udid']))
+          candidates.sort(reverse=True)
+          print(candidates[0][2] if candidates else '')
+          ")
+          if [ -z "$SIM_ID" ]; then
+            echo "No available iPhone simulator found" >&2
+            exit 1
+          fi
+          echo "udid=${SIM_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Run iOS unit tests
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -project LXPure.xcodeproj \
+            -scheme LXPure \
+            -sdk iphonesimulator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            test
+
+      - name: Build and package iOS IPA
+        id: package
+        working-directory: ios
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          VERSION_CODE: ${{ needs.meta.outputs.version_code }}
+          IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+        run: |
+          mkdir -p ../ios_out
+
+          if [ -n "$IOS_CERT_P12_BASE64" ] && [ -n "$IOS_PROVISION_PROFILE_BASE64" ]; then
+            # Optional signed build when Apple distribution certificate & provisioning profile secrets are configured
+            KEYCHAIN_PATH=$RUNNER_TEMP/lx-pure-signing.keychain-db
+            KEYCHAIN_PASS="lxpure-ci-temp"
+            security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            echo "$IOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -P "$IOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+            mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+            echo "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+            UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<< $(security cms -D -i "$RUNNER_TEMP/profile.mobileprovision"))
+            cp "$RUNNER_TEMP/profile.mobileprovision" ~/Library/MobileDevice/Provisioning\ Profiles/"${UUID}.mobileprovision"
+
+            xcodebuild \
+              -project LXPure.xcodeproj \
+              -scheme LXPure \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath build \
+              MARKETING_VERSION="${VERSION}" \
+              CURRENT_PROJECT_VERSION="${VERSION_CODE}" \
+              build
+
+            IPA_NAME="lx-pure-ios-${TAG}-signed.ipa"
+            SIGNED_MODE="证书正式签名"
+          else
+            xcodebuild \
+              -project LXPure.xcodeproj \
+              -scheme LXPure \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath build \
+              MARKETING_VERSION="${VERSION}" \
+              CURRENT_PROJECT_VERSION="${VERSION_CODE}" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              build
+
+            IPA_NAME="lx-pure-ios-${TAG}-unsigned.ipa"
+            SIGNED_MODE="未签名（Ad-Hoc，支持巨魔 TrollStore / AltStore / SideStore / 自签）"
+          fi
+
+          rm -rf build_ipa && mkdir -p build_ipa/Payload
+          cp -R build/Build/Products/Release-iphoneos/LXPure.app build_ipa/Payload/LXPure.app
+          if [ -z "$IOS_CERT_P12_BASE64" ] || [ -z "$IOS_PROVISION_PROFILE_BASE64" ]; then
+            codesign --force --deep --sign - build_ipa/Payload/LXPure.app
+          fi
+          (cd build_ipa && zip -r -y "../../ios_out/${IPA_NAME}" Payload)
+
+          IPA_SHA256=$(shasum -a 256 "../ios_out/${IPA_NAME}" | awk '{print $1}')
+          echo "ipa_name=${IPA_NAME}" >> "$GITHUB_OUTPUT"
+          echo "ipa_sha256=${IPA_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "ipa_signed_mode=${SIGNED_MODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload iOS release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-out
+          path: ios_out/
+          retention-days: 1
+
+  publish:
+    needs: [meta, android-build, ios-build]
+    if: needs.meta.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Android artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-release-out
+          path: release_out
+
+      - name: Download iOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-release-out
+          path: release_out
+
+      - name: Generate checksums and release notes
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          APK_NAME: ${{ needs.android-build.outputs.apk_name }}
+          APK_SHA256: ${{ needs.android-build.outputs.apk_sha256 }}
+          CERT_SHA256: ${{ needs.android-build.outputs.cert_sha256 }}
+          IPA_NAME: ${{ needs.ios-build.outputs.ipa_name }}
+          IPA_SHA256: ${{ needs.ios-build.outputs.ipa_sha256 }}
+          IPA_SIGNED_MODE: ${{ needs.ios-build.outputs.ipa_signed_mode }}
+        run: |
+          (cd release_out && sha256sum "${APK_NAME}" "${IPA_NAME}" > SHA256SUMS.txt)
 
           PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n 1 || true)
           if [ -n "$PREV_TAG" ]; then
@@ -145,33 +338,38 @@ jobs:
           ${CHANGES}
 
           ### 重要提示
-          - 本安装包为**开源纯净版**，**不内置、不提供、不推荐任何第三方音源脚本或音频资源**。请自行导入合规的 \`.js\` 自定义源或扫描设备本地音乐使用。
-          - 使用正式 Release 证书签名，可从上一正式版直接覆盖升级并保留本地歌单、收藏与已导入音源。
+          - Android 与 iOS 安装包均为**开源纯净版**，**不内置、不提供、不推荐任何第三方音源脚本或音频资源**。请自行导入合规的 \`.js\` 自定义源或导入本地音频使用。
+          - **Android**：使用正式 Release 证书签名，可从上一正式版直接覆盖升级并保留本地歌单、收藏与已导入音源。
+          - **iOS**：${IPA_SIGNED_MODE}，要求 iOS 16.0 及以上，支持通过巨魔（TrollStore）、AltStore、SideStore、Sideloadly 等工具安装，或使用 Xcode 打开 \`ios/\` 自行签名编译。
 
           ### 校验信息
-          - **APK 文件**: \`${APK_NAME}\`
-          - **SHA-256**: \`${APK_SHA256}\`
-          - **签名证书 SHA-256 指纹**: \`${CERT_SHA256}\`
+          - **Android APK**: \`${APK_NAME}\`
+            - SHA-256: \`${APK_SHA256}\`
+            - 签名证书 SHA-256 指纹: \`${CERT_SHA256}\`
+          - **iOS IPA**: \`${IPA_NAME}\`
+            - SHA-256: \`${IPA_SHA256}\`
           EOF
 
       - name: Publish GitHub Release
-        if: steps.meta.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          RELEASE_EXISTS: ${{ steps.meta.outputs.release_exists }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          APK_NAME: ${{ needs.android-build.outputs.apk_name }}
+          IPA_NAME: ${{ needs.ios-build.outputs.ipa_name }}
+          RELEASE_EXISTS: ${{ needs.meta.outputs.release_exists }}
         run: |
-          APK_PATH="release_out/lx-pure-${TAG}-release.apk"
           if [ "$RELEASE_EXISTS" = "true" ]; then
-            gh release upload "$TAG" "$APK_PATH" release_out/SHA256SUMS.txt --clobber
+            gh release upload "$TAG" \
+              "release_out/${APK_NAME}" \
+              "release_out/${IPA_NAME}" \
+              release_out/SHA256SUMS.txt --clobber
             gh release edit "$TAG" --notes-file release_out/release_notes.md
           else
-            gh release create "$TAG" "$APK_PATH" release_out/SHA256SUMS.txt \
+            gh release create "$TAG" \
+              "release_out/${APK_NAME}" \
+              "release_out/${IPA_NAME}" \
+              release_out/SHA256SUMS.txt \
               --target "${GITHUB_SHA}" \
               --title "${TAG}" \
               --notes-file release_out/release_notes.md
           fi
-
-      - name: Clean up temporary keystore
-        if: always()
-        run: rm -rf keystore release_out

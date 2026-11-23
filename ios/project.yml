@@ -1,0 +1,63 @@
+name: LXPure
+options:
+  bundleIdPrefix: com.lxpure
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+  defaultConfig: Release
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    MARKETING_VERSION: "1.1.0"
+    CURRENT_PROJECT_VERSION: "5"
+    PRODUCT_NAME: "LXPure"
+    DEVELOPMENT_LANGUAGE: zh-Hans
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    GENERATE_INFOPLIST_FILE: NO
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  LXPure:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: LXPure
+        excludes:
+          - "Info.plist"
+          - "Resources/**"
+      - path: LXPure/Resources/user-api-preload.js
+        buildPhase: resources
+    settings:
+      base:
+        INFOPLIST_FILE: LXPure/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.lxpure.music
+        DISPLAY_NAME: "轻雪音乐"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+    scheme:
+      testTargets:
+        - LXPureTests
+      gatherCoverageData: false
+
+  LXPureTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: LXPureTests
+    dependencies:
+      - target: LXPure
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lxpure.music.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/LXPure.app/LXPure"
+        BUNDLE_LOADER: "$(TEST_HOST)"

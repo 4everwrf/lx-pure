@@ -1,0 +1,86 @@
+name: iOS CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Select available iOS Simulator
+        id: sim
+        run: |
+          SIM_ID=$(xcrun simctl list devices available --json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)['devices']
+          candidates = []
+          for runtime, devs in data.items():
+              if 'iOS' in runtime:
+                  for d in devs:
+                      if d.get('isAvailable') and 'iPhone' in d.get('name', ''):
+                          candidates.append((runtime, d['name'], d['udid']))
+          candidates.sort(reverse=True)
+          print(candidates[0][2] if candidates else '')
+          ")
+          if [ -z "$SIM_ID" ]; then
+            echo "No available iPhone simulator found" >&2
+            xcrun simctl list devices available
+            exit 1
+          fi
+          echo "udid=${SIM_ID}" >> "$GITHUB_OUTPUT"
+          echo "Selected Simulator UDID: ${SIM_ID}"
+
+      - name: Run iOS unit tests
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -project LXPure.xcodeproj \
+            -scheme LXPure \
+            -sdk iphonesimulator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            test
+
+      - name: Build unsigned Release IPA (ad-hoc signed for TrollStore / AltStore / SideStore)
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -project LXPure.xcodeproj \
+            -scheme LXPure \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+          rm -rf build_ipa && mkdir -p build_ipa/Payload
+          cp -R build/Build/Products/Release-iphoneos/LXPure.app build_ipa/Payload/LXPure.app
+          codesign --force --deep --sign - build_ipa/Payload/LXPure.app
+          (cd build_ipa && zip -r -y ../lx-pure-ios-unsigned.ipa Payload)
+
+      - name: Upload iOS unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lx-pure-ios-unsigned-ipa
+          path: ios/lx-pure-ios-unsigned.ipa
+          retention-days: 14

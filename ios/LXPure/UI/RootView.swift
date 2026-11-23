@@ -1,0 +1,582 @@
+import SwiftUI
+
+private enum BottomTab: Int, CaseIterable, Identifiable {
+    case library
+    case discover
+    case search
+
+    var id: Int { rawValue }
+
+    var label: String {
+        switch self {
+        case .library: return "音乐库"
+        case .discover: return "发现"
+        case .search: return "搜索"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .library: return "music.note.house.fill"
+        case .discover: return "safari.fill"
+        case .search: return "magnifyingglass"
+        }
+    }
+}
+
+private enum AppRoute: Hashable {
+    case collection(LibraryCollectionType)
+    case userPlaylist(UserPlaylist)
+    case onlinePlaylist(OnlinePlaylist)
+    case leaderboard(LeaderboardItem)
+    case settings
+    case sourceManager
+}
+
+struct RootView: View {
+    @EnvironmentObject private var container: AppContainer
+    @EnvironmentObject private var settingsStore: SettingsStore
+    @EnvironmentObject private var libraryStore: LibraryStore
+    @EnvironmentObject private var userApiManager: UserApiManager
+    @EnvironmentObject private var localMusicManager: LocalMusicManager
+    @EnvironmentObject private var playerController: PlayerController
+
+    @Environment(\.colorScheme) private var systemColorScheme
+
+    @State private var activeTab: BottomTab = .library
+    @State private var path: [AppRoute] = []
+    @State private var isPlayerExpanded = false
+    @State private var showQueueSheet = false
+    @State private var actionSheetTrack: Track?
+    @State private var addToPlaylistTrack: Track?
+    @State private var isImportingPlaylist = false
+    @State private var downloadedBytes: Int64 = 0
+    @State private var cacheBytes: Int64 = 0
+
+    @State private var activeToast: PlayerUiEvent?
+    @State private var toastDismissTask: Task<Void, Never>?
+
+    private var effectivePalette: LxPurePalette {
+        switch settingsStore.settings.themeMode {
+        case .dark: return .dark
+        case .light: return .light
+        case .system: return systemColorScheme == .dark ? .dark : .light
+        }
+    }
+
+    private var hasReadySource: Bool {
+        userApiManager.sources.contains { $0.enabled && $0.status == .ready }
+    }
+
+    private var bottomContentInset: CGFloat {
+        let hasMiniPlayer = playerController.state.currentTrack != nil
+        return path.isEmpty
+            ? (hasMiniPlayer ? 164 : 96)
+            : (hasMiniPlayer ? 96 : 28)
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            FluidAmbientBackground(
+                palette: playerController.state.ambientPalette,
+                enabled: settingsStore.settings.fluidAmbientBackground,
+                immersive: false
+            )
+
+            NavigationStack(path: $path) {
+                tabRootContent
+                    .navigationDestination(for: AppRoute.self) { route in
+                        destinationView(for: route)
+                    }
+            }
+            .tint(effectivePalette.accent)
+
+            // Floating MiniPlayer + Bottom Pill Tab Bar
+            VStack(spacing: 10) {
+                if let activeToast {
+                    ToastBannerView(
+                        event: activeToast,
+                        onAction: activeToast.openSourceManager ? {
+                            self.activeToast = nil
+                            if path.last != .sourceManager {
+                                path.append(.sourceManager)
+                            }
+                        } : nil
+                    )
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
+                if playerController.state.currentTrack != nil {
+                    FloatingMiniPlayer(
+                        state: playerController.state,
+                        onTap: { isPlayerExpanded = true },
+                        onTogglePlayPause: { playerController.togglePlayPause() },
+                        onNext: { playerController.next() },
+                        onPrevious: { playerController.previous() },
+                        onOpenQueue: { showQueueSheet = true }
+                    )
+                }
+
+                if path.isEmpty {
+                    floatingTabBar
+                }
+            }
+            .padding(.bottom, 8)
+            .animation(.easeInOut(duration: 0.22), value: activeToast?.id)
+        }
+        .environment(\.lxPalette, effectivePalette)
+        .preferredColorScheme(settingsStore.settings.themeMode.preferredColorScheme)
+        .fullScreenCover(isPresented: $isPlayerExpanded) {
+            FullPlayerView(
+                state: playerController.state,
+                isFavorite: playerController.state.currentTrack.map { libraryStore.favoriteIds.contains($0.id) } ?? false,
+                downloadRecord: playerController.state.currentTrack.flatMap { libraryStore.downloadRecord(for: $0.id) },
+                preferredQuality: settingsStore.settings.preferredQuality,
+                fluidAmbientEnabled: settingsStore.settings.fluidAmbientBackground,
+                showTranslationDefault: settingsStore.settings.showTranslationLyrics,
+                onCollapse: { isPlayerExpanded = false },
+                onTogglePlayPause: { playerController.togglePlayPause() },
+                onNext: { playerController.next() },
+                onPrevious: { playerController.previous() },
+                onSeek: { playerController.seek(to: $0) },
+                onCycleRepeat: { playerController.cycleRepeatMode() },
+                onToggleFavorite: { track in
+                    let added = libraryStore.toggleFavorite(track)
+                    showToast(added ? "已添加到我喜欢的" : "已取消喜欢")
+                },
+                onDownload: { triggerTrackDownload($0) },
+                onOpenQueue: { showQueueSheet = true },
+                onSelectQuality: { playerController.changePreferredQuality($0) },
+                onSetSleepTimer: { playerController.setSleepTimer(minutes: $0) }
+            )
+            .environment(\.lxPalette, effectivePalette)
+            .sheet(isPresented: $showQueueSheet) {
+                queueSheet
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { showQueueSheet && !isPlayerExpanded },
+            set: { showQueueSheet = $0 }
+        )) {
+            queueSheet
+        }
+        .sheet(item: $actionSheetTrack) { track in
+            TrackActionSheetView(
+                track: track,
+                isFavorite: libraryStore.favoriteIds.contains(track.id),
+                isDownloaded: libraryStore.downloadRecord(for: track.id)?.status == .completed,
+                onPlayNext: { playerController.playNext(track) },
+                onAddToQueue: { playerController.addToQueue(track) },
+                onToggleFavorite: {
+                    let added = libraryStore.toggleFavorite(track)
+                    showToast(added ? "已添加到我喜欢的" : "已取消喜欢")
+                },
+                onAddToPlaylist: { addToPlaylistTrack = track },
+                onDownload: { triggerTrackDownload(track) }
+            )
+            .environment(\.lxPalette, effectivePalette)
+            .presentationDetents([.medium])
+        }
+        .sheet(item: $addToPlaylistTrack) { track in
+            AddToPlaylistSheetView(
+                track: track,
+                playlists: libraryStore.userPlaylists,
+                onSelectPlaylist: { pl in
+                    libraryStore.addTracks([track], toPlaylistId: pl.id)
+                    showToast("已收藏到《\(pl.name)》")
+                },
+                onCreateAndAdd: { name in
+                    _ = libraryStore.createPlaylist(name: name, tracks: [track])
+                    showToast("已创建歌单《\(name)》并加入")
+                }
+            )
+            .environment(\.lxPalette, effectivePalette)
+            .presentationDetents([.medium])
+        }
+        .onReceive(playerController.events) { event in
+            showEvent(event)
+        }
+        .onChange(of: path) { newPath in
+            if newPath.last == .settings {
+                refreshStorageStats()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var tabRootContent: some View {
+        Group {
+            switch activeTab {
+            case .library:
+                LibraryView(
+                    hasReadySource: hasReadySource,
+                    favoritesCount: libraryStore.favorites.count,
+                    localCount: localMusicManager.localTracks.count,
+                    downloadsCount: libraryStore.downloads.filter { $0.status == .completed }.count,
+                    recentHistory: libraryStore.recentHistory,
+                    playlists: libraryStore.userPlaylists,
+                    isImportingPlaylist: isImportingPlaylist,
+                    bottomInset: bottomContentInset,
+                    onOpenSettings: {
+                        refreshStorageStats()
+                        path.append(.settings)
+                    },
+                    onOpenSourceManager: { path.append(.sourceManager) },
+                    onOpenCollection: { path.append(.collection($0)) },
+                    onOpenPlaylist: { path.append(.userPlaylist($0)) },
+                    onPlayTrack: { playerController.playTrack($0, inQueue: libraryStore.recentHistory) },
+                    onCreatePlaylist: { name in
+                        _ = libraryStore.createPlaylist(name: name)
+                        showToast("已创建歌单《\(name)》")
+                    },
+                    onImportExternalPlaylist: { input in
+                        importExternalPlaylist(input)
+                    },
+                    onDeletePlaylist: { pl in
+                        libraryStore.deletePlaylist(id: pl.id)
+                        showToast("已删除歌单《\(pl.name)》")
+                    }
+                )
+
+            case .discover:
+                DiscoverView(
+                    aggregator: container.musicAggregator,
+                    bottomInset: bottomContentInset,
+                    onOpenPlaylist: { path.append(.onlinePlaylist($0)) },
+                    onOpenLeaderboard: { path.append(.leaderboard($0)) }
+                )
+
+            case .search:
+                SearchView(
+                    aggregator: container.musicAggregator,
+                    searchHistory: libraryStore.searchHistory,
+                    currentTrackId: playerController.state.currentTrack?.id,
+                    isPlaying: playerController.state.isPlaying,
+                    bottomInset: bottomContentInset,
+                    onSaveSearchQuery: { libraryStore.saveSearchQuery($0) },
+                    onClearSearchHistory: { libraryStore.clearSearchHistory() },
+                    onPlayTracks: { tracks, idx in playerController.playTracks(tracks, startIndex: idx) },
+                    onTrackMore: { actionSheetTrack = $0 }
+                )
+            }
+        }
+        .toolbar(.hidden, for: .navigationBar)
+    }
+
+    @ViewBuilder
+    private func destinationView(for route: AppRoute) -> some View {
+        switch route {
+        case .collection(let type):
+            switch type {
+            case .favorites:
+                CollectionDetailView(
+                    title: type.title,
+                    subtitle: "在播放页或歌曲菜单中点击心形图标收藏喜欢的歌曲",
+                    tracks: libraryStore.favorites,
+                    currentTrackId: playerController.state.currentTrack?.id,
+                    isPlaying: playerController.state.isPlaying,
+                    isLocalCollection: false,
+                    isScanningLocal: false,
+                    canClearHistory: false,
+                    canDeleteTracks: true,
+                    bottomInset: bottomContentInset,
+                    onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                    onTrackMore: { actionSheetTrack = $0 },
+                    onRemoveTrack: { track in
+                        libraryStore.toggleFavorite(track)
+                        showToast("已移出我喜欢的")
+                    }
+                )
+
+            case .local:
+                CollectionDetailView(
+                    title: type.title,
+                    subtitle: "支持导入 FLAC / MP3 / M4A / WAV 本地音频",
+                    tracks: localMusicManager.localTracks,
+                    currentTrackId: playerController.state.currentTrack?.id,
+                    isPlaying: playerController.state.isPlaying,
+                    isLocalCollection: true,
+                    isScanningLocal: localMusicManager.isScanning,
+                    canClearHistory: false,
+                    canDeleteTracks: true,
+                    bottomInset: bottomContentInset,
+                    onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                    onTrackMore: { actionSheetTrack = $0 },
+                    onScanLocal: {
+                        Task {
+                            let found = await localMusicManager.scan()
+                            showToast("扫描完成，找到 \(found.count) 首本地音频")
+                        }
+                    },
+                    onImportLocalFiles: { urls in
+                        Task {
+                            let count = await localMusicManager.importFiles(from: urls)
+                            showToast(count > 0 ? "已导入 \(count) 首本地音频" : "未找到可导入的音频文件")
+                        }
+                    },
+                    onRemoveTrack: { track in
+                        Task {
+                            await localMusicManager.deleteLocalTrack(track)
+                            showToast("已删除本地文件")
+                        }
+                    }
+                )
+
+            case .downloads:
+                DownloadsDetailView(
+                    downloads: libraryStore.downloads,
+                    currentTrackId: playerController.state.currentTrack?.id,
+                    isPlaying: playerController.state.isPlaying,
+                    bottomInset: bottomContentInset,
+                    onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                    onDeleteDownload: { record in
+                        Task {
+                            await container.downloadManager.deleteDownload(trackId: record.trackId)
+                            refreshStorageStats()
+                            showToast("已删除离线文件")
+                        }
+                    },
+                    onRetryDownload: { triggerTrackDownload($0) }
+                )
+
+            case .history:
+                CollectionDetailView(
+                    title: type.title,
+                    subtitle: "播放过的歌曲将自动记录在这里",
+                    tracks: libraryStore.recentHistory,
+                    currentTrackId: playerController.state.currentTrack?.id,
+                    isPlaying: playerController.state.isPlaying,
+                    isLocalCollection: false,
+                    isScanningLocal: false,
+                    canClearHistory: true,
+                    canDeleteTracks: false,
+                    bottomInset: bottomContentInset,
+                    onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                    onTrackMore: { actionSheetTrack = $0 },
+                    onClearHistory: {
+                        libraryStore.clearHistory()
+                        showToast("已清空播放历史")
+                    }
+                )
+            }
+
+        case .userPlaylist(let playlist):
+            let tracks = libraryStore.tracks(forPlaylistId: playlist.id)
+            CollectionDetailView(
+                title: playlist.name,
+                subtitle: "歌单内还没有歌曲，可在搜索或发现页收藏添加",
+                tracks: tracks,
+                currentTrackId: playerController.state.currentTrack?.id,
+                isPlaying: playerController.state.isPlaying,
+                isLocalCollection: false,
+                isScanningLocal: false,
+                canClearHistory: false,
+                canDeleteTracks: true,
+                bottomInset: bottomContentInset,
+                onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                onTrackMore: { actionSheetTrack = $0 },
+                onRemoveTrack: { track in
+                    libraryStore.removeTrack(trackId: track.id, fromPlaylistId: playlist.id)
+                    showToast("已从歌单移除")
+                }
+            )
+
+        case .onlinePlaylist(let playlist):
+            OnlinePlaylistDetailView(
+                title: playlist.name,
+                coverUrl: playlist.coverUrl,
+                loadKey: "pl_\(playlist.source.code)_\(playlist.id)",
+                loadDetail: {
+                    await container.musicAggregator.getPlaylistDetail(source: playlist.source, idOrUrl: playlist.id)
+                },
+                currentTrackId: playerController.state.currentTrack?.id,
+                isPlaying: playerController.state.isPlaying,
+                bottomInset: bottomContentInset,
+                onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                onSaveToLibrary: { saveOnlinePlaylistToLibrary($0) },
+                onTrackMore: { actionSheetTrack = $0 }
+            )
+
+        case .leaderboard(let board):
+            OnlinePlaylistDetailView(
+                title: board.name,
+                coverUrl: nil,
+                loadKey: "board_\(board.id)",
+                loadDetail: {
+                    await container.musicAggregator.getLeaderboardDetail(board: board)
+                },
+                currentTrackId: playerController.state.currentTrack?.id,
+                isPlaying: playerController.state.isPlaying,
+                bottomInset: bottomContentInset,
+                onPlayTracks: { playerController.playTracks($0, startIndex: $1) },
+                onSaveToLibrary: { saveOnlinePlaylistToLibrary($0) },
+                onTrackMore: { actionSheetTrack = $0 }
+            )
+
+        case .settings:
+            SettingsView(
+                settings: settingsStore.settings,
+                sources: userApiManager.sources,
+                downloadedBytes: downloadedBytes,
+                cacheBytes: cacheBytes,
+                bottomInset: bottomContentInset,
+                onOpenSourceManager: { path.append(.sourceManager) },
+                onSelectQuality: { q in settingsStore.update { $0.preferredQuality = q } },
+                onToggleAutoFallback: { val in settingsStore.update { $0.autoFallbackSource = val } },
+                onToggleCellularDataSaver: { val in settingsStore.update { $0.wifiOnlyHighQuality = val } },
+                onSelectTheme: { mode in settingsStore.update { $0.themeMode = mode } },
+                onToggleFluidAmbient: { val in settingsStore.update { $0.fluidAmbientBackground = val } },
+                onToggleTranslation: { val in settingsStore.update { $0.showTranslationLyrics = val } },
+                onScanLocalMusic: {
+                    Task {
+                        let found = await localMusicManager.scan()
+                        showToast("扫描完成，找到 \(found.count) 首本地音频")
+                    }
+                },
+                onClearCache: {
+                    container.audioCacheManager.clearAllCaches()
+                    refreshStorageStats()
+                    showToast("已清理音频与封面缓存")
+                }
+            )
+
+        case .sourceManager:
+            SourceManagerView(
+                userApiManager: userApiManager,
+                bottomInset: bottomContentInset,
+                onMessage: { showToast($0) }
+            )
+        }
+    }
+
+    private var floatingTabBar: some View {
+        HStack(spacing: 4) {
+            ForEach(BottomTab.allCases) { tab in
+                let selected = tab == activeTab
+                Button {
+                    activeTab = tab
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: tab.icon)
+                            .font(.system(size: 18, weight: selected ? .semibold : .regular))
+                        Text(tab.label)
+                            .font(.system(size: 10, weight: selected ? .semibold : .medium))
+                    }
+                    .foregroundColor(selected ? effectivePalette.accent : effectivePalette.textTertiary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(selected ? effectivePalette.accentSoft : .clear)
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial)
+        .background(effectivePalette.glassSurface)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(effectivePalette.hairline, lineWidth: 0.8))
+        .shadow(color: .black.opacity(effectivePalette.isDark ? 0.35 : 0.10), radius: 14, y: 6)
+        .padding(.horizontal, 26)
+    }
+
+    private var queueSheet: some View {
+        QueueSheetView(
+            queue: playerController.state.queue,
+            currentIndex: playerController.state.currentIndex,
+            isPlaying: playerController.state.isPlaying,
+            repeatMode: playerController.state.repeatMode,
+            onSelectIndex: { idx in
+                playerController.playTracks(playerController.state.queue, startIndex: idx)
+            },
+            onRemoveIndex: { idx in
+                playerController.removeFromQueue(at: idx)
+            },
+            onCycleRepeat: { playerController.cycleRepeatMode() },
+            onClearQueue: { playerController.clearQueue() }
+        )
+        .environment(\.lxPalette, effectivePalette)
+        .presentationDetents([.medium, .large])
+    }
+
+    private func triggerTrackDownload(_ track: Track) {
+        if let existing = libraryStore.downloadRecord(for: track.id) {
+            switch existing.status {
+            case .completed:
+                showToast("《\(track.title)》已离线保存")
+                return
+            case .queued, .downloading:
+                showToast("《\(track.title)》正在后台下载中")
+                return
+            case .failed:
+                break
+            }
+        }
+        if !track.isLocal {
+            showToast("开始离线下载《\(track.title)》...")
+        }
+        container.downloadManager.enqueueDownload(
+            track: track,
+            preferredQuality: settingsStore.settings.preferredQuality
+        ) { msg in
+            showToast(msg)
+            refreshStorageStats()
+        }
+    }
+
+    private func importExternalPlaylist(_ rawInput: String) {
+        isImportingPlaylist = true
+        Task {
+            let res = await container.musicAggregator.importExternalPlaylist(rawInput: rawInput)
+            isImportingPlaylist = false
+            switch res {
+            case .success(let detail):
+                _ = libraryStore.createPlaylist(
+                    name: detail.playlist.name,
+                    description: detail.playlist.description,
+                    coverUrl: detail.playlist.coverUrl,
+                    sourceUrl: rawInput,
+                    tracks: detail.tracks
+                )
+                showToast("已导入歌单《\(detail.playlist.name)》（\(detail.tracks.count) 首）")
+            case .failure(let err):
+                showToast("导入歌单失败：\(err.localizedDescription)")
+            }
+        }
+    }
+
+    private func saveOnlinePlaylistToLibrary(_ detail: PlaylistDetailResult) {
+        _ = libraryStore.createPlaylist(
+            name: detail.playlist.name,
+            description: detail.playlist.description,
+            coverUrl: detail.playlist.coverUrl,
+            tracks: detail.tracks
+        )
+        showToast("已收藏《\(detail.playlist.name)》到我的歌单")
+    }
+
+    private func refreshStorageStats() {
+        let dlBytes = container.downloadManager.calculateDownloadedBytes()
+        let dbBytes = libraryStore.downloads
+            .filter { $0.status == .completed }
+            .reduce(Int64(0)) { $0 + max($1.totalBytes, 0) }
+        downloadedBytes = max(dlBytes, dbBytes)
+        cacheBytes = container.audioCacheManager.calculateTotalCacheBytes()
+    }
+
+    private func showToast(_ msg: String) {
+        showEvent(PlayerUiEvent(message: msg))
+    }
+
+    private func showEvent(_ event: PlayerUiEvent) {
+        toastDismissTask?.cancel()
+        activeToast = event
+        toastDismissTask = Task {
+            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            if !Task.isCancelled {
+                activeToast = nil
+            }
+        }
+    }
+}

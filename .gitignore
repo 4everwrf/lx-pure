@@ -19,6 +19,8 @@ captures/
 *.keystore
 *.p12
 *.pem
+*.mobileprovision
+*.cer
 keystore/
 keystore.properties
 
@@ -27,6 +29,12 @@ keystore.properties
 *.aab
 *.ap_
 *.dex
+*.ipa
+ios/build/
+ios/build_ipa/
+ios/DerivedData/
+ios/LXPure.xcodeproj/xcuserdata/
+ios/LXPure.xcodeproj/project.xcworkspace/xcuserdata/
 
 # OS & editor files
 .DS_Store

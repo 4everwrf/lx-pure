@@ -37,7 +37,7 @@ jobs:
                   for d in devs:
                       if d.get('isAvailable') and 'iPhone' in d.get('name', ''):
                           candidates.append((runtime, d['name'], d['udid']))
-          candidates.sort(reverse=True)
+          candidates.sort(key=lambda x: ('iOS-18' in x[0], x[0], x[1]), reverse=True)
           print(candidates[0][2] if candidates else '')
           ")
           if [ -z "$SIM_ID" ]; then

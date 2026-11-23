@@ -222,13 +222,12 @@ final class AppUpdateManager: ObservableObject {
     nonisolated static func extractTagFromReleaseUrl(_ url: String?) -> String? {
         guard let url, !url.isEmpty else { return nil }
         guard let range = url.range(of: "/releases/tag/", options: .caseInsensitive) else { return nil }
-        let suffix = String(url[range.upperBound...])
-        let tag = suffix
-            .split(separator: "?", maxSplits: 1).first.map(String.init)?
-            .split(separator: "#", maxSplits: 1).first.map(String.init)?
-            .split(separator: "/", maxSplits: 1).first.map(String.init)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (tag?.isEmpty == false) ? tag : nil
+        var part = String(url[range.upperBound...])
+        if let idx = part.firstIndex(of: "?") { part = String(part[..<idx]) }
+        if let idx = part.firstIndex(of: "#") { part = String(part[..<idx]) }
+        if let idx = part.firstIndex(of: "/") { part = String(part[..<idx]) }
+        let tag = part.trimmingCharacters(in: .whitespacesAndNewlines)
+        return tag.isEmpty ? nil : tag
     }
 
     nonisolated static func extractSha256Digest(_ rawDigest: String?) -> String? {

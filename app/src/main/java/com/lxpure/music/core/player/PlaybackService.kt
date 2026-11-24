@@ -145,10 +145,7 @@ class PlaybackService : MediaSessionService() {
             }
 
             override fun play() {
-                if (exoPlayer.mediaItemCount == 0 ||
-                    exoPlayer.playerError != null ||
-                    exoPlayer.playbackState == Player.STATE_IDLE
-                ) {
+                if (app.container.playerController.needsReloadForCurrentTrack(exoPlayer)) {
                     app.container.playerController.resumeOrReloadCurrent()
                 } else {
                     super.play()

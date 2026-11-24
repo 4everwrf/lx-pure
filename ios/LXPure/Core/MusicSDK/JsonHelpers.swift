@@ -41,13 +41,27 @@ enum JsonSafe {
         return nil
     }
 
+    static func asNonBlankString(_ value: Any?) -> String? {
+        guard let str = asString(value)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !str.isEmpty else {
+            return nil
+        }
+        return str
+    }
+
     static func asInt(_ value: Any?) -> Int? {
         guard let value, !(value is NSNull) else { return nil }
         if let n = value as? NSNumber {
             if CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
             return n.intValue
         }
-        if let s = value as? String { return Int(s) }
+        if let s = value as? String {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let v = Int(trimmed) { return v }
+            if let d = Double(trimmed), let exact = Int(exactly: d) {
+                return exact
+            }
+        }
         return nil
     }
 
@@ -57,7 +71,13 @@ enum JsonSafe {
             if CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
             return n.int64Value
         }
-        if let s = value as? String { return Int64(s) }
+        if let s = value as? String {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let v = Int64(trimmed) { return v }
+            if let d = Double(trimmed), let exact = Int64(exactly: d) {
+                return exact
+            }
+        }
         return nil
     }
 
@@ -67,7 +87,9 @@ enum JsonSafe {
             if CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
             return n.doubleValue
         }
-        if let s = value as? String { return Double(s) }
+        if let s = value as? String {
+            return Double(s.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
         return nil
     }
 
@@ -77,8 +99,11 @@ enum JsonSafe {
             return n.boolValue
         }
         if let s = value as? String {
-            if s.lowercased() == "true" { return true }
-            if s.lowercased() == "false" { return false }
+            switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1": return true
+            case "false", "0": return false
+            default: return nil
+            }
         }
         return nil
     }
@@ -105,4 +130,20 @@ func firstRegexCapture(pattern: String, in text: String, group: Int = 1) -> Stri
     let gRange = match.range(at: group)
     guard gRange.location != NSNotFound else { return nil }
     return ns.substring(with: gRange)
+}
+
+/// Extracts the first HTTP(S) URL from pasted share copy while stopping before CJK text or trailing punctuation.
+func extractFirstHttpUrl(from raw: String) -> String? {
+    guard let rawMatch = firstRegexCapture(
+        pattern: "(https?://[A-Za-z0-9\\-._~:/?#\\[\\]@!$&'*+,;=%]+)",
+        in: raw,
+        group: 1
+    ) else {
+        return nil
+    }
+    let trimSet = CharacterSet(charactersIn: ".,;:!?) ]}'\"")
+    let cleaned = rawMatch.trimmingCharacters(in: trimSet)
+    let lower = cleaned.lowercased()
+    guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else { return nil }
+    return cleaned
 }

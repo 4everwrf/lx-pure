@@ -12,19 +12,24 @@ enum AmbientColorExtractor {
         let bytesPerRow = bytesPerPixel * width
         var rawBytes = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
 
-        guard let ctx = CGContext(
-            data: &rawBytes,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return .default
+        let drew = rawBytes.withUnsafeMutableBytes { rawBuffer -> Bool in
+            guard let baseAddress = rawBuffer.baseAddress,
+                  let ctx = CGContext(
+                      data: baseAddress,
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bytesPerRow: bytesPerRow,
+                      space: CGColorSpaceCreateDeviceRGB(),
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else {
+                return false
+            }
+            ctx.interpolationQuality = .low
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
         }
-        ctx.interpolationQuality = .low
-        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard drew else { return .default }
 
         var sumR: Double = 0, sumG: Double = 0, sumB: Double = 0, count: Double = 0
         var bestAccent: (r: Double, g: Double, b: Double, score: Double) = (0.22, 0.74, 0.97, -1)
@@ -66,21 +71,21 @@ enum AmbientColorExtractor {
         let avgG = sumG / count
         let avgB = sumB / count
 
-        // Deepen primary & secondary slightly so white lyrics remain crisp
+        // Clamp primary & secondary luminance strictly below 0.34 so white text/lyrics remain crisp even on white covers
         let primary = Color(
-            red: clamp(avgR * 0.72 + bestSecondary.r * 0.28, 0.08, 0.58),
-            green: clamp(avgG * 0.72 + bestSecondary.g * 0.28, 0.08, 0.58),
-            blue: clamp(avgB * 0.72 + bestSecondary.b * 0.28, 0.10, 0.66)
+            red: clamp(avgR * 0.55 + bestSecondary.r * 0.25, 0.07, 0.34),
+            green: clamp(avgG * 0.55 + bestSecondary.g * 0.25, 0.07, 0.34),
+            blue: clamp(avgB * 0.55 + bestSecondary.b * 0.25, 0.09, 0.42)
         )
         let secondary = Color(
-            red: clamp(bestSecondary.r * 0.75, 0.06, 0.52),
-            green: clamp(bestSecondary.g * 0.75, 0.06, 0.52),
-            blue: clamp(bestSecondary.b * 0.82, 0.09, 0.60)
+            red: clamp(bestSecondary.r * 0.62, 0.06, 0.32),
+            green: clamp(bestSecondary.g * 0.62, 0.06, 0.32),
+            blue: clamp(bestSecondary.b * 0.68, 0.08, 0.40)
         )
         let accent = Color(
-            red: clamp(bestAccent.r, 0.20, 0.96),
-            green: clamp(bestAccent.g, 0.20, 0.96),
-            blue: clamp(bestAccent.b, 0.25, 0.98)
+            red: clamp(bestAccent.r, 0.32, 0.94),
+            green: clamp(bestAccent.g, 0.38, 0.94),
+            blue: clamp(bestAccent.b, 0.48, 0.98)
         )
 
         return AmbientPalette(primary: primary, secondary: secondary, accent: accent)

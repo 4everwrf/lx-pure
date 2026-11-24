@@ -7,7 +7,7 @@ struct EffectiveQualityDecision: Equatable, Sendable {
 }
 
 final class NetworkQualityAdvisor: @unchecked Sendable {
-    private let monitor = NWPathMonitor()
+    private var monitor: NWPathMonitor?
     private let queue = DispatchQueue(label: "com.lxpure.network.monitor")
     private let lock = NSLock()
 
@@ -16,24 +16,27 @@ final class NetworkQualityAdvisor: @unchecked Sendable {
 
     init(startMonitoring: Bool = true) {
         if startMonitoring {
-            monitor.pathUpdateHandler = { [weak self] path in
+            let pathMonitor = NWPathMonitor()
+            pathMonitor.pathUpdateHandler = { [weak self] path in
                 guard let self else { return }
                 self.lock.lock()
                 self._isConnected = (path.status == .satisfied)
                 let usesWifiOrWired = path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet)
                 if usesWifiOrWired {
-                    self._isMetered = path.isExpensive
+                    self._isMetered = path.isExpensive || path.isConstrained
                 } else {
-                    self._isMetered = path.usesInterfaceType(.cellular) || path.isExpensive
+                    self._isMetered = path.usesInterfaceType(.cellular) || path.isExpensive || path.isConstrained
                 }
                 self.lock.unlock()
             }
-            monitor.start(queue: queue)
+            self.monitor = pathMonitor
+            pathMonitor.start(queue: queue)
         }
     }
 
     deinit {
-        monitor.cancel()
+        monitor?.pathUpdateHandler = nil
+        monitor?.cancel()
     }
 
     func isNetworkConnected() -> Bool {

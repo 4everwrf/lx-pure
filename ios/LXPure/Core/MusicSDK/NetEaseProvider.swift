@@ -172,8 +172,13 @@ final class NetEaseProvider: Sendable {
         if directTracks.count >= trackIds.count || trackIds.isEmpty {
             finalTracks = directTracks
         } else {
-            var hydratedMap: [String: Track] = Dictionary(uniqueKeysWithValues: directTracks.map { ($0.songmid, $0) })
-            let missingIds = trackIds.filter { hydratedMap[$0] == nil }
+            // Safe against duplicate song IDs in large playlists (prevents Dictionary(uniqueKeysWithValues:) SIGTRAP)
+            var hydratedMap: [String: Track] = Dictionary(
+                directTracks.map { ($0.songmid, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            var seenMissing = Set<String>()
+            let missingIds = trackIds.filter { hydratedMap[$0] == nil && seenMissing.insert($0).inserted }
             let chunks = stride(from: 0, to: missingIds.count, by: 400).map {
                 Array(missingIds[$0..<min($0 + 400, missingIds.count)])
             }
@@ -182,6 +187,9 @@ final class NetEaseProvider: Sendable {
             }
 
             for wave in waves {
+                if Task.isCancelled {
+                    return .failure(CancellationError())
+                }
                 let waveResults: [[Track]] = await withTaskGroup(of: [Track].self) { group in
                     for chunk in wave {
                         group.addTask { await self.fetchSongsByIdsWithRetry(chunk) }
@@ -218,6 +226,7 @@ final class NetEaseProvider: Sendable {
 
     private func fetchSongsByIdsWithRetry(_ ids: [String], maxAttempts: Int = 2) async -> [Track] {
         for _ in 0..<maxAttempts {
+            if Task.isCancelled { return [] }
             let res = await fetchSongsByIds(ids)
             if !res.isEmpty { return res }
         }
@@ -273,18 +282,19 @@ final class NetEaseProvider: Sendable {
             return ParsedLyrics()
         }
 
-        let yrcText = JsonSafe.asString(JsonSafe.asObject(root["yrc"])?["lyric"])
-        let lrcText = JsonSafe.asString(JsonSafe.asObject(root["lrc"])?["lyric"])
-        let rawLrc = (yrcText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? yrcText : lrcText
+        let yrcText = JsonSafe.asNonBlankString(JsonSafe.asObject(root["yrc"])?["lyric"])
+        let lrcText = JsonSafe.asNonBlankString(JsonSafe.asObject(root["lrc"])?["lyric"])
+        let ytlrcText = JsonSafe.asNonBlankString(JsonSafe.asObject(root["ytlrc"])?["lyric"])
+        let tlyricText = JsonSafe.asNonBlankString(JsonSafe.asObject(root["tlyric"])?["lyric"])
 
-        let ytlrcText = JsonSafe.asString(JsonSafe.asObject(root["ytlrc"])?["lyric"])
-        let tlyricText = JsonSafe.asString(JsonSafe.asObject(root["tlyric"])?["lyric"])
-        let rawTrans = (ytlrcText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? ytlrcText : tlyricText
-
-        return LrcParser.parse(rawLrc, translation: rawTrans)
+        if let yrcText {
+            let yrcParsed = LrcParser.parse(yrcText, translation: ytlrcText ?? tlyricText)
+            if !yrcParsed.isEmpty { return yrcParsed }
+        }
+        return LrcParser.parse(lrcText, translation: tlyricText ?? ytlrcText)
     }
 
-    private func extractPlaylistId(_ raw: String) async -> String? {
+    func extractPlaylistId(_ raw: String) async -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty && trimmed.allSatisfy(\.isNumber) { return trimmed }
 
@@ -292,7 +302,7 @@ final class NetEaseProvider: Sendable {
             return direct
         }
 
-        guard let urlStr = firstRegexCapture(pattern: "(https?://\\S+)", in: trimmed),
+        guard let urlStr = extractFirstHttpUrl(from: trimmed),
               let url = URL(string: urlStr) else { return nil }
         var req = URLRequest(url: url)
         req.setValue(ua, forHTTPHeaderField: "User-Agent")

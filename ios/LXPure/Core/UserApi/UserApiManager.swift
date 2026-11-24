@@ -56,6 +56,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     private static let scriptUrlTimeoutSec: Double = 4.5
     private static let streamProbeTimeoutSec: Double = 2.5
     private static let cooldownDurationSec: TimeInterval = 45.0
+    private static let maxScriptDownloadBytes: Int = 2 * 1024 * 1024
 
     private let libraryStore: LibraryStore
     private let session: URLSession
@@ -65,6 +66,9 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
     private let lock = NSLock()
     private var runtimes: [String: LxJsRuntime] = [:]
+    private var inFlightRuntimes: [String: LxJsRuntime] = [:]
+    private var inFlightWaiterCounts: [String: Int] = [:]
+    private var runtimeGenerations: [String: UInt64] = [:]
     private var platformCooldowns: [String: Date] = [:]
     private var sourcesSnapshot: [UserApiSource] = []
     private var hasCompletedInitialStoreLoad = false
@@ -103,7 +107,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     /// opening the app lets custom JS source runtimes finish initializing.
     func awaitInitialLoadIfNeeded(timeoutSec: Double = 4.0) async {
         let deadline = Date().addingTimeInterval(timeoutSec)
-        while Date() < deadline {
+        while Date() < deadline && !Task.isCancelled {
             let (loaded, list) = withLock { (hasCompletedInitialStoreLoad, sourcesSnapshot) }
             if loaded {
                 let hasReady = list.contains { $0.enabled && $0.status == .ready }
@@ -116,16 +120,56 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Validates a downloaded custom source script while rejecting HTML/JSON error pages.
+    /// Validates a downloaded custom source script while rejecting HTML/JSON error pages
+    /// (including UTF-8 BOM prefixed responses).
     static func isValidDownloadedScript(_ content: String?) -> Bool {
         guard let content, content.count >= 150 else { return false }
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        var cleaned = content
+        if cleaned.unicodeScalars.first == "\u{FEFF}" {
+            cleaned = String(cleaned.unicodeScalars.dropFirst())
+        }
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.hasPrefix("<"), !trimmed.hasPrefix("{") else { return false }
-        let lower = content.lowercased()
+        let lower = trimmed.lowercased()
         return lower.contains("lx") ||
             lower.contains("\\x6c\\x78") ||
             lower.contains("@name") ||
             lower.contains("globalthis")
+    }
+
+    /// Distinguishes infrastructure/runtime failures from per-track/per-tier misses
+    /// so FLAC -> 320k -> 128k fallback stays intact on healthy sources.
+    static func isTransportOrRuntimeFailure(_ rawMessage: String?) -> Bool {
+        let lower = (rawMessage ?? "").lowercased()
+        guard !lower.isEmpty else { return false }
+        return lower.contains("超时") ||
+            lower.contains("timeout") ||
+            lower.contains("timed out") ||
+            lower.contains("无法连接") ||
+            lower.contains("连接失败") ||
+            lower.contains("校验失败") ||
+            lower.contains("运行异常") ||
+            lower.contains("引擎") ||
+            lower.contains("未正确注册") ||
+            lower.contains("已卸载") ||
+            lower.contains("已停用") ||
+            lower.contains("已切换")
+    }
+
+    private func bumpGeneration(for id: String) -> UInt64 {
+        let (next, oldInFlight): (UInt64, LxJsRuntime?) = withLock {
+            let n = (runtimeGenerations[id] ?? 0) &+ 1
+            runtimeGenerations[id] = n
+            let inflight = inFlightRuntimes.removeValue(forKey: id)
+            inFlightWaiterCounts.removeValue(forKey: id)
+            return (n, inflight)
+        }
+        oldInFlight?.destroy()
+        return next
+    }
+
+    private func currentGeneration(for id: String) -> UInt64 {
+        withLock { runtimeGenerations[id] ?? 0 }
     }
 
     func reloadAllFromStore() async {
@@ -144,6 +188,11 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         let obsoleteRuntimes: [LxJsRuntime] = withLock {
             var toDestroy: [LxJsRuntime] = []
             for key in Array(runtimes.keys) where !validIds.contains(key) {
+                runtimeGenerations[key] = (runtimeGenerations[key] ?? 0) &+ 1
+                if let inflight = inFlightRuntimes.removeValue(forKey: key) {
+                    inFlightWaiterCounts.removeValue(forKey: key)
+                    toDestroy.append(inflight)
+                }
                 if let rt = runtimes.removeValue(forKey: key) {
                     toDestroy.append(rt)
                 }
@@ -158,8 +207,13 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     }
 
     private func startRuntime(for source: UserApiSource) async {
+        let gen = bumpGeneration(for: source.id)
         let old = withLock { runtimes.removeValue(forKey: source.id) }
         old?.destroy()
+
+        guard let liveBefore = currentSources().first(where: { $0.id == source.id }), liveBefore.enabled else {
+            return
+        }
 
         await updateSourceState(id: source.id) { item in
             item.status = .initializing
@@ -167,13 +221,29 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             item.latencyMs = nil
         }
 
-        let runtime = LxJsRuntime(session: session, source: source)
+        let runtime = LxJsRuntime(session: session, source: liveBefore)
         let result = await runtime.initialize()
 
         if result.success {
-            withLock { runtimes[source.id] = runtime }
+            let (installed, displaced): (Bool, LxJsRuntime?) = withLock {
+                guard runtimeGenerations[source.id] == gen,
+                      let live = sourcesSnapshot.first(where: { $0.id == source.id }),
+                      live.enabled else {
+                    return (false, nil)
+                }
+                let old = runtimes.updateValue(runtime, forKey: source.id)
+                return (true, old)
+            }
+            guard installed else {
+                runtime.destroy()
+                return
+            }
+            if let displaced, displaced !== runtime {
+                displaced.destroy()
+            }
             clearCooldowns(forSourceId: source.id)
-            await updateSourceState(id: source.id) { item in
+            await updateSourceState(id: source.id, expectedGeneration: gen) { item in
+                guard item.enabled else { return }
                 item.status = .ready
                 item.supportedPlatforms = result.supportedPlatforms
                 item.latencyMs = nil
@@ -181,7 +251,13 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             }
         } else {
             runtime.destroy()
-            await updateSourceState(id: source.id) { item in
+            let stillValid: Bool = withLock {
+                runtimeGenerations[source.id] == gen &&
+                    (sourcesSnapshot.first(where: { $0.id == source.id })?.enabled == true)
+            }
+            guard stillValid else { return }
+            await updateSourceState(id: source.id, expectedGeneration: gen) { item in
+                guard item.enabled else { return }
                 item.status = .error
                 item.errorMessage = LxJsRuntime.formatFriendlyError(result.errorMessage ?? "初始化失败")
                 item.latencyMs = nil
@@ -205,12 +281,13 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     }
 
     private func downloadText(urlString: String) async -> String? {
-        guard let url = URL(string: urlString) else { return nil }
+        guard let url = LxJsRuntime.parseLenientURL(urlString) else { return nil }
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
         req.setValue("LXPure/1.1", forHTTPHeaderField: "User-Agent")
         guard let (data, resp) = try? await session.data(for: req),
               let httpResp = resp as? HTTPURLResponse,
               (200..<300).contains(httpResp.statusCode),
+              data.count <= Self.maxScriptDownloadBytes,
               let text = String(data: data, encoding: .utf8),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
@@ -227,48 +304,70 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         guard !normalizedScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .failure(LxRuntimeError.message("脚本内容为空"))
         }
+        guard !normalizedScript.unicodeScalars.contains("\u{0000}") else {
+            return .failure(LxRuntimeError.message("文件包含二进制内容，不是有效的 JS 音源脚本"))
+        }
+        guard normalizedScript.utf8.count <= 1 * 1024 * 1024 else {
+            return .failure(LxRuntimeError.message("脚本体积过大（上限 1 MB），请导入标准 JS 音源文件"))
+        }
 
         let meta = LxScriptParser.parse(normalizedScript, fallbackName: fallbackName)
-        var existing = await MainActor.run { libraryStore.loadSavedUserApis() }
-        let existingIdx = existing.firstIndex { $0.id == meta.id }
-        let priority = existingIdx.map { existing[$0].priority } ?? existing.count
-        let mergedSourceUrl = sourceUrl ?? existingIdx.flatMap { existing[$0].sourceUrl }
+        let model: UserApiSource = await MainActor.run {
+            var existing = libraryStore.loadSavedUserApis()
+            let existingIdx = existing.firstIndex { $0.id == meta.id }
+            let priority = existingIdx.map { existing[$0].priority }
+                ?? ((existing.map(\.priority).max() ?? -1) + 1)
+            let mergedSourceUrl = sourceUrl ?? existingIdx.flatMap { existing[$0].sourceUrl }
 
-        let model = UserApiSource(
-            id: meta.id,
-            name: meta.name,
-            description: meta.description,
-            version: meta.version,
-            author: meta.author,
-            homepage: meta.homepage,
-            script: normalizedScript,
-            sourceUrl: mergedSourceUrl,
-            enabled: true,
-            priority: priority,
-            status: .initializing
-        )
+            let built = UserApiSource(
+                id: meta.id,
+                name: meta.name,
+                description: meta.description,
+                version: meta.version,
+                author: meta.author,
+                homepage: meta.homepage,
+                script: normalizedScript,
+                sourceUrl: mergedSourceUrl,
+                enabled: true,
+                priority: priority,
+                status: .initializing
+            )
 
-        if let idx = existingIdx {
-            existing[idx] = model
-        } else {
-            existing.append(model)
+            if let idx = existingIdx {
+                existing[idx] = built
+            } else {
+                existing.append(built)
+            }
+            libraryStore.saveUserApis(existing)
+            return built
         }
-        let toSave = existing
-        await MainActor.run { libraryStore.saveUserApis(toSave) }
-        await reloadAllFromStore()
 
-        if let live = currentSources().first(where: { $0.id == model.id }) {
-            return .success(live)
+        // Update only the imported source in memory so other healthy runtimes keep playing uninterrupted
+        let nextList: [UserApiSource] = withLock {
+            var copy = sourcesSnapshot
+            if let idx = copy.firstIndex(where: { $0.id == model.id }) {
+                copy[idx] = model
+            } else {
+                copy.append(model)
+            }
+            copy.sort { $0.priority < $1.priority }
+            sourcesSnapshot = copy
+            return copy
         }
+        await publishCurrentSnapshot()
+        _ = nextList
+        Task { await self.startRuntime(for: model) }
         return .success(model)
     }
 
     func toggleEnabled(id: String, enabled: Bool) async {
-        var saved = await MainActor.run { libraryStore.loadSavedUserApis() }
-        if let idx = saved.firstIndex(where: { $0.id == id }) {
-            saved[idx].enabled = enabled
-            let toSave = saved
-            await MainActor.run { libraryStore.saveUserApis(toSave) }
+        _ = bumpGeneration(for: id)
+        await MainActor.run {
+            var saved = libraryStore.loadSavedUserApis()
+            if let idx = saved.firstIndex(where: { $0.id == id }) {
+                saved[idx].enabled = enabled
+                libraryStore.saveUserApis(saved)
+            }
         }
 
         if !enabled {
@@ -292,36 +391,50 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     }
 
     func removeSource(id: String) async {
+        _ = bumpGeneration(for: id)
         let old = withLock { runtimes.removeValue(forKey: id) }
         old?.destroy()
         clearCooldowns(forSourceId: id)
 
-        var saved = await MainActor.run { libraryStore.loadSavedUserApis() }
-        saved.removeAll { $0.id == id }
-        for idx in saved.indices { saved[idx].priority = idx }
-        let toSave = saved
-        await MainActor.run { libraryStore.saveUserApis(toSave) }
+        await MainActor.run {
+            var saved = libraryStore.loadSavedUserApis()
+            saved.removeAll { $0.id == id }
+            for idx in saved.indices { saved[idx].priority = idx }
+            libraryStore.saveUserApis(saved)
+        }
 
-        let updated = currentSources().filter { $0.id != id }
-        await publishSources(updated)
+        withLock {
+            sourcesSnapshot.removeAll { $0.id == id }
+            for idx in sourcesSnapshot.indices { sourcesSnapshot[idx].priority = idx }
+        }
+        await publishCurrentSnapshot()
     }
 
     func movePriorityUp(id: String) async {
-        var saved = await MainActor.run { libraryStore.loadSavedUserApis() }
-        guard let idx = saved.firstIndex(where: { $0.id == id }), idx > 0 else { return }
-        let item = saved.remove(at: idx)
-        saved.insert(item, at: idx - 1)
-        for i in saved.indices { saved[i].priority = i }
-        let toSave = saved
-        await MainActor.run { libraryStore.saveUserApis(toSave) }
-
-        var live = currentSources()
-        if let liveIdx = live.firstIndex(where: { $0.id == id }), liveIdx > 0 {
-            let liveItem = live.remove(at: liveIdx)
-            live.insert(liveItem, at: liveIdx - 1)
-            for i in live.indices { live[i].priority = i }
-            await publishSources(live)
+        let reorderedPriorities: [String: Int] = await MainActor.run {
+            var saved = libraryStore.loadSavedUserApis()
+            guard let idx = saved.firstIndex(where: { $0.id == id }), idx > 0 else { return [:] }
+            let item = saved.remove(at: idx)
+            saved.insert(item, at: idx - 1)
+            var map: [String: Int] = [:]
+            for i in saved.indices {
+                saved[i].priority = i
+                map[saved[i].id] = i
+            }
+            libraryStore.saveUserApis(saved)
+            return map
         }
+        guard !reorderedPriorities.isEmpty else { return }
+
+        withLock {
+            for i in sourcesSnapshot.indices {
+                if let p = reorderedPriorities[sourcesSnapshot[i].id] {
+                    sourcesSnapshot[i].priority = p
+                }
+            }
+            sourcesSnapshot.sort { $0.priority < $1.priority }
+        }
+        await publishCurrentSnapshot()
     }
 
     func updateSingleSource(id: String) async -> SourceUpdateResult {
@@ -343,6 +456,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         var fetchedScript: String?
         var usedUrl: String?
         for url in candidateUrls {
+            if Task.isCancelled { break }
             if let content = await downloadText(urlString: url), Self.isValidDownloadedScript(content) {
                 fetchedScript = LxScriptParser.normalizeScript(content)
                 usedUrl = url
@@ -357,60 +471,81 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             )
         }
 
-        let oldHash = LxCrypto.md5Hex(
-            LxScriptParser.normalizeScript(current.script).trimmingCharacters(in: .whitespacesAndNewlines)
-        )
-        let newHash = LxCrypto.md5Hex(fetchedScript.trimmingCharacters(in: .whitespacesAndNewlines))
         let parsed = LxScriptParser.parse(fetchedScript, fallbackName: current.name)
+        let newHash = LxCrypto.md5Hex(fetchedScript.trimmingCharacters(in: .whitespacesAndNewlines))
 
-        if oldHash == newHash {
-            if current.enabled && current.status == .error {
-                await startRuntime(for: current)
+        // Atomically merge onto live persisted record inside a single MainActor.run block
+        // so concurrent updateAllSources() saves never clobber one another or resurrect deleted sources.
+        enum MergeOutcome: Sendable {
+            case deleted
+            case alreadyLatest(live: UserApiSource)
+            case updated(live: UserApiSource, oldVersion: String)
+        }
+
+        let outcome: MergeOutcome = await MainActor.run {
+            var saved = libraryStore.loadSavedUserApis()
+            guard let idx = saved.firstIndex(where: { $0.id == id }) else {
+                return .deleted
+            }
+            let live = saved[idx]
+            let oldHash = LxCrypto.md5Hex(
+                LxScriptParser.normalizeScript(live.script).trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            if oldHash == newHash {
+                return .alreadyLatest(live: live)
+            }
+            var merged = live
+            merged.name = parsed.name
+            merged.description = parsed.description.isEmpty ? live.description : parsed.description
+            merged.version = parsed.version
+            merged.author = parsed.author
+            merged.homepage = parsed.homepage.isEmpty ? live.homepage : parsed.homepage
+            merged.script = fetchedScript
+            merged.sourceUrl = usedUrl ?? live.sourceUrl
+            saved[idx] = merged
+            libraryStore.saveUserApis(saved)
+            return .updated(live: merged, oldVersion: live.version)
+        }
+
+        switch outcome {
+        case .deleted:
+            return SourceUpdateResult(
+                sourceName: current.name, oldVersion: current.version, newVersion: current.version,
+                updated: false, alreadyLatest: false, errorMessage: "该音源已被删除"
+            )
+
+        case .alreadyLatest(let live):
+            let liveMem = currentSources().first(where: { $0.id == id })
+            if live.enabled && liveMem?.status == .error {
+                await startRuntime(for: live)
             }
             return SourceUpdateResult(
-                sourceName: current.name, oldVersion: current.version, newVersion: parsed.version,
+                sourceName: live.name, oldVersion: live.version, newVersion: parsed.version,
                 updated: false, alreadyLatest: true, errorMessage: nil
             )
-        }
 
-        var updatedModel = current
-        updatedModel.name = parsed.name
-        updatedModel.description = parsed.description.isEmpty ? current.description : parsed.description
-        updatedModel.version = parsed.version
-        updatedModel.author = parsed.author
-        updatedModel.homepage = parsed.homepage.isEmpty ? current.homepage : parsed.homepage
-        updatedModel.script = fetchedScript
-        updatedModel.sourceUrl = usedUrl ?? current.sourceUrl
-        let finalModel = updatedModel
-
-        var saved = await MainActor.run { libraryStore.loadSavedUserApis() }
-        if let idx = saved.firstIndex(where: { $0.id == current.id }) {
-            saved[idx] = finalModel
-            let toSave = saved
-            await MainActor.run { libraryStore.saveUserApis(toSave) }
+        case .updated(let merged, let oldVersion):
+            await updateSourceState(id: id) { item in
+                item.name = merged.name
+                item.description = merged.description
+                item.version = merged.version
+                item.author = merged.author
+                item.homepage = merged.homepage
+                item.script = merged.script
+                item.sourceUrl = merged.sourceUrl
+            }
+            if merged.enabled {
+                await startRuntime(for: merged)
+            }
+            return SourceUpdateResult(
+                sourceName: merged.name,
+                oldVersion: oldVersion,
+                newVersion: merged.version,
+                updated: true,
+                alreadyLatest: false,
+                errorMessage: nil
+            )
         }
-
-        await updateSourceState(id: current.id) { item in
-            item.name = finalModel.name
-            item.description = finalModel.description
-            item.version = finalModel.version
-            item.author = finalModel.author
-            item.homepage = finalModel.homepage
-            item.script = finalModel.script
-            item.sourceUrl = finalModel.sourceUrl
-        }
-        if finalModel.enabled {
-            await startRuntime(for: finalModel)
-        }
-
-        return SourceUpdateResult(
-            sourceName: finalModel.name,
-            oldVersion: current.version,
-            newVersion: finalModel.version,
-            updated: true,
-            alreadyLatest: false,
-            errorMessage: nil
-        )
     }
 
     func updateAllSources() async -> BatchUpdateSummary {
@@ -471,7 +606,11 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         }
 
         let currentMeta = currentSources().first(where: { $0.id == id })
-        let platformOrder = (currentMeta?.supportedPlatforms.keys.map { MusicSource.fromCode($0) } ?? [])
+        var seenPlatforms = Set<MusicSource>()
+        let platformOrder = (currentMeta?.supportedPlatforms.keys.compactMap { code -> MusicSource? in
+            guard let parsed = MusicSource(rawValue: code.lowercased()), parsed != .local else { return nil }
+            return seenPlatforms.insert(parsed).inserted ? parsed : nil
+        } ?? [])
             .sorted { MusicAggregator.platformPriority($0) > MusicAggregator.platformPriority($1) }
         guard !platformOrder.isEmpty else {
             let msg = "音源未声明可用音乐平台"
@@ -485,11 +624,13 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
         var probeTrack: Track?
         for platform in platformOrder {
+            if Task.isCancelled { return .failure(CancellationError()) }
             if let found = await aggregator.searchSinglePlatform(source: platform, query: "晴天", page: 1, limit: 3).first {
                 probeTrack = found
                 break
             }
         }
+        guard !Task.isCancelled else { return .failure(CancellationError()) }
         guard let probeTrack else {
             let msg = "测试曲目检索失败，请检查网络"
             await updateSourceState(id: id) {
@@ -502,6 +643,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
         let start = Date()
         let probeRes = await runtime.requestMusicUrl(track: probeTrack, quality: .q128k, timeoutSeconds: 6.0)
+        if Task.isCancelled { return .failure(CancellationError()) }
         let elapsed = max(Int64(Date().timeIntervalSince(start) * 1000.0), 1)
 
         if case .success(let url) = probeRes, await verifyPlayableAudioUrl(url) {
@@ -513,6 +655,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             }
             return .success(elapsed)
         } else {
+            if Task.isCancelled { return .failure(CancellationError()) }
             let rawErr: String
             if case .failure(let err) = probeRes {
                 rawErr = err.localizedDescription
@@ -539,6 +682,8 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         excludedTrackIds: Set<String> = []
     ) async -> Result<ResolvedStream, Error> {
         await awaitInitialLoadIfNeeded()
+        if Task.isCancelled { return .failure(CancellationError()) }
+
         let allSources = currentSources()
         let readySources = allSources
             .filter { $0.enabled && $0.status == .ready && !excludedSourceIds.contains($0.id) }
@@ -576,6 +721,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                 return .success(resolved)
             }
         }
+        if Task.isCancelled { return .failure(CancellationError()) }
 
         // 2. Cross-platform fallback
         if allowCrossPlatformFallback {
@@ -593,15 +739,20 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                ) {
                 return .success(resolved)
             }
+            if Task.isCancelled { return .failure(CancellationError()) }
 
-            // 3. Dynamic fuzzy search across remaining platforms
+            // 3. Dynamic fuzzy search across remaining platforms (bounded by 3.5s timeout for Android parity)
             let triedCodes = Set(([track] + attachedAlts).map(\.source.code))
             let allSupported = Set(readySources.flatMap { $0.supportedPlatforms.keys })
             let remainingCodes = allSupported.subtracting(triedCodes)
             let searchCodes = remainingCodes.isEmpty ? allSupported : remainingCodes
 
-            let dynamicAlts = await aggregator.findAlternativeTracks(for: track, allowedPlatformCodes: searchCodes)
-                .filter { !excludedTrackIds.contains($0.id) }
+            let rawDynamicAlts = await Self.withTimeoutOrNil(seconds: 3.5) {
+                await self.aggregator.findAlternativeTracks(for: track, allowedPlatformCodes: searchCodes)
+            } ?? []
+            if Task.isCancelled { return .failure(CancellationError()) }
+
+            let dynamicAlts = rawDynamicAlts.filter { !excludedTrackIds.contains($0.id) }
             if !dynamicAlts.isEmpty {
                 var seenPlatforms = Set<MusicSource>()
                 let bestPerPlatform = dynamicAlts.filter { seenPlatforms.insert($0.source).inserted }.prefix(3)
@@ -618,7 +769,26 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             }
         }
 
+        if Task.isCancelled { return .failure(CancellationError()) }
         return .failure(LxRuntimeError.message("所有音源与平台均无法获取《\(track.title)》的可用音频流"))
+    }
+
+    private static func withTimeoutOrNil<T: Sendable>(
+        seconds: Double,
+        operation: @escaping @Sendable () async -> T
+    ) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask {
+                await operation()
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(max(seconds, 0.1) * 1_000_000_000))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
     }
 
     private func tryResolveTracksByQualityTiers(
@@ -633,6 +803,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
         for includeCooling in [false, true] {
             for quality in qualityChain {
+                if Task.isCancelled { return nil }
                 let candidates = buildTierCandidates(
                     tracks: tracks,
                     quality: quality,
@@ -694,7 +865,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         preferredSourceId: String?,
         prunedBox: PrunedSetBox
     ) async -> ResolvedStream? {
-        guard !candidates.isEmpty else { return nil }
+        guard !candidates.isEmpty, !Task.isCancelled else { return nil }
         if let preferredSourceId, !preferredSourceId.isEmpty {
             let preferred = candidates.filter { $0.source.id == preferredSourceId }
             let others = candidates.filter { $0.source.id != preferredSourceId }
@@ -706,7 +877,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                 ) {
                     return winner
                 }
-                if !others.isEmpty {
+                if !others.isEmpty && !Task.isCancelled {
                     return await raceInBalancedWaves(
                         candidates: others,
                         prunedBox: prunedBox,
@@ -733,6 +904,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             Array(candidates[$0..<min($0 + waveSize, candidates.count)])
         }
         for (waveIdx, wave) in waves.enumerated() {
+            if Task.isCancelled { return nil }
             if let winner = await raceFirstValid(
                 candidates: wave,
                 prunedBox: prunedBox,
@@ -749,11 +921,11 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         prunedBox: PrunedSetBox,
         switchedSourceOnWin: Bool
     ) async -> ResolvedStream? {
-        guard !candidates.isEmpty else { return nil }
+        guard !candidates.isEmpty, !Task.isCancelled else { return nil }
         return await withTaskGroup(of: ResolvedStream?.self) { group in
             for candidate in candidates {
                 group.addTask { [weak self] in
-                    guard let self else { return nil }
+                    guard let self, !Task.isCancelled else { return nil }
                     let platformCode = candidate.track.source.code
                     let key = self.cooldownKey(sourceId: candidate.source.id, platformCode: platformCode)
                     let start = Date()
@@ -764,6 +936,8 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                     } else {
                         activeRuntime = await self.ensureRuntimeReady(for: candidate.source)
                     }
+                    if Task.isCancelled { return nil }
+
                     guard let runtime = activeRuntime else {
                         prunedBox.insert(key)
                         self.markCooldown(sourceId: candidate.source.id, platformCode: platformCode)
@@ -777,29 +951,41 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                     )
                     if Task.isCancelled { return nil }
 
-                    if case .success(let url) = res, await self.verifyPlayableAudioUrl(url) {
+                    switch res {
+                    case .success(let url):
+                        let playable = await self.verifyPlayableAudioUrl(url)
                         if Task.isCancelled { return nil }
-                        let elapsed = max(Int64(Date().timeIntervalSince(start) * 1000.0), 1)
-                        self.clearCooldown(key: key)
-                        await self.updateSourceState(id: candidate.source.id) { item in
-                            if item.status == .ready {
-                                item.latencyMs = elapsed
+                        if playable {
+                            let elapsed = max(Int64(Date().timeIntervalSince(start) * 1000.0), 1)
+                            self.clearCooldown(key: key)
+                            await self.updateSourceState(id: candidate.source.id) { item in
+                                if item.status == .ready {
+                                    item.latencyMs = elapsed
+                                }
                             }
+                            return ResolvedStream(
+                                url: url,
+                                quality: candidate.quality,
+                                resolvedTrack: candidate.track,
+                                sourceId: candidate.source.id,
+                                providerName: candidate.source.name,
+                                switchedPlatform: candidate.switchedPlatform,
+                                switchedSource: switchedSourceOnWin
+                            )
                         }
-                        return ResolvedStream(
-                            url: url,
-                            quality: candidate.quality,
-                            resolvedTrack: candidate.track,
-                            sourceId: candidate.source.id,
-                            providerName: candidate.source.name,
-                            switchedPlatform: candidate.switchedPlatform,
-                            switchedSource: switchedSourceOnWin
-                        )
-                    }
+                        // Non-playable URL on a higher tier should allow 320k/128k fallback without banning source
+                        return nil
 
-                    prunedBox.insert(key)
-                    self.markCooldown(sourceId: candidate.source.id, platformCode: platformCode)
-                    return nil
+                    case .failure(let error):
+                        if error is CancellationError || Task.isCancelled {
+                            return nil
+                        }
+                        if Self.isTransportOrRuntimeFailure(error.localizedDescription) {
+                            prunedBox.insert(key)
+                            self.markCooldown(sourceId: candidate.source.id, platformCode: platformCode)
+                        }
+                        return nil
+                    }
                 }
             }
 
@@ -813,15 +999,19 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Header-only live stream probe using `URLSession.bytes(for:)` so CDNs ignoring `Range`
+    /// and returning `200 OK` never download 30-80MB audio files into RAM or time out.
     private func verifyPlayableAudioUrl(_ urlString: String) async -> Bool {
-        guard let url = URL(string: urlString) else { return false }
+        guard !Task.isCancelled, let url = LxJsRuntime.parseLenientURL(urlString) else { return false }
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.streamProbeTimeoutSec)
         req.httpMethod = "GET"
         req.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
         req.setValue("bytes=0-127", forHTTPHeaderField: "Range")
 
         do {
-            let (_, response) = try await probeSession.data(for: req)
+            let (bytes, response) = try await probeSession.bytes(for: req)
+            _ = bytes
+            if Task.isCancelled { return false }
             guard let httpResp = response as? HTTPURLResponse,
                   httpResp.statusCode == 200 || httpResp.statusCode == 206 else {
                 return false
@@ -843,17 +1033,27 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     }
 
     func trimIdleRuntimes(keepTopCount: Int = 2) {
+        let snapshot = currentSources()
+        let initializingIds = Set(snapshot.filter { $0.status == .initializing }.map(\.id))
         let keepIds = Set(
-            currentSources()
+            snapshot
                 .filter { $0.enabled && $0.status == .ready }
                 .sorted { $0.priority < $1.priority }
                 .prefix(max(keepTopCount, 1))
                 .map(\.id)
-        )
+        ).union(initializingIds)
+
         let trimmed: [LxJsRuntime] = withLock {
             var toDestroy: [LxJsRuntime] = []
             for key in Array(runtimes.keys) where !keepIds.contains(key) {
-                if let rt = runtimes.removeValue(forKey: key) {
+                if let rt = runtimes[key], !rt.hasInFlightWork {
+                    runtimes.removeValue(forKey: key)
+                    toDestroy.append(rt)
+                }
+            }
+            for key in Array(inFlightRuntimes.keys) where (inFlightWaiterCounts[key] ?? 0) <= 0 {
+                if let rt = inFlightRuntimes.removeValue(forKey: key) {
+                    inFlightWaiterCounts.removeValue(forKey: key)
                     toDestroy.append(rt)
                 }
             }
@@ -870,13 +1070,86 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         if let existing = withLock({ runtimes[source.id] }) {
             return existing
         }
-        let runtime = LxJsRuntime(session: session, source: source)
+        if Task.isCancelled { return nil }
+
+        // Coalesce concurrent revivals onto the same LxJsRuntime instance (whose initialize()
+        // supports multiple independently-cancellable waiters without blocking withTaskGroup).
+        let (runtime, gen, countedAsWaiter): (LxJsRuntime?, UInt64, Bool) = withLock {
+            if let existing = runtimes[source.id] {
+                return (existing, runtimeGenerations[source.id] ?? 0, false)
+            }
+            guard let liveSource = sourcesSnapshot.first(where: { $0.id == source.id }),
+                  liveSource.enabled else {
+                return (nil, 0, false)
+            }
+            let currentGen = runtimeGenerations[source.id] ?? 0
+            if let inflight = inFlightRuntimes[source.id] {
+                inFlightWaiterCounts[source.id, default: 0] += 1
+                return (inflight, currentGen, true)
+            }
+            let created = LxJsRuntime(session: session, source: liveSource)
+            inFlightRuntimes[source.id] = created
+            inFlightWaiterCounts[source.id] = 1
+            return (created, currentGen, true)
+        }
+
+        guard let runtime else { return nil }
+        if !countedAsWaiter {
+            return runtime
+        }
+
         let initRes = await runtime.initialize(timeoutSeconds: 5.0)
-        if initRes.success {
-            withLock { runtimes[source.id] = runtime }
+        if Task.isCancelled {
+            let orphaned: LxJsRuntime? = withLock {
+                guard inFlightRuntimes[source.id] === runtime else { return nil }
+                let remaining = max((inFlightWaiterCounts[source.id] ?? 1) - 1, 0)
+                if remaining == 0 {
+                    inFlightRuntimes.removeValue(forKey: source.id)
+                    inFlightWaiterCounts.removeValue(forKey: source.id)
+                    return runtime
+                } else {
+                    inFlightWaiterCounts[source.id] = remaining
+                    return nil
+                }
+            }
+            orphaned?.destroy()
+            return nil
+        }
+
+        let (installed, displaced, shouldDestroySelf): (Bool, LxJsRuntime?, Bool) = withLock {
+            if inFlightRuntimes[source.id] === runtime {
+                let remaining = max((inFlightWaiterCounts[source.id] ?? 1) - 1, 0)
+                if remaining == 0 {
+                    inFlightRuntimes.removeValue(forKey: source.id)
+                    inFlightWaiterCounts.removeValue(forKey: source.id)
+                } else {
+                    inFlightWaiterCounts[source.id] = remaining
+                }
+            }
+            if runtimes[source.id] === runtime {
+                return (true, nil, false)
+            }
+            guard initRes.success,
+                  (runtimeGenerations[source.id] ?? 0) == gen,
+                  let postLive = sourcesSnapshot.first(where: { $0.id == source.id }),
+                  postLive.enabled else {
+                let stillReferenced = (inFlightRuntimes[source.id] === runtime)
+                return (false, nil, !stillReferenced)
+            }
+            inFlightRuntimes.removeValue(forKey: source.id)
+            inFlightWaiterCounts.removeValue(forKey: source.id)
+            let old = runtimes.updateValue(runtime, forKey: source.id)
+            return (true, old, false)
+        }
+        if let displaced, displaced !== runtime {
+            displaced.destroy()
+        }
+        if installed {
             return runtime
         } else {
-            runtime.destroy()
+            if shouldDestroySelf {
+                runtime.destroy()
+            }
             return nil
         }
     }
@@ -922,23 +1195,34 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
     private func publishSources(_ list: [UserApiSource]) async {
         withLock { sourcesSnapshot = list }
+        await publishCurrentSnapshot()
+    }
+
+    private func publishCurrentSnapshot() async {
         await MainActor.run {
-            self.sources = list
+            self.sources = self.withLock { self.sourcesSnapshot }
         }
     }
 
-    private func updateSourceState(id: String, transform: @Sendable (inout UserApiSource) -> Void) async {
-        let updated: [UserApiSource] = withLock {
+    private func updateSourceState(
+        id: String,
+        expectedGeneration: UInt64? = nil,
+        transform: @Sendable (inout UserApiSource) -> Void
+    ) async {
+        let updated: Bool = withLock {
+            if let expectedGeneration, (runtimeGenerations[id] ?? 0) != expectedGeneration {
+                return false
+            }
             sourcesSnapshot = sourcesSnapshot.map { item in
                 guard item.id == id else { return item }
                 var copy = item
                 transform(&copy)
                 return copy
             }
-            return sourcesSnapshot
+            return true
         }
-        await MainActor.run {
-            self.sources = updated
+        if updated {
+            await publishCurrentSnapshot()
         }
     }
 

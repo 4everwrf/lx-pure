@@ -14,22 +14,23 @@ struct SourceManagerView: View {
     @State private var showJsFilePicker = false
     @State private var isImporting = false
     @State private var isUpdatingAll = false
-    @State private var testingId: String?
-    @State private var updatingId: String?
+    @State private var testingIds: Set<String> = []
+    @State private var updatingIds: Set<String> = []
+    @State private var pendingDeleteSource: UserApiSource?
 
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 14) {
                 // 3 Quick Import Methods
                 HStack(spacing: 10) {
-                    importTile(icon: "link", title: "在线链接", subtitle: "粘贴 .js URL") {
+                    importTile(icon: "link", title: "在线链接", subtitle: "粘贴 .js URL", disabled: isImporting) {
                         urlInput = ""
                         showUrlSheet = true
                     }
-                    importTile(icon: "folder", title: "本地文件", subtitle: "选择 .js 文件") {
+                    importTile(icon: "folder", title: "本地文件", subtitle: "选择 .js 文件", disabled: isImporting) {
                         showJsFilePicker = true
                     }
-                    importTile(icon: "chevron.left.forwardslash.chevron.right", title: "粘贴脚本", subtitle: "源码导入") {
+                    importTile(icon: "chevron.left.forwardslash.chevron.right", title: "粘贴脚本", subtitle: "源码导入", disabled: isImporting) {
                         pasteInput = ""
                         showPasteSheet = true
                     }
@@ -69,10 +70,11 @@ struct SourceManagerView: View {
                     ProgressView().tint(lx.accent)
                 } else if !userApiManager.sources.isEmpty {
                     Button {
+                        guard !isUpdatingAll && !isImporting && testingIds.isEmpty && updatingIds.isEmpty else { return }
+                        isUpdatingAll = true
                         Task {
-                            isUpdatingAll = true
+                            defer { isUpdatingAll = false }
                             let summary = await userApiManager.updateAllSources()
-                            isUpdatingAll = false
                             onMessage(summary.formatUserMessage())
                         }
                     } label: {
@@ -83,6 +85,7 @@ struct SourceManagerView: View {
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(lx.accent)
                     }
+                    .disabled(!testingIds.isEmpty || !updatingIds.isEmpty)
                 }
             }
         }
@@ -93,12 +96,51 @@ struct SourceManagerView: View {
         ) { result in
             switch result {
             case .success(let urls):
-                guard let url = urls.first else { return }
+                guard let url = urls.first, !isImporting else { return }
+                isImporting = true
                 Task {
-                    isImporting = true
-                    let accessed = url.startAccessingSecurityScopedResource()
-                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                    if let content = try? String(contentsOf: url, encoding: .utf8) {
+                    defer { isImporting = false }
+                    let fileReadResult: Result<String, Error> = await Task.detached(priority: .userInitiated) {
+                        let accessed = url.startAccessingSecurityScopedResource()
+                        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                        let values = try? url.resourceValues(forKeys: [.fileSizeKey])
+                        if let size = values?.fileSize, size > 1_048_576 {
+                            return .failure(NSError(
+                                domain: "SourceImport",
+                                code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: "脚本文件过大（超过 1 MB），请确认选择的是 .js 音源脚本"]
+                            ))
+                        }
+                        do {
+                            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+                            if data.count > 1_048_576 {
+                                return .failure(NSError(
+                                    domain: "SourceImport",
+                                    code: -1,
+                                    userInfo: [NSLocalizedDescriptionKey: "脚本文件过大（超过 1 MB），请确认选择的是 .js 音源脚本"]
+                                ))
+                            }
+                            if data.contains(0) {
+                                return .failure(NSError(
+                                    domain: "SourceImport",
+                                    code: -2,
+                                    userInfo: [NSLocalizedDescriptionKey: "文件包含非文本二进制内容，请确认选择的是 UTF-8 编码 .js 脚本"]
+                                ))
+                            }
+                            guard let text = String(data: data, encoding: .utf8) else {
+                                return .failure(NSError(
+                                    domain: "SourceImport",
+                                    code: -3,
+                                    userInfo: [NSLocalizedDescriptionKey: "无法读取该文件（请确认 UTF-8 编码）"]
+                                ))
+                            }
+                            return .success(text)
+                        } catch {
+                            return .failure(error)
+                        }
+                    }.value
+                    switch fileReadResult {
+                    case .success(let content):
                         let res = await userApiManager.importRawScript(
                             content,
                             fallbackName: url.deletingPathExtension().lastPathComponent
@@ -107,10 +149,9 @@ struct SourceManagerView: View {
                         case .success(let src): onMessage("已导入音源：\(src.name)")
                         case .failure(let err): onMessage("导入失败：\(err.localizedDescription)")
                         }
-                    } else {
-                        onMessage("无法读取该文件（请确认 UTF-8 编码）")
+                    case .failure(let err):
+                        onMessage(err.localizedDescription)
                     }
-                    isImporting = false
                 }
             case .failure(let err):
                 onMessage("文件选择失败：\(err.localizedDescription)")
@@ -124,6 +165,7 @@ struct SourceManagerView: View {
                         .foregroundColor(lx.textSecondary)
 
                     TextField("https://example.com/source.js", text: $urlInput)
+                        .foregroundColor(lx.textPrimary)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
@@ -144,22 +186,25 @@ struct SourceManagerView: View {
                     }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("导入") {
+                            guard !isImporting else { return }
                             let targetUrl = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !targetUrl.isEmpty else { return }
                             showUrlSheet = false
+                            isImporting = true
                             Task {
-                                isImporting = true
+                                defer { isImporting = false }
                                 let res = await userApiManager.importFromUrl(targetUrl)
-                                isImporting = false
                                 switch res {
                                 case .success(let src): onMessage("已导入音源：\(src.name)")
                                 case .failure(let err): onMessage("导入失败：\(err.localizedDescription)")
                                 }
                             }
                         }
-                        .disabled(urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(isImporting || urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
             }
+            .preferredColorScheme(lx.isDark ? .dark : .light)
             .presentationDetents([.height(260)])
         }
         .sheet(isPresented: $showPasteSheet) {
@@ -171,6 +216,8 @@ struct SourceManagerView: View {
 
                     TextEditor(text: $pasteInput)
                         .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(lx.textPrimary)
+                        .scrollContentBackground(.hidden)
                         .padding(8)
                         .background(lx.surfaceElevated)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -186,26 +233,50 @@ struct SourceManagerView: View {
                     }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("导入") {
+                            guard !isImporting else { return }
                             let code = pasteInput
+                            guard !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                             showPasteSheet = false
+                            isImporting = true
                             Task {
-                                isImporting = true
+                                defer { isImporting = false }
                                 let res = await userApiManager.importRawScript(code)
-                                isImporting = false
                                 switch res {
                                 case .success(let src): onMessage("已导入音源：\(src.name)")
                                 case .failure(let err): onMessage("导入失败：\(err.localizedDescription)")
                                 }
                             }
                         }
-                        .disabled(pasteInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(isImporting || pasteInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
             }
+            .preferredColorScheme(lx.isDark ? .dark : .light)
+        }
+        .alert(
+            "删除音源",
+            isPresented: Binding(
+                get: { pendingDeleteSource != nil },
+                set: { if !$0 { pendingDeleteSource = nil } }
+            ),
+            presenting: pendingDeleteSource
+        ) { target in
+            Button("取消", role: .cancel) {
+                pendingDeleteSource = nil
+            }
+            Button("删除", role: .destructive) {
+                pendingDeleteSource = nil
+                Task {
+                    await userApiManager.removeSource(id: target.id)
+                    onMessage("已移除音源：\(target.name)")
+                }
+            }
+        } message: { target in
+            Text("确定要移除自定义音源「\(target.name)」吗？移除后需重新导入。")
         }
     }
 
-    private func importTile(icon: String, title: String, subtitle: String, action: @escaping () -> Void) -> some View {
+    private func importTile(icon: String, title: String, subtitle: String, disabled: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             GlassCard(cornerRadius: 16) {
                 VStack(spacing: 6) {
@@ -225,6 +296,8 @@ struct SourceManagerView: View {
             }
         }
         .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.55 : 1)
     }
 
     private func sourceCard(source: UserApiSource, isTopPriority: Bool) -> some View {
@@ -286,12 +359,18 @@ struct SourceManagerView: View {
                 }
 
                 if !source.supportedPlatforms.isEmpty {
-                    HStack(spacing: 6) {
-                        ForEach(source.supportedPlatforms.keys.sorted(), id: \.self) { code in
+                    let sortedCodes = source.supportedPlatforms.keys.sorted()
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 42), spacing: 6)],
+                        alignment: .leading,
+                        spacing: 6
+                    ) {
+                        ForEach(sortedCodes, id: \.self) { code in
+                            let label = MusicSource(rawValue: code.lowercased())?.shortLabel ?? code.uppercased()
                             SmallPillBadge(
-                                text: MusicSource.fromCode(code).shortLabel,
+                                text: label,
                                 color: lx.textSecondary,
-                                background: lx.surfaceElevated
+                                background: lx.hairline
                             )
                         }
                     }
@@ -299,22 +378,26 @@ struct SourceManagerView: View {
 
                 Divider().overlay(lx.hairline)
 
+                let isTesting = testingIds.contains(source.id)
+                let isUpdating = updatingIds.contains(source.id)
+
                 HStack(spacing: 14) {
                     if !isTopPriority {
-                        actionButton(icon: "arrow.up", title: "优先") {
+                        actionButton(icon: "arrow.up", title: "优先", disabled: isUpdatingAll) {
                             Task { await userApiManager.movePriorityUp(id: source.id) }
                         }
                     }
 
                     actionButton(
                         icon: "speedometer",
-                        title: testingId == source.id ? "测速中..." : "测速",
-                        disabled: testingId == source.id
+                        title: isTesting ? "测速中..." : "测速",
+                        disabled: isTesting || isUpdating || isUpdatingAll
                     ) {
+                        guard !testingIds.contains(source.id) && !updatingIds.contains(source.id) else { return }
+                        testingIds.insert(source.id)
                         Task {
-                            testingId = source.id
+                            defer { testingIds.remove(source.id) }
                             let res = await userApiManager.testSourceHealth(id: source.id)
-                            testingId = nil
                             switch res {
                             case .success(let ms): onMessage("\(source.name) 解析可用 (\(ms)ms)")
                             case .failure(let err): onMessage("\(source.name) 测试失败：\(err.localizedDescription)")
@@ -325,13 +408,14 @@ struct SourceManagerView: View {
                     if !SourceUrlUtils.buildUpdateCandidateUrls(source.sourceUrl).isEmpty {
                         actionButton(
                             icon: "arrow.clockwise",
-                            title: updatingId == source.id ? "检查中..." : "更新",
-                            disabled: updatingId == source.id
+                            title: isUpdating ? "检查中..." : "更新",
+                            disabled: isUpdating || isTesting || isUpdatingAll
                         ) {
+                            guard !updatingIds.contains(source.id) && !testingIds.contains(source.id) else { return }
+                            updatingIds.insert(source.id)
                             Task {
-                                updatingId = source.id
+                                defer { updatingIds.remove(source.id) }
                                 let res = await userApiManager.updateSingleSource(id: source.id)
-                                updatingId = nil
                                 if res.updated {
                                     onMessage("\(res.sourceName) 已更新至 \(LxScriptParser.formatVersionBadge(res.newVersion))")
                                 } else if res.alreadyLatest {
@@ -346,10 +430,7 @@ struct SourceManagerView: View {
                     Spacer()
 
                     Button(role: .destructive) {
-                        Task {
-                            await userApiManager.removeSource(id: source.id)
-                            onMessage("已移除音源：\(source.name)")
-                        }
+                        pendingDeleteSource = source
                     } label: {
                         Image(systemName: "trash")
                             .font(.system(size: 14))
@@ -357,6 +438,7 @@ struct SourceManagerView: View {
                             .frame(width: 30, height: 30)
                     }
                     .buttonStyle(.plain)
+                    .disabled(isUpdatingAll)
                 }
             }
             .padding(14)

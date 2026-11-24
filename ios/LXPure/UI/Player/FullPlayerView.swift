@@ -2,6 +2,7 @@ import SwiftUI
 
 struct FullPlayerView: View {
     let state: PlayerState
+    @ObservedObject var progress: PlaybackProgressModel
     let isFavorite: Bool
     let downloadRecord: DownloadRecord?
     let preferredQuality: AudioQuality
@@ -26,6 +27,23 @@ struct FullPlayerView: View {
     @State private var showSleepSheet = false
     @State private var isDraggingSlider = false
     @State private var dragPositionMs: Double = 0
+    @State private var pendingSeekTargetMs: Int64?
+    @State private var pendingSeekClearTask: Task<Void, Never>?
+    @State private var isUserScrollingLyrics = false
+    @State private var lyricScrollCooldownTask: Task<Void, Never>?
+    @GestureState private var isDraggingLyrics = false
+
+    private var activeLyricIndex: Int {
+        state.lyrics.activeIndex(at: progress.positionMs)
+    }
+
+    private func isActiveQuality(_ q: AudioQuality) -> Bool {
+        if let badge = state.activeQualityBadge?.split(separator: "·").first.map({ String($0).trimmingCharacters(in: .whitespaces) }),
+           AudioQuality.allCases.contains(where: { $0.badge.caseInsensitiveCompare(badge) == .orderedSame }) {
+            return q.badge.caseInsensitiveCompare(badge) == .orderedSame
+        }
+        return q == preferredQuality
+    }
 
     var body: some View {
         if let track = state.currentTrack {
@@ -37,7 +55,7 @@ struct FullPlayerView: View {
                 )
 
                 VStack(spacing: 0) {
-                    // Top handle & Header bar
+                    // Top handle & Header bar (swipe down works in BOTH cover and lyrics modes)
                     VStack(spacing: 10) {
                         Capsule()
                             .fill(Color.white.opacity(0.28))
@@ -82,13 +100,22 @@ struct FullPlayerView: View {
                                 ZStack {
                                     Image(systemName: "moon.zzz")
                                         .font(.system(size: 18, weight: .medium))
-                                        .foregroundColor(state.sleepTimerRemainingMs != nil ? Color(hex: 0x38BDF8) : .white.opacity(0.85))
+                                        .foregroundColor(progress.sleepTimerRemainingMs != nil ? Color(hex: 0x38BDF8) : .white.opacity(0.85))
                                 }
                                 .frame(width: 38, height: 38)
                             }
                         }
                     }
                     .padding(.horizontal, 20)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 24)
+                            .onEnded { value in
+                                if value.translation.height > 75 && abs(value.translation.height) > abs(value.translation.width) {
+                                    onCollapse()
+                                }
+                            }
+                    )
 
                     // Center Stage: Cover Artwork OR Synced Lyrics
                     Group {
@@ -132,8 +159,12 @@ struct FullPlayerView: View {
 
                         // Progress Slider
                         VStack(spacing: 6) {
-                            let maxDuration = Double(max(state.durationMs, track.durationMs, 1))
-                            let displayedPos = isDraggingSlider ? dragPositionMs : Double(state.positionMs)
+                            let maxDuration = Double(max(progress.durationMs, state.durationMs, track.durationMs, 1))
+                            let displayedPos: Double = {
+                                if isDraggingSlider { return dragPositionMs }
+                                if let target = pendingSeekTargetMs { return Double(target) }
+                                return Double(progress.positionMs)
+                            }()
 
                             Slider(
                                 value: Binding(
@@ -145,20 +176,37 @@ struct FullPlayerView: View {
                                 ),
                                 in: 0...maxDuration,
                                 onEditingChanged: { editing in
-                                    if !editing {
-                                        onSeek(Int64(dragPositionMs))
+                                    if editing {
+                                        pendingSeekClearTask?.cancel()
+                                        pendingSeekTargetMs = nil
+                                        dragPositionMs = Double(progress.positionMs)
+                                        isDraggingSlider = true
+                                    } else if isDraggingSlider {
+                                        let target = Int64(min(max(dragPositionMs, 0), maxDuration))
                                         isDraggingSlider = false
+                                        if maxDuration > 1 {
+                                            pendingSeekTargetMs = target
+                                            onSeek(target)
+                                            pendingSeekClearTask?.cancel()
+                                            pendingSeekClearTask = Task { @MainActor in
+                                                try? await Task.sleep(nanoseconds: 650_000_000)
+                                                if !Task.isCancelled && pendingSeekTargetMs == target {
+                                                    pendingSeekTargetMs = nil
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             )
+                            .id(track.id)
                             .tint(.white)
 
                             HStack {
                                 Text(FormatUtils.formatTimeMs(Int64(displayedPos)))
                                     .font(.system(size: 11, weight: .medium).monospacedDigit())
-                                    .foregroundColor(.white.opacity(0.65))
+                                    .foregroundColor(.white.opacity(0.72))
                                 Spacer()
-                                if let remaining = state.sleepTimerRemainingMs {
+                                if let remaining = progress.sleepTimerRemainingMs {
                                     Text("定时 \(FormatUtils.formatTimeMs(remaining))")
                                         .font(.system(size: 11, weight: .semibold).monospacedDigit())
                                         .foregroundColor(Color(hex: 0x38BDF8))
@@ -166,7 +214,7 @@ struct FullPlayerView: View {
                                 }
                                 Text(FormatUtils.formatTimeMs(Int64(maxDuration)))
                                     .font(.system(size: 11, weight: .medium).monospacedDigit())
-                                    .foregroundColor(.white.opacity(0.65))
+                                    .foregroundColor(.white.opacity(0.72))
                             }
                         }
 
@@ -310,10 +358,21 @@ struct FullPlayerView: View {
             }
             .onChange(of: track.id) { _ in
                 isDraggingSlider = false
+                dragPositionMs = 0
+                pendingSeekClearTask?.cancel()
+                pendingSeekTargetMs = nil
+                lyricScrollCooldownTask?.cancel()
+                isUserScrollingLyrics = false
+            }
+            .onChange(of: progress.positionMs) { newPos in
+                if let target = pendingSeekTargetMs, abs(newPos - target) < 1_500 {
+                    pendingSeekClearTask?.cancel()
+                    pendingSeekTargetMs = nil
+                }
             }
             .confirmationDialog("选择偏好音质", isPresented: $showQualitySheet, titleVisibility: .visible) {
                 ForEach(AudioQuality.allCases) { q in
-                    Button(q == preferredQuality ? "✓ \(q.label)" : q.label) {
+                    Button(isActiveQuality(q) ? "✓ \(q.label)" : q.label) {
                         onSelectQuality(q)
                     }
                 }
@@ -323,7 +382,7 @@ struct FullPlayerView: View {
                 ForEach([15, 30, 45, 60, 90], id: \.self) { minVal in
                     Button("\(minVal) 分钟后暂停") { onSetSleepTimer(minVal) }
                 }
-                if state.sleepTimerRemainingMs != nil {
+                if progress.sleepTimerRemainingMs != nil {
                     Button("关闭定时", role: .destructive) { onSetSleepTimer(nil) }
                 }
                 Button("取消", role: .cancel) {}
@@ -338,7 +397,7 @@ struct FullPlayerView: View {
                 let artSize = min(geo.size.width - 32, geo.size.height - 24, 330)
                 AlbumArtworkView(
                     url: track.coverUrl,
-                    size: max(artSize, 180),
+                    size: max(artSize, 80),
                     cornerRadius: 24,
                     isThumbnail: false
                 )
@@ -364,11 +423,11 @@ struct FullPlayerView: View {
             )
 
             // Preview active lyric line beneath cover
-            let idx = state.activeLyricIndex
+            let idx = activeLyricIndex
             if idx >= 0 && idx < state.lyrics.lines.count {
                 Text(state.lyrics.lines[idx].text)
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.white.opacity(0.75))
+                    .foregroundColor(.white.opacity(0.84))
                     .lineLimit(1)
                     .padding(.horizontal, 28)
                     .onTapGesture { showLyrics = true }
@@ -384,16 +443,16 @@ struct FullPlayerView: View {
                     ProgressView().tint(.white)
                     Text("加载歌词中...")
                         .font(.system(size: 13))
-                        .foregroundColor(.white.opacity(0.65))
+                        .foregroundColor(.white.opacity(0.72))
                 }
             } else if state.lyrics.isEmpty {
                 VStack(spacing: 8) {
                     Text("纯音乐或暂无歌词")
                         .font(.system(size: 16, weight: .medium))
-                        .foregroundColor(.white.opacity(0.72))
+                        .foregroundColor(.white.opacity(0.78))
                     Text("轻触此处返回封面")
                         .font(.system(size: 12))
-                        .foregroundColor(.white.opacity(0.45))
+                        .foregroundColor(.white.opacity(0.55))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .contentShape(Rectangle())
@@ -404,21 +463,23 @@ struct FullPlayerView: View {
                         LazyVStack(alignment: .leading, spacing: 18) {
                             Spacer().frame(height: 80)
                             ForEach(Array(state.lyrics.lines.enumerated()), id: \.offset) { idx, line in
-                                let isActive = idx == state.activeLyricIndex
+                                let isActive = idx == activeLyricIndex
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(line.text)
                                         .font(.system(size: isActive ? 22 : 17, weight: isActive ? .bold : .medium))
-                                        .foregroundColor(isActive ? .white : .white.opacity(0.42))
+                                        .foregroundColor(isActive ? .white : .white.opacity(0.58))
                                     if showTranslation, let trans = line.translation, !trans.isEmpty {
                                         Text(trans)
                                             .font(.system(size: isActive ? 14 : 13))
-                                            .foregroundColor(isActive ? .white.opacity(0.78) : .white.opacity(0.32))
+                                            .foregroundColor(isActive ? .white.opacity(0.88) : .white.opacity(0.46))
                                     }
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .id(idx)
                                 .contentShape(Rectangle())
                                 .onTapGesture {
+                                    lyricScrollCooldownTask?.cancel()
+                                    isUserScrollingLyrics = false
                                     onSeek(line.timeMs)
                                 }
                                 .animation(.easeOut(duration: 0.2), value: isActive)
@@ -427,16 +488,53 @@ struct FullPlayerView: View {
                         }
                         .padding(.horizontal, 28)
                     }
-                    .onChange(of: state.activeLyricIndex) { newIdx in
-                        if newIdx >= 0 {
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 6)
+                            .updating($isDraggingLyrics) { _, state, _ in
+                                state = true
+                            }
+                    )
+                    .onChange(of: isDraggingLyrics) { dragging in
+                        lyricScrollCooldownTask?.cancel()
+                        if dragging {
+                            isUserScrollingLyrics = true
+                        } else if isUserScrollingLyrics {
+                            lyricScrollCooldownTask = Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 3_500_000_000)
+                                if !Task.isCancelled {
+                                    isUserScrollingLyrics = false
+                                }
+                            }
+                        }
+                    }
+                    .onChange(of: isUserScrollingLyrics) { scrolling in
+                        guard !scrolling else { return }
+                        let cur = activeLyricIndex
+                        if cur >= 0 && cur < state.lyrics.lines.count {
+                            withAnimation(.easeInOut(duration: 0.35)) {
+                                proxy.scrollTo(cur, anchor: .center)
+                            }
+                        } else if cur < 0 && !state.lyrics.lines.isEmpty {
+                            withAnimation(.easeInOut(duration: 0.35)) {
+                                proxy.scrollTo(0, anchor: .top)
+                            }
+                        }
+                    }
+                    .onChange(of: activeLyricIndex) { newIdx in
+                        guard !isUserScrollingLyrics else { return }
+                        if newIdx >= 0 && newIdx < state.lyrics.lines.count {
                             withAnimation(.easeInOut(duration: 0.35)) {
                                 proxy.scrollTo(newIdx, anchor: .center)
+                            }
+                        } else if newIdx < 0 && !state.lyrics.lines.isEmpty {
+                            withAnimation(.easeInOut(duration: 0.35)) {
+                                proxy.scrollTo(0, anchor: .top)
                             }
                         }
                     }
                     .onAppear {
-                        let cur = state.activeLyricIndex
-                        if cur >= 0 {
+                        let cur = activeLyricIndex
+                        if cur >= 0 && cur < state.lyrics.lines.count {
                             proxy.scrollTo(cur, anchor: .center)
                         }
                     }

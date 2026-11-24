@@ -7,9 +7,14 @@ import com.lxpure.music.domain.model.PlaybackQueueSnapshot
 import com.lxpure.music.domain.model.PlaybackQueueSource
 import com.lxpure.music.domain.model.RepeatMode
 import com.lxpure.music.domain.model.Track
-import kotlinx.serialization.encodeToString
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromStream
+import kotlinx.serialization.json.encodeToStream
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -93,8 +98,20 @@ class PlaybackSessionStore(private val baseDir: File) {
             }
 
             val currentTrack = queue[resolvedIndex]
-            val durationMs = maxOf(cursor?.durationMs ?: 0L, currentTrack.durationMs, 0L)
-            var positionMs = (cursor?.positionMs ?: 0L).coerceAtLeast(0L)
+            val trackMatched = cursor == null ||
+                cursor.currentTrackId.isNullOrBlank() ||
+                currentTrack.id == cursor.currentTrackId
+
+            val durationMs = if (trackMatched) {
+                maxOf(cursor?.durationMs ?: 0L, currentTrack.durationMs, 0L)
+            } else {
+                currentTrack.durationMs.coerceAtLeast(0L)
+            }
+            var positionMs = if (trackMatched) {
+                (cursor?.positionMs ?: 0L).coerceAtLeast(0L)
+            } else {
+                0L
+            }
             if (durationMs > 5_000L && positionMs >= durationMs - 1_500L) {
                 positionMs = (durationMs - 2_000L).coerceAtLeast(0L)
             } else if (durationMs > 0L && positionMs > durationMs) {
@@ -112,13 +129,20 @@ class PlaybackSessionStore(private val baseDir: File) {
                 durationMs = durationMs,
                 repeatMode = repeatMode,
                 queueSource = queueSnapshot?.queueSource,
-                activeQualityBadge = cursor?.activeQualityBadge ?: currentTrack.bestQualityBadge,
-                activeProviderName = cursor?.activeProviderName
+                activeQualityBadge = if (trackMatched) {
+                    cursor?.activeQualityBadge ?: currentTrack.bestQualityBadge
+                } else {
+                    currentTrack.bestQualityBadge
+                },
+                activeProviderName = if (trackMatched) cursor?.activeProviderName else null
             )
         }
     }
 
-    private val ioLock = ReentrantLock()
+    private val queueLock = ReentrantLock()
+    private val cursorLock = ReentrantLock()
+    private val queueWriteGen = AtomicLong(0L)
+    private val cursorWriteGen = AtomicLong(0L)
     private val queueFile: File get() = File(baseDir, QUEUE_FILE_NAME)
     private val cursorFile: File get() = File(baseDir, CURSOR_FILE_NAME)
 
@@ -136,6 +160,8 @@ class PlaybackSessionStore(private val baseDir: File) {
             clear()
             return
         }
+        val qGen = queueWriteGen.incrementAndGet()
+        val cGen = cursorWriteGen.incrementAndGet()
         val (slicedQueue, slicedIndex) = sliceQueueForPersistence(queue, currentIndex)
         val now = System.currentTimeMillis()
         val queueSnapshot = PlaybackQueueSnapshot(
@@ -156,9 +182,15 @@ class PlaybackSessionStore(private val baseDir: File) {
             updatedAt = now
         )
 
-        ioLock.withLock {
-            writeAtomically(queueFile, json.encodeToString(queueSnapshot))
-            writeAtomically(cursorFile, json.encodeToString(cursorSnapshot))
+        queueLock.withLock {
+            if (queueWriteGen.get() == qGen) {
+                writeJsonAtomically(queueFile, queueSnapshot)
+            }
+        }
+        cursorLock.withLock {
+            if (cursorWriteGen.get() == cGen) {
+                writeJsonAtomically(cursorFile, cursorSnapshot)
+            }
         }
     }
 
@@ -172,6 +204,7 @@ class PlaybackSessionStore(private val baseDir: File) {
         activeProviderName: String?
     ) {
         if (currentIndex < 0 || currentTrackId.isNullOrBlank()) return
+        val cGen = cursorWriteGen.incrementAndGet()
         val cursorSnapshot = PlaybackCursorSnapshot(
             version = 1,
             currentIndex = currentIndex,
@@ -183,42 +216,62 @@ class PlaybackSessionStore(private val baseDir: File) {
             activeProviderName = activeProviderName,
             updatedAt = System.currentTimeMillis()
         )
-        ioLock.withLock {
-            writeAtomically(cursorFile, json.encodeToString(cursorSnapshot))
+        cursorLock.withLock {
+            if (cursorWriteGen.get() == cGen) {
+                writeJsonAtomically(cursorFile, cursorSnapshot)
+            }
         }
     }
 
-    fun loadSession(): RestoredPlaybackSession? = ioLock.withLock {
-        val queueSnapshot = readJson<PlaybackQueueSnapshot>(queueFile)
-        val cursorSnapshot = readJson<PlaybackCursorSnapshot>(cursorFile)
-        resolveRestoredSession(queueSnapshot, cursorSnapshot)
+    fun loadSession(): RestoredPlaybackSession? = queueLock.withLock {
+        cursorLock.withLock {
+            val queueSnapshot = readJson<PlaybackQueueSnapshot>(queueFile)
+            val cursorSnapshot = readJson<PlaybackCursorSnapshot>(cursorFile)
+            resolveRestoredSession(queueSnapshot, cursorSnapshot)
+        }
     }
 
-    fun clear() = ioLock.withLock {
-        runCatching { if (queueFile.exists()) queueFile.delete() }
-        runCatching { if (cursorFile.exists()) cursorFile.delete() }
+    fun clear() {
+        queueWriteGen.incrementAndGet()
+        cursorWriteGen.incrementAndGet()
+        queueLock.withLock {
+            cursorLock.withLock {
+                runCatching { if (queueFile.exists()) queueFile.delete() }
+                runCatching { if (cursorFile.exists()) cursorFile.delete() }
+            }
+        }
     }
 
+    @OptIn(ExperimentalSerializationApi::class)
     private inline fun <reified T> readJson(file: File): T? {
         if (!file.exists() || file.length() <= 0L) return null
         return runCatching {
-            json.decodeFromString<T>(file.readText(Charsets.UTF_8))
+            BufferedInputStream(file.inputStream(), 16 * 1024).use { input ->
+                json.decodeFromStream<T>(input)
+            }
         }.onFailure { err ->
             Log.w(TAG, "Failed to decode ${file.name}: ${err.message}")
         }.getOrNull()
     }
 
-    private fun writeAtomically(target: File, content: String) {
+    @OptIn(ExperimentalSerializationApi::class)
+    private inline fun <reified T> writeJsonAtomically(target: File, value: T) {
+        val temp = File(target.parentFile, "${target.name}.tmp")
         runCatching {
             target.parentFile?.mkdirs()
-            val temp = File(target.parentFile, "${target.name}.tmp")
-            temp.writeText(content, Charsets.UTF_8)
+            BufferedOutputStream(temp.outputStream(), 16 * 1024).use { output ->
+                json.encodeToStream(value, output)
+            }
             if (!temp.renameTo(target)) {
-                target.writeText(content, Charsets.UTF_8)
-                temp.delete()
+                BufferedOutputStream(target.outputStream(), 16 * 1024).use { output ->
+                    json.encodeToStream(value, output)
+                }
             }
         }.onFailure { err ->
             Log.w(TAG, "Failed to persist ${target.name}: ${err.message}")
+        }
+        runCatching {
+            if (temp.exists()) temp.delete()
         }
     }
 }

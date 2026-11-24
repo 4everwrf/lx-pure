@@ -7,6 +7,7 @@ import coil.ImageLoaderFactory
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import com.lxpure.music.core.download.DownloadManager
+import com.lxpure.music.core.localmedia.LocalAudioArtFetcher
 import com.lxpure.music.core.localmedia.LocalMusicScanner
 import com.lxpure.music.core.musicsdk.MusicAggregator
 import com.lxpure.music.core.network.NetworkQualityAdvisor
@@ -53,7 +54,11 @@ class AppContainer(application: Application) {
         .build()
 
     val imageLoader: ImageLoader = ImageLoader.Builder(application)
-        .okHttpClient(httpClient)
+        // Avoid double disk caching (Coil maintains its own 64 MB DiskCache; keep http_cache exclusively for API metadata)
+        .okHttpClient(httpClient.newBuilder().cache(null).build())
+        .components {
+            add(LocalAudioArtFetcher.Factory(application))
+        }
         .memoryCache {
             MemoryCache.Builder(application)
                 // Hard 24 MB cap keeps foreground Bitmap PSS strictly bounded even after browsing multiple 200-track charts
@@ -89,7 +94,7 @@ class AppContainer(application: Application) {
     val downloadManager: DownloadManager = DownloadManager(
         context = application,
         downloadDao = database.downloadDao(),
-        httpClient = httpClient,
+        httpClient = streamHttpClient,
         userApiManager = userApiManager
     )
     val playerController: PlayerController = PlayerController(
@@ -118,13 +123,22 @@ class LxPureApp : Application(), ImageLoaderFactory {
 
     override fun newImageLoader(): ImageLoader = container.imageLoader
 
+    @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (!::container.isInitialized) return
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
-            // Release decoded cover Bitmaps and unused backup QuickJS VMs when backgrounded
-            container.imageLoader.memoryCache?.clear()
-            container.userApiManager.trimIdleRuntimes(keepTopCount = 2)
+        when {
+            level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND ||
+                level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> {
+                // Aggressive trim under deep background or critical foreground memory pressure (API 26–35)
+                container.imageLoader.memoryCache?.clear()
+                container.userApiManager.trimIdleRuntimes(keepTopCount = 1)
+            }
+            level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN ||
+                level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> {
+                container.imageLoader.memoryCache?.clear()
+                container.userApiManager.trimIdleRuntimes(keepTopCount = 2)
+            }
         }
     }
 

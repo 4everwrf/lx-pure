@@ -23,6 +23,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -31,8 +32,12 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -115,10 +120,38 @@ fun CollectionDetailScreen(
                     Icon(Icons.Rounded.DeleteOutline, contentDescription = "清空", tint = lxColors.textSecondary)
                 }
             }
+            var showDeleteConfirm by remember { mutableStateOf(false) }
+            var isDeleting by remember { mutableStateOf(false) }
             if (showDeletePlaylistAction && onDeletePlaylist != null) {
-                IconButton(onClick = onDeletePlaylist) {
+                IconButton(
+                    onClick = { if (!isDeleting) showDeleteConfirm = true },
+                    enabled = !isDeleting
+                ) {
                     Icon(Icons.Rounded.DeleteOutline, contentDescription = "删除歌单", tint = lxColors.danger)
                 }
+            }
+            if (showDeleteConfirm && onDeletePlaylist != null) {
+                AlertDialog(
+                    onDismissRequest = { showDeleteConfirm = false },
+                    title = { Text("删除歌单", style = MaterialTheme.typography.titleLarge) },
+                    text = { Text("确定要删除歌单「$title」吗？此操作不可撤销。", style = MaterialTheme.typography.bodyMedium) },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                if (!isDeleting) {
+                                    isDeleting = true
+                                    showDeleteConfirm = false
+                                    onDeletePlaylist()
+                                }
+                            }
+                        ) {
+                            Text("删除", color = lxColors.danger)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") }
+                    }
+                )
             }
         }
 
@@ -151,6 +184,11 @@ fun CollectionDetailScreen(
             val currentTrackIndex = remember(tracks, currentTrackId) {
                 currentTrackId?.let { id -> tracks.indexOfFirst { it.id == id } } ?: -1
             }
+            val extraDockClearance = when {
+                tracks.size < 15 -> 0.dp
+                currentTrackIndex >= 0 -> 114.dp
+                else -> 74.dp
+            }
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -159,7 +197,7 @@ fun CollectionDetailScreen(
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = bottomPadding)
+                    contentPadding = PaddingValues(bottom = bottomPadding + extraDockClearance)
                 ) {
                     item {
                         Row(
@@ -216,9 +254,14 @@ fun DownloadsDetailScreen(
     bottomPadding: Dp,
     onBack: () -> Unit,
     onPlayTrack: (Track) -> Unit,
+    onPlayAllCompleted: ((List<Track>) -> Unit)? = null,
+    onRetryDownload: ((Track) -> Unit)? = null,
     onDeleteDownload: (String) -> Unit
 ) {
     val lxColors = LocalLxColors.current
+    val completedTracks = remember(records) {
+        records.filter { it.status == DownloadStatus.COMPLETED }.map { it.track }
+    }
 
     Column(
         modifier = Modifier
@@ -236,8 +279,7 @@ fun DownloadsDetailScreen(
             }
             Column(modifier = Modifier.weight(1f)) {
                 Text("离线下载", style = MaterialTheme.typography.titleLarge, color = lxColors.textPrimary)
-                val completedCount = records.count { it.status == DownloadStatus.COMPLETED }
-                Text("已完成 $completedCount 首 · 离线播放零流量", style = MaterialTheme.typography.bodyMedium, color = lxColors.textSecondary)
+                Text("已完成 ${completedTracks.size} 首 · 离线播放零流量", style = MaterialTheme.typography.bodyMedium, color = lxColors.textSecondary)
             }
         }
 
@@ -247,12 +289,40 @@ fun DownloadsDetailScreen(
             }
         } else {
             LazyColumn(contentPadding = PaddingValues(bottom = bottomPadding)) {
+                if (completedTracks.isNotEmpty() && onPlayAllCompleted != null) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 18.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Button(
+                                onClick = { onPlayAllCompleted(completedTracks) },
+                                shape = RoundedCornerShape(50),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = lxColors.accent,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary
+                                ),
+                                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+                            ) {
+                                Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("播放全部 (${completedTracks.size})")
+                            }
+                        }
+                    }
+                }
                 itemsIndexed(records, key = { _, r -> r.trackId }) { _, record ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable(enabled = record.status == DownloadStatus.COMPLETED) {
-                                onPlayTrack(record.track)
+                            .clickable(enabled = record.status == DownloadStatus.COMPLETED || (record.status == DownloadStatus.FAILED && onRetryDownload != null)) {
+                                if (record.status == DownloadStatus.COMPLETED) {
+                                    onPlayTrack(record.track)
+                                } else if (record.status == DownloadStatus.FAILED) {
+                                    onRetryDownload?.invoke(record.track)
+                                }
                             }
                             .padding(horizontal = 18.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -272,7 +342,7 @@ fun DownloadsDetailScreen(
                                 DownloadStatus.QUEUED -> "等待中…"
                                 DownloadStatus.DOWNLOADING -> "下载中 ${(record.progress * 100).toInt()}%"
                                 DownloadStatus.COMPLETED -> "${record.track.artist} · ${record.quality.badge} · ${FormatUtils.formatSize(record.totalBytes)}"
-                                DownloadStatus.FAILED -> "失败：${record.errorMessage ?: "请重试"}"
+                                DownloadStatus.FAILED -> "失败：${record.errorMessage ?: "点击重试"}"
                             }
                             Text(
                                 text = statusText,
@@ -292,6 +362,11 @@ fun DownloadsDetailScreen(
                                     color = lxColors.accent,
                                     trackColor = lxColors.hairline
                                 )
+                            }
+                        }
+                        if (record.status == DownloadStatus.FAILED && onRetryDownload != null) {
+                            IconButton(onClick = { onRetryDownload(record.track) }) {
+                                Icon(Icons.Rounded.Refresh, contentDescription = "重试下载", tint = lxColors.accent)
                             }
                         }
                         IconButton(onClick = { onDeleteDownload(record.trackId) }) {

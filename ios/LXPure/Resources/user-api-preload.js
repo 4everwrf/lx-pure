@@ -17,19 +17,24 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
   }
   const nativeFuncNames = [
     '__lx_native_call__set_timeout',
+    '__lx_native_call__clear_timeout',
     '__lx_native_call__utils_str2b64',
     '__lx_native_call__utils_b642buf',
     '__lx_native_call__utils_str2md5',
     '__lx_native_call__utils_aes_encrypt',
     '__lx_native_call__utils_rsa_encrypt',
+    '__lx_native_call__utils_zlib_inflate',
+    '__lx_native_call__utils_zlib_deflate',
   ]
   const nativeFuncs = {}
   for (const fnName of nativeFuncNames) {
     const nativeFunc = globalThis[fnName]
     delete globalThis[fnName]
-    nativeFuncs[fnName.replace('__lx_native_call__', '')] = (...args) => {
-      for (const arg of args) checkLength(arg)
-      return nativeFunc(...args)
+    if (typeof nativeFunc === 'function') {
+      nativeFuncs[fnName.replace('__lx_native_call__', '')] = (...args) => {
+        for (const arg of args) checkLength(arg)
+        return nativeFunc(...args)
+      }
     }
   }
 
@@ -73,6 +78,9 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
     const target = callbacks.get(tid)
     if (!target) return
     callbacks.delete(tid)
+    if (nativeFuncs.clear_timeout) {
+      nativeFuncs.clear_timeout(tid)
+    }
   }
   const handleSetTimeout = (tid) => {
     const target = callbacks.get(tid)
@@ -81,38 +89,110 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
     target.callback(...target.params)
   }
 
+  const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+  function toUint8Array(buf) {
+    if (buf instanceof Uint8Array) return buf
+    if (ArrayBuffer.isView(buf)) return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+    if (buf instanceof ArrayBuffer) return new Uint8Array(buf)
+    if (Array.isArray(buf)) return new Uint8Array(buf)
+    return null
+  }
+
+  function bytesToBase64(bytes) {
+    let out = ''
+    const len = bytes.length
+    for (let i = 0; i < len; i += 3) {
+      const b0 = bytes[i] & 0xFF
+      const has1 = i + 1 < len
+      const has2 = i + 2 < len
+      const b1 = has1 ? (bytes[i + 1] & 0xFF) : 0
+      const b2 = has2 ? (bytes[i + 2] & 0xFF) : 0
+      const trip = (b0 << 16) | (b1 << 8) | b2
+      out += B64_CHARS[(trip >> 18) & 63]
+      out += B64_CHARS[(trip >> 12) & 63]
+      out += has1 ? B64_CHARS[(trip >> 6) & 63] : '='
+      out += has2 ? B64_CHARS[trip & 63] : '='
+    }
+    return out
+  }
+
+  function bytesToLatin1(bytes) {
+    let out = ''
+    const chunkSize = 8192
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const end = Math.min(i + chunkSize, bytes.length)
+      const slice = new Array(end - i)
+      for (let j = i; j < end; j++) slice[j - i] = bytes[j] & 0xFF
+      out += String.fromCharCode.apply(null, slice)
+    }
+    return out
+  }
+
+  // Decode UTF-8 byte sequence to UTF-16 string (supports 1..4 byte sequences & surrogate pairs)
   function bytesToString(bytes) {
     let result = ''
     let i = 0
-    while (i < bytes.length) {
-      const byte = bytes[i]
-      if (byte < 128) {
-        result += String.fromCharCode(byte)
-        i++
-      } else if (byte >= 192 && byte < 224) {
-        result += String.fromCharCode(((byte & 31) << 6) | (bytes[i + 1] & 63))
+    const len = bytes.length
+    while (i < len) {
+      const b0 = bytes[i] & 0xFF
+      if (b0 < 0x80) {
+        result += String.fromCharCode(b0)
+        i += 1
+      } else if ((b0 & 0xE0) === 0xC0 && i + 1 < len) {
+        const b1 = bytes[i + 1] & 0xFF
+        result += String.fromCharCode(((b0 & 0x1F) << 6) | (b1 & 0x3F))
         i += 2
-      } else {
-        result += String.fromCharCode(((byte & 15) << 12) | ((bytes[i + 1] & 63) << 6) | (bytes[i + 2] & 63))
+      } else if ((b0 & 0xF0) === 0xE0 && i + 2 < len) {
+        const b1 = bytes[i + 1] & 0xFF
+        const b2 = bytes[i + 2] & 0xFF
+        result += String.fromCharCode(((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F))
         i += 3
+      } else if ((b0 & 0xF8) === 0xF0 && i + 3 < len) {
+        const b1 = bytes[i + 1] & 0xFF
+        const b2 = bytes[i + 2] & 0xFF
+        const b3 = bytes[i + 3] & 0xFF
+        const cp = (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)) - 0x10000
+        if (cp >= 0 && cp <= 0xFFFFF) {
+          result += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF))
+        } else {
+          result += '\uFFFD'
+        }
+        i += 4
+      } else {
+        result += '\uFFFD'
+        i += 1
       }
     }
     return result
   }
 
+  // Encode UTF-16 string to UTF-8 byte array (supports surrogate pairs -> 4-byte UTF-8)
   function stringToBytes(inputString) {
     const bytes = []
     for (let i = 0; i < inputString.length; i++) {
-      const charCode = inputString.charCodeAt(i)
-      if (charCode < 128) {
-        bytes.push(charCode)
-      } else if (charCode < 2048) {
-        bytes.push((charCode >> 6) | 192)
-        bytes.push((charCode & 63) | 128)
+      let cp = inputString.charCodeAt(i)
+      if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < inputString.length) {
+        const low = inputString.charCodeAt(i + 1)
+        if (low >= 0xDC00 && low <= 0xDFFF) {
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+          i += 1
+        }
+      }
+      if (cp < 0x80) {
+        bytes.push(cp)
+      } else if (cp < 0x800) {
+        bytes.push((cp >> 6) | 0xC0)
+        bytes.push((cp & 0x3F) | 0x80)
+      } else if (cp < 0x10000) {
+        bytes.push((cp >> 12) | 0xE0)
+        bytes.push(((cp >> 6) & 0x3F) | 0x80)
+        bytes.push((cp & 0x3F) | 0x80)
       } else {
-        bytes.push((charCode >> 12) | 224)
-        bytes.push(((charCode >> 6) & 63) | 128)
-        bytes.push((charCode & 63) | 128)
+        bytes.push((cp >> 18) | 0xF0)
+        bytes.push(((cp >> 12) & 0x3F) | 0x80)
+        bytes.push(((cp >> 6) & 0x3F) | 0x80)
+        bytes.push((cp & 0x3F) | 0x80)
       }
     }
     return bytes
@@ -154,7 +234,7 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
   }
 
   const verifyLyricInfo = (info) => {
-    if (typeof info != 'object' || typeof info.lyric != 'string') throw new Error('failed')
+    if (!info || typeof info != 'object' || typeof info.lyric != 'string') throw new Error('failed')
     if (info.lyric.length > 51200) throw new Error('failed')
     return {
       lyric: info.lyric,
@@ -164,15 +244,26 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
     }
   }
 
+  const formatErrorMessage = (err) => {
+    if (err && typeof err === 'object' && typeof err.message === 'string' && err.message.length > 0) {
+      return err.message
+    }
+    if (typeof err === 'string' && err.length > 0) return err
+    return err != null ? String(err) : 'failed'
+  }
+
   const requestQueue = new Map()
   let isInitedApi = false
   let isShowedUpdateAlert = false
 
   const sendNativeRequest = (url, options, callback) => {
-    const requestKey = Math.random().toString()
+    const requestKey = `${Date.now()}_${Math.random().toString(36).slice(2)}`
     const requestInfo = {
       aborted: false,
       abort: () => {
+        if (requestInfo.aborted) return
+        requestInfo.aborted = true
+        requestQueue.delete(requestKey)
         nativeCall(NATIVE_EVENTS_NAMES.cancelRequest, requestKey)
       },
     }
@@ -181,22 +272,41 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
       requestInfo,
     })
 
-    nativeCall(NATIVE_EVENTS_NAMES.request, { requestKey, url, options })
+    try {
+      nativeCall(NATIVE_EVENTS_NAMES.request, { requestKey, url, options })
+    } catch (err) {
+      requestQueue.delete(requestKey)
+      requestInfo.aborted = true
+      if (typeof callback === 'function') {
+        callback(err instanceof Error ? err : new Error(formatErrorMessage(err)), null)
+      }
+    }
     return requestInfo
   }
+
   const handleNativeResponse = ({ requestKey, error, response }) => {
     const targetRequest = requestQueue.get(requestKey)
     if (!targetRequest) return
     requestQueue.delete(requestKey)
     targetRequest.requestInfo.aborted = true
-    if (error == null) targetRequest.callback(null, response)
-    else targetRequest.callback(new Error(error), null)
+    if (error == null) {
+      if (response && response.binary === true) {
+        if (typeof response.body === 'string') {
+          response.body = utils.buffer.from(response.body, 'base64')
+        } else if (Array.isArray(response.body)) {
+          response.body = new Uint8Array(response.body)
+        }
+      }
+      targetRequest.callback(null, response)
+    } else {
+      targetRequest.callback(new Error(error), null)
+    }
   }
 
   const handleRequest = ({ requestKey, data }) => {
     if (!events.request) return nativeCall(NATIVE_EVENTS_NAMES.response, { requestKey, status: false, errorMessage: 'Request event is not defined' })
     try {
-      Promise.resolve(events.request.call(globalThis.lx, { source: data.source, action: data.action, info: data.info })).then(response => {
+      Promise.resolve().then(() => events.request.call(globalThis.lx, { source: data.source, action: data.action, info: data.info })).then(response => {
         let result
         switch (data.action) {
           case 'musicUrl':
@@ -228,10 +338,10 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
         }
         nativeCall(NATIVE_EVENTS_NAMES.response, { requestKey, status: true, result })
       }).catch(err => {
-        nativeCall(NATIVE_EVENTS_NAMES.response, { requestKey, status: false, errorMessage: err && err.message ? err.message : String(err) })
+        nativeCall(NATIVE_EVENTS_NAMES.response, { requestKey, status: false, errorMessage: formatErrorMessage(err) })
       })
     } catch (err) {
-      nativeCall(NATIVE_EVENTS_NAMES.response, { requestKey, status: false, errorMessage: err && err.message ? err.message : String(err) })
+      nativeCall(NATIVE_EVENTS_NAMES.response, { requestKey, status: false, errorMessage: formatErrorMessage(err) })
     }
   }
 
@@ -264,8 +374,22 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
   })
 
   const handleInit = (info) => {
-    if (!info) {
+    if (!info || typeof info !== 'object') {
       nativeCall(NATIVE_EVENTS_NAMES.init, { info: null, status: false, errorMessage: 'Missing required parameter init info' })
+      return
+    }
+    if (info.status === false) {
+      const msg = typeof info.message === 'string' && info.message.length > 0
+        ? info.message.substring(0, 200)
+        : 'Init failed'
+      nativeCall(NATIVE_EVENTS_NAMES.init, { info: null, status: false, errorMessage: msg })
+      return
+    }
+    if (!info.sources || typeof info.sources !== 'object') {
+      const msg = typeof info.message === 'string' && info.message.length > 0
+        ? info.message.substring(0, 200)
+        : 'Missing sources in init info'
+      nativeCall(NATIVE_EVENTS_NAMES.init, { info: null, status: false, errorMessage: msg })
       return
     }
     const sourceInfo = {
@@ -277,14 +401,16 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
         if (!userSource || userSource.type !== 'music') continue
         const qualitys = supportQualitys[source]
         const actions = supportActions[source]
+        const userActions = Array.isArray(userSource.actions) ? userSource.actions : []
+        const userQualitys = Array.isArray(userSource.qualitys) ? userSource.qualitys : []
         sourceInfo.sources[source] = {
           type: 'music',
-          actions: actions.filter(a => userSource.actions.includes(a)),
-          qualitys: qualitys.filter(q => userSource.qualitys.includes(q)),
+          actions: actions.filter(a => userActions.includes(a)),
+          qualitys: qualitys.filter(q => userQualitys.includes(q)),
         }
       }
     } catch (error) {
-      nativeCall(NATIVE_EVENTS_NAMES.init, { info: null, status: false, errorMessage: error.message })
+      nativeCall(NATIVE_EVENTS_NAMES.init, { info: null, status: false, errorMessage: formatErrorMessage(error) })
       return
     }
     nativeCall(NATIVE_EVENTS_NAMES.init, { info: sourceInfo, status: true })
@@ -293,7 +419,7 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
   const handleShowUpdateAlert = (data, resolve, reject) => {
     if (!data || typeof data != 'object') return reject(new Error('parameter format error.'))
     if (!data.log || typeof data.log != 'string') return reject(new Error('log is required.'))
-    if (data.updateUrl && !/^https?:\/\/[^\s$.?#].[^\s]*$/.test(data.updateUrl) && data.updateUrl.length > 1024) delete data.updateUrl
+    if (data.updateUrl && (!/^https?:\/\/[^\s$.?#].[^\s]*$/.test(data.updateUrl) || data.updateUrl.length > 1024)) delete data.updateUrl
     if (data.log.length > 1024) data.log = data.log.substring(0, 1024) + '...'
     nativeCall(NATIVE_EVENTS_NAMES.showUpdateAlert, { log: data.log, updateUrl: data.updateUrl, name })
     resolve()
@@ -301,7 +427,8 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
 
   const dataToB64 = (data) => {
     if (typeof data === 'string') return nativeFuncs.utils_str2b64(data)
-    else if (Array.isArray(data) || ArrayBuffer.isView(data)) return utils.buffer.bufToString(data, 'base64')
+    const u8 = toUint8Array(data)
+    if (u8) return bytesToBase64(u8)
     throw new Error('data type error: ' + typeof data + ' raw data: ' + data)
   }
 
@@ -310,11 +437,11 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
       aesEncrypt(buffer, mode, key, iv) {
         switch (mode) {
           case 'aes-128-cbc':
-            return utils.buffer.from(nativeFuncs.utils_aes_encrypt(dataToB64(buffer), dataToB64(key), dataToB64(iv), AES_MODE.CBC_128_PKCS7Padding), 'base64')
+            return utils.buffer.from(nativeFuncs.utils_aes_encrypt(dataToB64(buffer), dataToB64(key), iv == null ? '' : dataToB64(iv), AES_MODE.CBC_128_PKCS7Padding), 'base64')
           case 'aes-128-ecb':
             return utils.buffer.from(nativeFuncs.utils_aes_encrypt(dataToB64(buffer), dataToB64(key), '', AES_MODE.ECB_128_NoPadding), 'base64')
           default:
-            throw new Error('Binary encoding is not supported for input strings')
+            throw new Error('Unsupported AES mode: ' + mode)
         }
       },
       rsaEncrypt(buffer, key) {
@@ -340,49 +467,111 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
         if (typeof input === 'string') {
           switch (encoding) {
             case 'binary':
-              throw new Error('Binary encoding is not supported for input strings')
+            case 'latin1': {
+              const out = new Uint8Array(input.length)
+              for (let i = 0; i < input.length; i++) out[i] = input.charCodeAt(i) & 0xFF
+              return out
+            }
             case 'base64':
               return new Uint8Array(JSON.parse(nativeFuncs.utils_b642buf(input)))
-            case 'hex':
-              return new Uint8Array((input.match(/.{1,2}/g) || []).map(byte => parseInt(byte, 16)))
+            case 'hex': {
+              const clean = input.trim()
+              if (!clean) return new Uint8Array(0)
+              return new Uint8Array((clean.match(/.{1,2}/g) || []).map(byte => parseInt(byte, 16)))
+            }
             default:
               return new Uint8Array(stringToBytes(input))
           }
-        } else if (Array.isArray(input) || ArrayBuffer.isView(input)) {
-          return new Uint8Array(input)
-        } else {
-          throw new Error('Unsupported input type: ' + input + ' encoding: ' + encoding)
         }
+        const u8 = toUint8Array(input)
+        if (u8) return new Uint8Array(u8)
+        throw new Error('Unsupported input type: ' + input + ' encoding: ' + encoding)
       },
       bufToString(buf, format) {
-        if (Array.isArray(buf) || ArrayBuffer.isView(buf)) {
-          const arr = Array.from(buf)
-          switch (format) {
-            case 'binary':
-              return buf
-            case 'hex':
-              return new Uint8Array(arr).reduce((str, byte) => str + byte.toString(16).padStart(2, '0'), '')
-            case 'base64':
-              return nativeFuncs.utils_str2b64(bytesToString(arr))
-            case 'utf8':
-            case 'utf-8':
-            default:
-              return bytesToString(arr)
-          }
-        } else {
+        const u8 = toUint8Array(buf)
+        if (!u8) {
           throw new Error('Input is not a valid buffer: ' + buf + ' format: ' + format)
         }
+        switch (format) {
+          case 'binary':
+          case 'latin1':
+            return bytesToLatin1(u8)
+          case 'hex': {
+            let hex = ''
+            for (let i = 0; i < u8.length; i++) {
+              hex += (u8[i] & 0xFF).toString(16).padStart(2, '0')
+            }
+            return hex
+          }
+          case 'base64':
+            return bytesToBase64(u8)
+          case 'utf8':
+          case 'utf-8':
+          default:
+            return bytesToString(u8)
+        }
+      },
+    },
+    zlib: {
+      inflate(buf) {
+        return new Promise((resolve, reject) => {
+          if (!nativeFuncs.utils_zlib_inflate) {
+            return reject(new Error('zlib.inflate is not supported'))
+          }
+          try {
+            const b64 = dataToB64(buf)
+            const outB64 = nativeFuncs.utils_zlib_inflate(b64)
+            if (!outB64 && b64.length > 0) return reject(new Error('zlib inflate failed'))
+            resolve(utils.buffer.from(outB64, 'base64'))
+          } catch (err) {
+            reject(err instanceof Error ? err : new Error(formatErrorMessage(err)))
+          }
+        })
+      },
+      deflate(data) {
+        return new Promise((resolve, reject) => {
+          if (!nativeFuncs.utils_zlib_deflate) {
+            return reject(new Error('zlib.deflate is not supported'))
+          }
+          try {
+            const b64 = dataToB64(data)
+            const outB64 = nativeFuncs.utils_zlib_deflate(b64)
+            if (!outB64 && b64.length > 0) return reject(new Error('zlib deflate failed'))
+            resolve(utils.buffer.from(outB64, 'base64'))
+          } catch (err) {
+            reject(err instanceof Error ? err : new Error(formatErrorMessage(err)))
+          }
+        })
       },
     },
   }
 
+  if (typeof globalThis.TextEncoder === 'undefined') {
+    globalThis.TextEncoder = class TextEncoder {
+      encode(str = '') {
+        return new Uint8Array(stringToBytes(String(str)))
+      }
+    }
+  }
+  if (typeof globalThis.TextDecoder === 'undefined') {
+    globalThis.TextDecoder = class TextDecoder {
+      decode(input) {
+        if (input == null) return ''
+        const u8 = toUint8Array(input)
+        return u8 ? bytesToString(u8) : ''
+      }
+    }
+  }
+
   globalThis.lx = {
     EVENT_NAMES,
-    request(url, { method = 'get', timeout, headers, body, form, formData, binary } = {}, callback) {
-      let options = { headers, binary: binary === true }
+    request(url, { method = 'get', timeout, headers, body, form, formData, binary, follow_max } = {}, callback) {
+      const options = { headers, binary: binary === true }
       if (timeout && typeof timeout == 'number' && timeout > 0) options.timeout = Math.min(timeout, 60_000)
+      if (typeof follow_max == 'number' && follow_max >= 0) options.follow_max = Math.floor(follow_max)
 
       let request = sendNativeRequest(url, { method, body, form, formData, ...options }, (err, resp) => {
+        if (typeof callback !== 'function') return
         if (err) {
           callback(err, null, null)
         } else {
@@ -455,10 +644,10 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
 
   const _toString = Function.prototype.toString
   Function.prototype.toString = function() {
-    const desc = Object.getOwnPropertyDescriptors(this).name
+    const desc = Object.getOwnPropertyDescriptor(this, 'name')
     return (desc && desc.configurable)
       ? _toString.apply(this)
-      : `function ${this.name}() { [native code] }`
+      : `function ${this.name || ''}() { [native code] }`
   }
   globalThis.eval = function() {
     throw new Error('eval is not available')

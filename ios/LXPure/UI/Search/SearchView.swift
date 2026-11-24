@@ -37,6 +37,8 @@ struct SearchView: View {
     @State private var results: [Track] = []
     @State private var isSearching = false
     @State private var hasSearched = false
+    @State private var searchTask: Task<Void, Never>?
+    @State private var searchToken = UUID()
     @FocusState private var isSearchFocused: Bool
 
     var body: some View {
@@ -64,9 +66,13 @@ struct SearchView: View {
 
                     if !query.isEmpty {
                         Button {
+                            searchTask?.cancel()
+                            searchTask = nil
+                            searchToken = UUID()
                             query = ""
                             results = []
                             hasSearched = false
+                            isSearching = false
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 16))
@@ -179,19 +185,29 @@ struct SearchView: View {
                 }
             } else if results.isEmpty {
                 Spacer()
-                VStack(spacing: 6) {
+                VStack(spacing: 10) {
                     Text("未找到相关歌曲")
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(lx.textPrimary)
-                    Text("可尝试切换搜索平台或更换关键词")
+                    Text("可尝试切换搜索平台、检查网络或更换关键词")
                         .font(.system(size: 12))
                         .foregroundColor(lx.textSecondary)
+                    Button("重新搜索") {
+                        executeSearch(keyword: query, scope: selectedScope)
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(lx.accent)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 7)
+                    .background(lx.accentSoft)
+                    .clipShape(Capsule())
+                    .buttonStyle(.plain)
                 }
                 Spacer()
             } else {
                 ScrollView {
                     LazyVStack(spacing: 2) {
-                        ForEach(Array(results.enumerated()), id: \.element.id) { idx, track in
+                        ForEach(Array(results.enumerated()), id: \.offset) { idx, track in
                             TrackListRow(
                                 track: track,
                                 index: nil,
@@ -206,6 +222,14 @@ struct SearchView: View {
                 }
             }
         }
+        .onDisappear {
+            if searchTask != nil {
+                searchTask?.cancel()
+                searchTask = nil
+                searchToken = UUID()
+                isSearching = false
+            }
+        }
     }
 
     private func executeSearch(keyword: String, scope: SearchScope) {
@@ -214,14 +238,21 @@ struct SearchView: View {
         isSearchFocused = false
         onSaveSearchQuery(trimmed)
 
-        Task {
-            isSearching = true
-            hasSearched = true
+        searchTask?.cancel()
+        let token = UUID()
+        searchToken = token
+        isSearching = true
+        hasSearched = true
+
+        searchTask = Task {
+            let fetched: [Track]
             if let source = scope.source {
-                results = await aggregator.searchSinglePlatform(source: source, query: trimmed, page: 1, limit: 30)
+                fetched = await aggregator.searchSinglePlatform(source: source, query: trimmed, page: 1, limit: 30)
             } else {
-                results = await aggregator.searchAggregated(query: trimmed)
+                fetched = await aggregator.searchAggregated(query: trimmed)
             }
+            guard !Task.isCancelled, searchToken == token else { return }
+            results = fetched
             isSearching = false
         }
     }

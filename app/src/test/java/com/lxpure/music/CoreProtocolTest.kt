@@ -10,8 +10,10 @@ import com.lxpure.music.core.musicsdk.asJsonArrayOrNull
 import com.lxpure.music.core.musicsdk.asJsonObjectOrNull
 import com.lxpure.music.core.musicsdk.asLongOrNull
 import com.lxpure.music.core.musicsdk.asStringOrNull
+import com.lxpure.music.core.update.AppUpdateManager
 import com.lxpure.music.core.userapi.LxQuickJsRuntime
 import com.lxpure.music.core.userapi.LxScriptParser
+import com.lxpure.music.domain.model.AudioQuality
 import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.QualityInfo
 import com.lxpure.music.domain.model.Track
@@ -891,5 +893,258 @@ class CoreProtocolTest {
         assertEquals(499, com.lxpure.music.ui.components.computeFastScrollTrackIndex(1.5f, 500))
         assertEquals(250, com.lxpure.music.ui.components.computeFastScrollTrackIndex(0.5f, 501))
         assertEquals(0, com.lxpure.music.ui.components.computeFastScrollTrackIndex(0.8f, 1))
+    }
+
+    @Test
+    fun round1PlaybackSessionMismatchResetsPositionAndCacheKeysIsolateSources() {
+        val t1 = Track(id = "wy_1", title = "Song 1", artist = "A", durationMs = 180_000L)
+        val t2 = Track(id = "wy_2", title = "Song 2", artist = "B", durationMs = 240_000L)
+        val restored = com.lxpure.music.data.local.PlaybackSessionStore.resolveRestoredSession(
+            queueSnapshot = com.lxpure.music.domain.model.PlaybackQueueSnapshot(queue = listOf(t1, t2)),
+            cursorSnapshot = com.lxpure.music.domain.model.PlaybackCursorSnapshot(
+                currentIndex = 1,
+                currentTrackId = "deleted_track_id",
+                positionMs = 135_000L,
+                durationMs = 310_000L,
+                activeQualityBadge = "HR",
+                activeProviderName = "OldSource"
+            )
+        )
+        assertNotNull(restored)
+        assertEquals(1, restored!!.currentIndex)
+        assertEquals(0L, restored.positionMs)
+        assertEquals(240_000L, restored.durationMs)
+        assertNull(restored.activeProviderName)
+
+        // Distinct sources / cross-platform fallback tracks must produce distinct SimpleCache keys
+        val k1 = com.lxpure.music.core.player.PlayerController.buildStreamCacheKey(
+            trackId = "wy_1",
+            resolvedTrackId = "wy_1",
+            sourceId = "src_a",
+            quality = com.lxpure.music.domain.model.AudioQuality.FLAC
+        )
+        val k2 = com.lxpure.music.core.player.PlayerController.buildStreamCacheKey(
+            trackId = "wy_1",
+            resolvedTrackId = "wy_1",
+            sourceId = "src_b",
+            quality = com.lxpure.music.domain.model.AudioQuality.FLAC
+        )
+        val k3 = com.lxpure.music.core.player.PlayerController.buildStreamCacheKey(
+            trackId = "wy_1",
+            resolvedTrackId = "tx_99",
+            sourceId = "src_a",
+            quality = com.lxpure.music.domain.model.AudioQuality.FLAC
+        )
+        assertFalse(k1 == k2)
+        assertFalse(k1 == k3)
+        assertTrue(k1.endsWith("_flac"))
+    }
+
+    @Test
+    fun round2SdkCryptoLyricsAndUserApiRegressionSuite() {
+        // 1. LxCrypto: URL-safe Base64, CBC empty IV -> zero IV (deterministic), zlib deflate/inflate round-trip
+        val raw = "LX Pure Round 2 音频沙箱 🎵"
+        val b64 = com.lxpure.music.core.userapi.LxCrypto.str2b64(raw)
+        val compressed = com.lxpure.music.core.userapi.LxCrypto.zlibDeflateBase64(b64)
+        assertTrue(compressed.isNotEmpty())
+        val decompressed = com.lxpure.music.core.userapi.LxCrypto.zlibInflateBase64(compressed)
+        assertEquals(b64, decompressed)
+
+        val keyB64 = com.lxpure.music.core.userapi.LxCrypto.str2b64("0123456789abcdef")
+        val cbcEmptyIv1 = com.lxpure.music.core.userapi.LxCrypto.aesEncryptBase64(b64, keyB64, "", "AES/CBC/PKCS7Padding")
+        val cbcEmptyIv2 = com.lxpure.music.core.userapi.LxCrypto.aesEncryptBase64(b64, keyB64, "", "AES/CBC/PKCS7Padding")
+        assertTrue(cbcEmptyIv1.isNotEmpty())
+        assertEquals(cbcEmptyIv1, cbcEmptyIv2)
+
+        // 2. LxScriptParser: license banner before metadata + distinct IDs for headerless scripts
+        val bannerScript = """
+            /*! MIT License Copyright 2026 */
+            /**
+             * @name Real Source After License
+             * @version 3.0.1
+             */
+            globalThis.lx.send('inited', { sources: {} })
+        """.trimIndent()
+        val bannerMeta = LxScriptParser.parse(bannerScript)
+        assertEquals("Real Source After License", bannerMeta.name)
+        assertEquals("3.0.1", bannerMeta.version)
+
+        val headlessA = LxScriptParser.parse("const a = 1; globalThis.lx.on('request', () => 'a')")
+        val headlessB = LxScriptParser.parse("const b = 2; globalThis.lx.on('request', () => 'b')")
+        assertFalse(headlessA.id == headlessB.id)
+
+        // 3. BOM HTML rejection & transport vs per-track failure classification
+        assertFalse(
+            com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedScript(
+                "\uFEFF<!DOCTYPE html><html><body>lx 404</body></html>" + " ".repeat(200)
+            )
+        )
+        assertTrue(com.lxpure.music.core.userapi.UserApiManager.isTransportOrRuntimeFailure("请求超时，请检查网络连接"))
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isTransportOrRuntimeFailure("音源暂不支持解析当前曲目"))
+
+        // 4. LrcParser: BOM, [offset:], colon & 4-digit ms, QQ "//" filter, 1-to-1 trans matching, duplicate timeMs
+        val lrcWithEdgeCases = "\uFEFF[offset:-500]\n[00:01.0000]Line One\n[00:01:20]Line Two\n[00:05.00]Dup A\n[00:05.00]Dup B"
+        val transWithSlash = "[00:01.00]第一句\n[00:05.00]//"
+        val parsedLrc = LrcParser.parse(lrcWithEdgeCases, transWithSlash)
+        assertEquals(4, parsedLrc.lines.size)
+        assertEquals(1_500L, parsedLrc.lines[0].timeMs)
+        assertEquals("第一句", parsedLrc.lines[0].translation)
+        assertNull(parsedLrc.lines[1].translation) // 1-to-1 matching prevents bleed
+        assertNull(parsedLrc.lines[2].translation) // "//" filtered out
+        assertEquals(2, parsedLrc.activeIndexAt(5_600L)) // lands on first of identical-timestamp group
+
+        // 5. FormatUtils.decodeHtml: numeric entities, <em> stripping, no &amp; double decode
+        assertEquals(
+            "Rock & Roll '99 &lt;Live>",
+            com.lxpure.music.core.musicsdk.FormatUtils.decodeHtml("<em>Rock</em> &#38; Roll &#x27;99 &amp;lt;Live&gt;")
+        )
+
+        // 6. CJK share copy URL extraction
+        assertEquals(
+            "http://163cn.tv/abc123",
+            com.lxpure.music.core.musicsdk.extractFirstHttpUrl("分享歌单 http://163cn.tv/abc123（来自@网易云音乐）")
+        )
+
+        // 7. MusicAggregator.isTrackMatch: variant mismatch rejection + reversed multi-artist match
+        val original = Track(id = "wy_1", title = "千里之外", artist = "周杰伦 / 费玉清", durationMs = 256_000L)
+        val karaoke = Track(id = "tx_2", title = "千里之外 (伴奏)", artist = "周杰伦 / 费玉清", durationMs = 256_000L)
+        val reversedArtist = Track(id = "kw_3", title = "千里之外", artist = "费玉清 / 周杰伦", durationMs = 257_000L)
+        assertFalse(MusicAggregator.isTrackMatch(original, karaoke))
+        assertTrue(MusicAggregator.isTrackMatch(original, reversedArtist))
+    }
+
+    @Test
+    fun round3DataDownloadAndUpdaterSecurityRegressionSuite() {
+        // 1. Corrupt Room entity JSON safely returns null instead of crashing cold-start; incomplete downloads never expose cachedFilePath
+        val corruptFav = com.lxpure.music.data.local.FavoriteEntity(
+            trackId = "bad_1",
+            trackJson = "{broken json"
+        )
+        assertNull(corruptFav.toTrackOrNull())
+
+        val validTrackJson = com.lxpure.music.data.local.roomJson.encodeToString(
+            kotlinx.serialization.serializer<Track>(),
+            Track(id = "wy_dl_1", title = "Song", artist = "Artist")
+        )
+        val downloadingEntity = com.lxpure.music.data.local.DownloadEntity(
+            trackId = "wy_dl_1",
+            trackJson = validTrackJson,
+            quality = AudioQuality.FLAC.lxType,
+            status = com.lxpure.music.domain.model.DownloadStatus.DOWNLOADING.name,
+            progress = 0.5f,
+            filePath = "/tmp/partial.flac",
+            totalBytes = 1000L,
+            errorMessage = null
+        )
+        assertNull(downloadingEntity.toTrackOrNull()?.cachedFilePath)
+
+        val completedEntity = downloadingEntity.copy(
+            status = com.lxpure.music.domain.model.DownloadStatus.COMPLETED.name,
+            progress = 1f,
+            filePath = "/tmp/done.flac"
+        )
+        assertEquals("/tmp/done.flac", completedEntity.toTrackOrNull()?.cachedFilePath)
+
+        // 2. DownloadManager MIME rejection, extension inference, and filename sanitization
+        assertTrue(com.lxpure.music.core.download.DownloadManager.isDisallowedAudioContentType("text/html; charset=utf-8"))
+        assertTrue(com.lxpure.music.core.download.DownloadManager.isDisallowedAudioContentType("application/json"))
+        assertFalse(com.lxpure.music.core.download.DownloadManager.isDisallowedAudioContentType("audio/flac"))
+        assertFalse(com.lxpure.music.core.download.DownloadManager.isDisallowedAudioContentType("application/octet-stream"))
+        assertEquals(
+            "m4a",
+            com.lxpure.music.core.download.DownloadManager.inferAudioExtension(
+                urlPath = "/cdn/stream",
+                contentType = "audio/mp4",
+                contentDisposition = null,
+                quality = AudioQuality.FLAC
+            )
+        )
+        assertEquals(
+            "ogg",
+            com.lxpure.music.core.download.DownloadManager.inferAudioExtension(
+                urlPath = "/cdn/stream",
+                contentType = "application/octet-stream",
+                contentDisposition = "attachment; filename=\"demo.ogg\"",
+                quality = AudioQuality.Q320K
+            )
+        )
+        assertEquals(
+            "hidden_song",
+            com.lxpure.music.core.download.DownloadManager.sanitizeFileName("...hidden/song\n")
+        )
+
+        // 3. AppUpdateManager SHA-256 extraction from release body & SHA256SUMS.txt + mirror gating
+        val digestHex = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        val body = """
+            ### 校验信息
+            - **Android APK**: `lx-pure-v1.1.4-release.apk`
+              - SHA-256: `$digestHex`
+            - **iOS IPA**: `lx-pure-ios-v1.1.4-unsigned.ipa`
+              - SHA-256: `0000000000000000000000000000000000000000000000000000000000000001`
+        """.trimIndent()
+        assertEquals(digestHex, AppUpdateManager.extractSha256FromReleaseBody(body, "lx-pure-v1.1.4-release.apk"))
+
+        val sums = "$digestHex  lx-pure-v1.1.4-release.apk\n1111111111111111111111111111111111111111111111111111111111111111  lx-pure-ios-v1.1.4-unsigned.ipa"
+        assertEquals(digestHex, AppUpdateManager.extractSha256FromSumsText(sums, "lx-pure-v1.1.4-release.apk"))
+
+        assertTrue(AppUpdateManager.isDisallowedUpdateContentType("text/html; charset=utf-8"))
+        assertFalse(AppUpdateManager.isDisallowedUpdateContentType("application/vnd.android.package-archive"))
+
+        val unverifiedRoutes = AppUpdateManager.buildDownloadRoutes(
+            "https://github.com/4everwrf/lx-pure/releases/download/v1.1.4/lx-pure-v1.1.4-release.apk",
+            allowMirrors = false
+        )
+        assertEquals(1, unverifiedRoutes.size)
+        assertEquals("GitHub 直连", unverifiedRoutes.first().label)
+    }
+
+    @Test
+    fun round5SessionWriteOrderAndProgressIsolationRegression() {
+        val tempDir = createTempDir(prefix = "lxpure_r5_session_")
+        try {
+            val store = com.lxpure.music.data.local.PlaybackSessionStore(tempDir)
+            val t1 = Track(id = "wy_r5_1", title = "A", artist = "Artist", durationMs = 200_000L)
+            val t2 = Track(id = "wy_r5_2", title = "B", artist = "Artist", durationMs = 180_000L)
+            store.saveQueueAndCursor(
+                queue = listOf(t1, t2),
+                queueSource = null,
+                currentIndex = 0,
+                positionMs = 10_000L,
+                durationMs = 200_000L,
+                repeatMode = com.lxpure.music.domain.model.RepeatMode.LIST_LOOP,
+                activeQualityBadge = "HQ",
+                activeProviderName = "Mock"
+            )
+            store.saveCursorOnly(
+                currentIndex = 1,
+                currentTrackId = t2.id,
+                positionMs = 95_000L,
+                durationMs = 180_000L,
+                repeatMode = com.lxpure.music.domain.model.RepeatMode.SINGLE_LOOP,
+                activeQualityBadge = "SQ",
+                activeProviderName = "Mock"
+            )
+            val loaded = store.loadSession()
+            assertNotNull(loaded)
+            assertEquals(1, loaded!!.currentIndex)
+            assertEquals(95_000L, loaded.positionMs)
+            assertEquals(180_000L, loaded.durationMs)
+            assertEquals(com.lxpure.music.domain.model.RepeatMode.SINGLE_LOOP, loaded.repeatMode)
+
+            store.clear()
+            assertNull(store.loadSession())
+
+            // Isolated PlaybackProgress holds live progress independently of PlayerState
+            val prog = com.lxpure.music.core.player.PlaybackProgress(
+                positionMs = 45_000L,
+                durationMs = 180_000L,
+                sleepTimerRemainingMs = 600_000L
+            )
+            assertEquals(45_000L, prog.positionMs)
+            assertEquals(180_000L, prog.durationMs)
+            assertEquals(600_000L, prog.sleepTimerRemainingMs)
+        } finally {
+            tempDir.deleteRecursively()
+        }
     }
 }

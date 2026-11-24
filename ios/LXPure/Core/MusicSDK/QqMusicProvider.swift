@@ -140,6 +140,7 @@ final class QqMusicProvider: Sendable {
         var firstDir: [String: Any]?
 
         while offset < totalExpected && allTracks.count < maxTracks {
+            if Task.isCancelled { return .failure(CancellationError()) }
             let payload = JsonSafe.stringify([
                 "comm": [
                     "cv": 4747474,
@@ -178,6 +179,7 @@ final class QqMusicProvider: Sendable {
 
             guard let (respData, resp) = try? await session.data(for: req),
                   let httpResp = resp as? HTTPURLResponse, (200..<300).contains(httpResp.statusCode) else {
+                if Task.isCancelled { return .failure(CancellationError()) }
                 if offset == 0 {
                     return .failure(LxRuntimeError.message("获取 QQ 歌单失败，请检查网络连接"))
                 }
@@ -187,8 +189,15 @@ final class QqMusicProvider: Sendable {
                 if offset == 0 { return .failure(LxRuntimeError.message("QQ 歌单数据异常")) }
                 break
             }
-            guard let req1 = JsonSafe.asObject(root["req_1"]),
-                  let data = JsonSafe.asObject(req1["data"]) else {
+            guard let req1 = JsonSafe.asObject(root["req_1"]) else {
+                if offset == 0 { return .failure(LxRuntimeError.message("QQ 歌单数据为空")) }
+                break
+            }
+            if let reqCode = JsonSafe.asInt(req1["code"]), reqCode != 0 {
+                if offset == 0 { return .failure(LxRuntimeError.message("歌单不存在或暂无访问权限")) }
+                break
+            }
+            guard let data = JsonSafe.asObject(req1["data"]) else {
                 if offset == 0 { return .failure(LxRuntimeError.message("QQ 歌单数据为空")) }
                 break
             }
@@ -200,26 +209,30 @@ final class QqMusicProvider: Sendable {
                     ?? pageSize
             }
 
-            let pageSongs: [Track] = (JsonSafe.asArray(data["songlist"]) ?? []).compactMap { el in
-                guard let obj = JsonSafe.asObject(el) else { return nil }
-                return parseQqSong(obj)
+            guard let rawList = JsonSafe.asArray(data["songlist"]), !rawList.isEmpty else {
+                break
             }
-            if pageSongs.isEmpty { break }
 
             var added = 0
-            for t in pageSongs {
+            for el in rawList {
+                guard let obj = JsonSafe.asObject(el), let t = parseQqSong(obj) else { continue }
                 if seenIds.insert(t.id).inserted {
                     allTracks.append(t)
                     added += 1
                 }
             }
-            if added == 0 || pageSongs.count < pageSize { break }
-            offset += pageSize
+            offset += rawList.count
+            if added == 0 || (totalExpected > 0 && offset >= totalExpected) { break }
+        }
+
+        let dirTitle = JsonSafe.asNonBlankString(firstDir?["title"])
+        if allTracks.isEmpty && dirTitle == nil {
+            return .failure(LxRuntimeError.message("歌单不存在或暂无访问权限"))
         }
 
         let meta = OnlinePlaylist(
             id: id,
-            name: FormatUtils.decodeHtml(JsonSafe.asString(firstDir?["title"]) ?? "QQ 音乐歌单"),
+            name: FormatUtils.decodeHtml(dirTitle ?? "QQ 音乐歌单"),
             coverUrl: (JsonSafe.asString(firstDir?["picurl"]) ?? "").replacingOccurrences(of: "http://", with: "https://"),
             author: JsonSafe.asString(firstDir?["host_nick"]) ?? "",
             playCount: FormatUtils.formatPlayCount(JsonSafe.asInt64(firstDir?["listennum"]) ?? 0),
@@ -302,8 +315,8 @@ final class QqMusicProvider: Sendable {
             return ParsedLyrics()
         }
 
-        let rawLrc = JsonSafe.asString(root["lyric"]).flatMap { decodeB64($0) }
-        let rawTrans = JsonSafe.asString(root["trans"]).flatMap { decodeB64($0) }
+        let rawLrc = JsonSafe.asString(root["lyric"]).flatMap { decodeB64($0)?.replacingOccurrences(of: "&#10;", with: "\n") }
+        let rawTrans = JsonSafe.asString(root["trans"]).flatMap { decodeB64($0)?.replacingOccurrences(of: "&#10;", with: "\n") }
         return LrcParser.parse(rawLrc, translation: rawTrans)
     }
 
@@ -313,28 +326,29 @@ final class QqMusicProvider: Sendable {
         return String(data: data, encoding: .utf8)
     }
 
-    private func extractPlaylistId(_ raw: String) async -> String? {
+    func extractPlaylistId(_ raw: String) async -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty && trimmed.allSatisfy(\.isNumber) { return trimmed }
 
-        if let direct = firstRegexCapture(pattern: "(?:/playlist/|/playsquare/|[?&]id=)(\\d+)", in: trimmed) {
+        let pattern = "(?:/playlist/|/playsquare/|[?&](?:id|tid|disstid)=)(\\d+)"
+        if let direct = firstRegexCapture(pattern: pattern, in: trimmed) {
             return direct
         }
 
-        guard let urlStr = firstRegexCapture(pattern: "(https?://\\S+)", in: trimmed),
+        guard let urlStr = extractFirstHttpUrl(from: trimmed),
               let url = URL(string: urlStr) else { return nil }
         var req = URLRequest(url: url)
         req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
         guard let (_, resp) = try? await session.data(for: req),
               let finalUrl = resp.url?.absoluteString else { return nil }
-        return firstRegexCapture(pattern: "(?:/playlist/|/playsquare/|[?&]id=)(\\d+)", in: finalUrl)
+        return firstRegexCapture(pattern: pattern, in: finalUrl)
     }
 
     func parseQqSong(_ item: [String: Any]) -> Track? {
-        guard let mid = JsonSafe.asString(item["mid"]), !mid.isEmpty else { return nil }
+        guard let mid = JsonSafe.asNonBlankString(item["mid"]) else { return nil }
         let file = JsonSafe.asObject(item["file"])
-        let mediaMid = JsonSafe.asString(file?["media_mid"]) ?? mid
-        let title = FormatUtils.decodeHtml(JsonSafe.asString(item["title"]) ?? JsonSafe.asString(item["name"]))
+        let mediaMid = JsonSafe.asNonBlankString(file?["media_mid"]) ?? mid
+        let title = FormatUtils.decodeHtml(JsonSafe.asNonBlankString(item["title"]) ?? JsonSafe.asNonBlankString(item["name"]))
         guard !title.isEmpty else { return nil }
 
         let singers = JsonSafe.asArray(item["singer"]) ?? []

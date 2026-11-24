@@ -1,6 +1,6 @@
 package com.lxpure.music.core.musicsdk
 
-import android.util.Base64
+import com.lxpure.music.core.userapi.LxCrypto
 import com.lxpure.music.domain.model.LeaderboardItem
 import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.OnlinePlaylist
@@ -18,6 +18,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.nio.charset.StandardCharsets
+import java.util.Locale
 import java.util.UUID
 import kotlin.random.Random
 
@@ -37,8 +38,8 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
     )
 
     suspend fun search(query: String, page: Int = 1, limit: Int = 25): List<Track> = withContext(Dispatchers.IO) {
-        runCatching {
-            val searchId = UUID.randomUUID().toString().replace("-", "").uppercase() +
+        suspendRunCatching {
+            val searchId = UUID.randomUUID().toString().replace("-", "").uppercase(Locale.ROOT) +
                 Random.nextInt(10000, 99999).toString()
 
             val payload = buildJsonObject {
@@ -76,14 +77,14 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
                 .post(payload.toRequestBody(jsonMediaType))
                 .build()
 
-            val body = httpClient.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
-                ?: return@runCatching emptyList()
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@runCatching emptyList()
+            val body = httpClient.newCall(req).awaitResponse().use { if (it.isSuccessful) it.body?.string() else null }
+                ?: return@suspendRunCatching emptyList()
+            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@suspendRunCatching emptyList()
             val list = root["music.search.SearchCgiService"].asJsonObjectOrNull()
                 ?.get("data").asJsonObjectOrNull()
                 ?.get("body").asJsonObjectOrNull()
                 ?.get("song").asJsonObjectOrNull()
-                ?.get("list").asJsonArrayOrNull() ?: return@runCatching emptyList()
+                ?.get("list").asJsonArrayOrNull() ?: return@suspendRunCatching emptyList()
 
             list.mapNotNull { el ->
                 runCatching { el.asJsonObjectOrNull()?.let { parseQqSong(it) } }.getOrNull()
@@ -92,7 +93,7 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getHotPlaylists(page: Int = 1, limit: Int = 20): List<OnlinePlaylist> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val payload = buildJsonObject {
                 put("comm", buildJsonObject {
                     put("cv", 1602)
@@ -118,13 +119,13 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
                 .post(payload.toRequestBody(jsonMediaType))
                 .build()
 
-            val body = httpClient.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
-                ?: return@runCatching emptyList()
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@runCatching emptyList()
+            val body = httpClient.newCall(req).awaitResponse().use { if (it.isSuccessful) it.body?.string() else null }
+                ?: return@suspendRunCatching emptyList()
+            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@suspendRunCatching emptyList()
             val items = root["playlist"].asJsonObjectOrNull()
                 ?.get("data").asJsonObjectOrNull()
                 ?.get("v_playlist").asJsonArrayOrNull()
-                ?: return@runCatching emptyList()
+                ?: return@suspendRunCatching emptyList()
 
             items.mapNotNull { el ->
                 runCatching {
@@ -146,8 +147,9 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getPlaylistDetail(rawIdOrUrl: String): Result<PlaylistDetailResult> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val id = extractPlaylistId(rawIdOrUrl) ?: error("无法识别 QQ 音乐歌单 ID")
+            val numericId = id.toLongOrNull() ?: error("无法识别 QQ 音乐歌单 ID")
             val pageSize = 500
             val maxTracks = 10_000
             val allTracks = mutableListOf<Track>()
@@ -172,7 +174,7 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
                         put("module", "music.srfDissInfo.aiDissInfo")
                         put("method", "uniform_get_Dissinfo")
                         put("param", buildJsonObject {
-                            put("disstid", id.toLong())
+                            put("disstid", numericId)
                             put("userinfo", if (offset == 0) 1 else 0)
                             put("tag", if (offset == 0) 1 else 0)
                             put("orderlist", 1)
@@ -192,11 +194,17 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
                     .post(payload.toRequestBody(jsonMediaType))
                     .build()
 
-                val body = httpClient.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
+                val body = httpClient.newCall(req).awaitResponse().use { if (it.isSuccessful) it.body?.string() else null }
                     ?: if (offset == 0) error("获取 QQ 歌单失败，请检查网络连接") else break
                 val root = json.parseToJsonElement(body).asJsonObjectOrNull()
                     ?: if (offset == 0) error("QQ 歌单数据异常") else break
-                val data = root["req_1"].asJsonObjectOrNull()?.get("data").asJsonObjectOrNull()
+                val req1 = root["req_1"].asJsonObjectOrNull()
+                    ?: if (offset == 0) error("QQ 歌单数据为空") else break
+                val reqCode = req1["code"].asIntOrNull()
+                if (reqCode != null && reqCode != 0) {
+                    if (offset == 0) error("歌单不存在或暂无访问权限") else break
+                }
+                val data = req1["data"].asJsonObjectOrNull()
                     ?: if (offset == 0) error("QQ 歌单数据为空") else break
 
                 if (firstDir == null) {
@@ -206,25 +214,29 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
                         ?: pageSize
                 }
 
-                val pageSongs = data["songlist"].asJsonArrayOrNull()?.mapNotNull { el ->
-                    runCatching { el.asJsonObjectOrNull()?.let { parseQqSong(it) } }.getOrNull()
-                }.orEmpty()
-                if (pageSongs.isEmpty()) break
+                val rawList = data["songlist"].asJsonArrayOrNull()
+                if (rawList == null || rawList.isEmpty()) break
 
                 var added = 0
-                pageSongs.forEach { t ->
-                    if (seenIds.add(t.id)) {
-                        allTracks.add(t)
+                rawList.forEach { el ->
+                    val parsed = runCatching { el.asJsonObjectOrNull()?.let { parseQqSong(it) } }.getOrNull()
+                    if (parsed != null && seenIds.add(parsed.id)) {
+                        allTracks.add(parsed)
                         added++
                     }
                 }
-                if (added == 0 || pageSongs.size < pageSize) break
-                offset += pageSize
+                offset += rawList.size
+                if (added == 0 || (totalExpected > 0 && offset >= totalExpected)) break
+            }
+
+            val dirTitle = firstDir?.get("title").asNonBlankStringOrNull()
+            if (allTracks.isEmpty() && dirTitle == null) {
+                error("歌单不存在或暂无访问权限")
             }
 
             val meta = OnlinePlaylist(
                 id = id,
-                name = FormatUtils.decodeHtml(firstDir?.get("title").asStringOrNull() ?: "QQ 音乐歌单"),
+                name = FormatUtils.decodeHtml(dirTitle ?: "QQ 音乐歌单"),
                 coverUrl = firstDir?.get("picurl").asStringOrNull().orEmpty().replace("http://", "https://"),
                 author = firstDir?.get("host_nick").asStringOrNull().orEmpty(),
                 playCount = FormatUtils.formatPlayCount(firstDir?.get("listennum").asLongOrNull() ?: 0L),
@@ -237,7 +249,7 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getLeaderboardDetail(board: LeaderboardItem): Result<PlaylistDetailResult> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val payload = buildJsonObject {
                 put("toplist", buildJsonObject {
                     put("module", "musicToplist.ToplistInfoServer")
@@ -263,7 +275,7 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
                 .post(payload.toRequestBody(jsonMediaType))
                 .build()
 
-            val body = httpClient.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
+            val body = httpClient.newCall(req).awaitResponse().use { if (it.isSuccessful) it.body?.string() else null }
                 ?: error("获取 QQ 榜单失败，请检查网络连接")
             val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: error("QQ 榜单数据异常")
             val data = root["toplist"].asJsonObjectOrNull()?.get("data").asJsonObjectOrNull() ?: error("榜单数据为空")
@@ -274,7 +286,7 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
 
             val meta = OnlinePlaylist(
                 id = board.bangId,
-                name = info?.get("title").asStringOrNull() ?: board.name,
+                name = info?.get("title").asNonBlankStringOrNull() ?: board.name,
                 coverUrl = info?.get("frontPicUrl").asStringOrNull().orEmpty().replace("http://", "https://"),
                 author = "QQ 音乐官方榜",
                 playCount = info?.get("updateTime").asStringOrNull().orEmpty(),
@@ -287,51 +299,49 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getLyric(songmid: String): ParsedLyrics = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val req = Request.Builder()
                 .url("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=$songmid&format=json&nobase64=0")
                 .header("Referer", "https://y.qq.com/")
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
                 .build()
-            val body = httpClient.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
-                ?: return@runCatching ParsedLyrics()
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@runCatching ParsedLyrics()
-            val rawLrc = root["lyric"].asStringOrNull()?.let { decodeB64(it) }
-            val rawTrans = root["trans"].asStringOrNull()?.let { decodeB64(it) }
+            val body = httpClient.newCall(req).awaitResponse().use { if (it.isSuccessful) it.body?.string() else null }
+                ?: return@suspendRunCatching ParsedLyrics()
+            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@suspendRunCatching ParsedLyrics()
+            val rawLrc = root["lyric"].asStringOrNull()?.let { decodeB64(it).replace("&#10;", "\n") }
+            val rawTrans = root["trans"].asStringOrNull()?.let { decodeB64(it).replace("&#10;", "\n") }
             LrcParser.parse(rawLrc, rawTrans)
         }.getOrDefault(ParsedLyrics())
     }
 
     private fun decodeB64(str: String): String {
         if (str.isBlank()) return ""
-        return runCatching {
-            String(Base64.decode(str, Base64.DEFAULT), StandardCharsets.UTF_8)
-        }.getOrDefault("")
+        val bytes = LxCrypto.decodeBase64Flexible(str) ?: return ""
+        return String(bytes, StandardCharsets.UTF_8)
     }
 
-    private fun extractPlaylistId(raw: String): String? {
+    internal suspend fun extractPlaylistId(raw: String): String? {
         val trimmed = raw.trim()
         if (trimmed.all { it.isDigit() } && trimmed.isNotEmpty()) return trimmed
 
-        Regex("(?:/playlist/|/playsquare/|[?&]id=)(\\d+)").find(trimmed)?.let {
-            return it.groupValues[1]
-        }
+        val idRegex = Regex("(?:/playlist/|/playsquare/|[?&](?:id|tid|disstid)=)(\\d+)", RegexOption.IGNORE_CASE)
+        idRegex.find(trimmed)?.let { return it.groupValues[1] }
 
-        val urlMatch = Regex("https?://\\S+").find(trimmed)?.value ?: return null
+        val urlMatch = extractFirstHttpUrl(trimmed) ?: return null
         val req = Request.Builder().url(urlMatch).header("User-Agent", "Mozilla/5.0").build()
-        return runCatching {
-            httpClient.newCall(req).execute().use { resp ->
+        return suspendRunCatching {
+            httpClient.newCall(req).awaitResponse().use { resp ->
                 val finalUrl = resp.request.url.toString()
-                Regex("(?:/playlist/|/playsquare/|[?&]id=)(\\d+)").find(finalUrl)?.groupValues?.getOrNull(1)
+                idRegex.find(finalUrl)?.groupValues?.getOrNull(1)
             }
         }.getOrNull()
     }
 
     internal fun parseQqSong(item: JsonObject): Track? {
-        val mid = item["mid"].asStringOrNull() ?: return null
+        val mid = item["mid"].asNonBlankStringOrNull() ?: return null
         val file = item["file"].asJsonObjectOrNull()
-        val mediaMid = file?.get("media_mid").asStringOrNull() ?: mid
-        val title = FormatUtils.decodeHtml(item["title"].asStringOrNull() ?: item["name"].asStringOrNull())
+        val mediaMid = file?.get("media_mid").asNonBlankStringOrNull() ?: mid
+        val title = FormatUtils.decodeHtml(item["title"].asNonBlankStringOrNull() ?: item["name"].asNonBlankStringOrNull())
             .ifBlank { return null }
         val singers = item["singer"].asJsonArrayOrNull()
         val artist = singers?.mapNotNull { it.asJsonObjectOrNull()?.get("name").asStringOrNull() }

@@ -17,6 +17,7 @@ struct OnlinePlaylistDetailView: View {
     @State private var errorMsg: String?
     @State private var isLoading = true
     @State private var retryNonce = 0
+    @State private var isSaved = false
 
     var body: some View {
         Group {
@@ -131,26 +132,28 @@ struct OnlinePlaylistDetailView: View {
                                     .disabled(detail.tracks.isEmpty)
 
                                     Button {
+                                        guard !isSaved else { return }
+                                        isSaved = true
                                         onSaveToLibrary(detail)
                                     } label: {
                                         HStack(spacing: 6) {
-                                            Image(systemName: "bookmark.fill")
-                                            Text("收藏歌单")
+                                            Image(systemName: isSaved ? "checkmark.circle.fill" : "bookmark.fill")
+                                            Text(isSaved ? "已收藏" : "收藏歌单")
                                         }
                                         .font(.system(size: 14, weight: .semibold))
-                                        .foregroundColor(lx.textPrimary)
+                                        .foregroundColor(isSaved ? lx.accent : lx.textPrimary)
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 11)
-                                        .background(lx.surfaceElevated)
+                                        .background(isSaved ? lx.accentSoft : lx.surfaceElevated)
                                         .clipShape(Capsule())
-                                        .overlay(Capsule().stroke(lx.hairline, lineWidth: 0.8))
+                                        .overlay(Capsule().stroke(isSaved ? lx.accent.opacity(0.35) : lx.hairline, lineWidth: 0.8))
                                     }
-                                    .disabled(detail.tracks.isEmpty)
+                                    .disabled(detail.tracks.isEmpty || isSaved)
                                 }
                                 .padding(.horizontal, 18)
                                 .padding(.vertical, 14)
 
-                                ForEach(Array(detail.tracks.enumerated()), id: \.element.id) { idx, track in
+                                ForEach(Array(detail.tracks.enumerated()), id: \.offset) { idx, track in
                                     TrackListRow(
                                         track: track,
                                         index: idx,
@@ -163,10 +166,9 @@ struct OnlinePlaylistDetailView: View {
                                 }
 
                                 Color.clear
-                                    .frame(height: 1)
+                                    .frame(height: bottomInset + (detail.tracks.count >= 15 ? 148 : 0))
                                     .id("online_bottom")
                             }
-                            .padding(.bottom, bottomInset)
                         }
 
                         TrackListFastScrollerOverlay(
@@ -180,10 +182,11 @@ struct OnlinePlaylistDetailView: View {
                                 proxy.scrollTo("online_bottom", anchor: .bottom)
                             },
                             onJumpToIndex: { idx in
-                                proxy.scrollTo(
-                                    "online_track_\(idx)",
-                                    anchor: idx == detail.tracks.count - 1 ? .bottom : .center
-                                )
+                                if idx >= detail.tracks.count - 1 {
+                                    proxy.scrollTo("online_bottom", anchor: .bottom)
+                                } else {
+                                    proxy.scrollTo("online_track_\(idx)", anchor: .center)
+                                }
                             }
                         )
                     }
@@ -194,9 +197,13 @@ struct OnlinePlaylistDetailView: View {
         .navigationTitle(detail?.playlist.name ?? title)
         .navigationBarTitleDisplayMode(.inline)
         .task(id: "\(loadKey)_\(retryNonce)") {
+            let activeKey = "\(loadKey)_\(retryNonce)"
             isLoading = true
+            detail = nil
             errorMsg = nil
+            isSaved = false
             let res = await loadDetail()
+            guard !Task.isCancelled, "\(loadKey)_\(retryNonce)" == activeKey else { return }
             switch res {
             case .success(let loaded):
                 detail = loaded

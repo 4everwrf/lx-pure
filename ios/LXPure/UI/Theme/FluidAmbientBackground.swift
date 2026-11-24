@@ -8,12 +8,15 @@ struct FluidAmbientBackground: View {
     let immersive: Bool
 
     @Environment(\.lxPalette) private var lx
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         if immersive && enabled {
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+            let isPaused = scenePhase != .active || reduceMotion
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: isPaused)) { timeline in
                 let elapsed = timeline.date.timeIntervalSinceReferenceDate
-                let phase = (elapsed.truncatingRemainder(dividingBy: 22.0) / 22.0) * 2.0 * .pi
+                let phase = isPaused ? 0.0 : (elapsed.truncatingRemainder(dividingBy: 22.0) / 22.0) * 2.0 * .pi
                 ambientCanvas(phase: phase)
             }
             .ignoresSafeArea()
@@ -47,14 +50,14 @@ struct FluidAmbientBackground: View {
                     y: h * (0.86 + 0.07 * cos(phase + 1.4))
                 )
 
-                drawOrb(&ctx, center: orb1, radius: w * 1.15, color: palette.primary.opacity(0.78))
-                drawOrb(&ctx, center: orb2, radius: w * 1.05, color: palette.secondary.opacity(0.62))
-                drawOrb(&ctx, center: orb3, radius: w * 0.95, color: palette.accent.opacity(0.34))
+                drawOrb(&ctx, center: orb1, radius: w * 1.15, color: palette.primary.opacity(0.72))
+                drawOrb(&ctx, center: orb2, radius: w * 1.05, color: palette.secondary.opacity(0.58))
+                drawOrb(&ctx, center: orb3, radius: w * 0.95, color: palette.accent.opacity(0.28))
 
                 let scrim = Gradient(colors: [
-                    Color.black.opacity(0.22),
-                    Color.black.opacity(0.32),
-                    Color.black.opacity(0.56)
+                    Color.black.opacity(0.28),
+                    Color.black.opacity(0.38),
+                    Color.black.opacity(0.62)
                 ])
                 ctx.fill(
                     Path(rect),

@@ -1,6 +1,7 @@
 package com.lxpure.music.data.local
 
 import androidx.room.Dao
+import androidx.room.Embedded
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
@@ -29,6 +30,17 @@ interface FavoriteDao {
 interface PlaylistDao {
     @Query("SELECT * FROM playlists ORDER BY createdAt DESC")
     fun observePlaylists(): Flow<List<PlaylistEntity>>
+
+    @Query(
+        """
+        SELECT p.*, COUNT(pt.trackId) AS trackCount
+        FROM playlists p
+        LEFT JOIN playlist_tracks pt ON p.id = pt.playlistId
+        GROUP BY p.id
+        ORDER BY p.createdAt DESC
+        """
+    )
+    fun observePlaylistsWithCounts(): Flow<List<PlaylistWithCountRow>>
 
     @Query("SELECT * FROM playlists WHERE id = :id LIMIT 1")
     suspend fun getById(id: Long): PlaylistEntity?
@@ -66,7 +78,14 @@ interface PlaylistDao {
     @Query("SELECT playlistId, COUNT(*) as count FROM playlist_tracks GROUP BY playlistId")
     fun observeAllTrackCounts(): Flow<List<PlaylistCountTuple>>
 
-    @Query("SELECT playlistId FROM playlist_tracks WHERE trackId = :trackId")
+    @Query(
+        """
+        SELECT pt.playlistId
+        FROM playlist_tracks pt
+        INNER JOIN playlists p ON p.id = pt.playlistId
+        WHERE pt.trackId = :trackId
+        """
+    )
     fun observePlaylistIdsContainingTrack(trackId: String): Flow<List<Long>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -78,6 +97,11 @@ interface PlaylistDao {
     @Query("DELETE FROM playlist_tracks WHERE playlistId = :playlistId")
     suspend fun clearPlaylistTracks(playlistId: Long)
 }
+
+data class PlaylistWithCountRow(
+    @Embedded val playlist: PlaylistEntity,
+    val trackCount: Int
+)
 
 data class PlaylistCountTuple(
     val playlistId: Long,
@@ -94,6 +118,9 @@ interface HistoryDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: HistoryEntity)
+
+    @Query("DELETE FROM play_history WHERE trackId NOT IN (SELECT trackId FROM play_history ORDER BY playedAt DESC LIMIT :keepLimit)")
+    suspend fun pruneOlderThan(keepLimit: Int = 200)
 
     @Query("DELETE FROM play_history")
     suspend fun clear()
@@ -128,6 +155,9 @@ interface DownloadDao {
     @Query("SELECT * FROM downloads WHERE trackId = :trackId LIMIT 1")
     suspend fun getById(trackId: String): DownloadEntity?
 
+    @Query("SELECT * FROM downloads WHERE status IN ('QUEUED', 'DOWNLOADING')")
+    suspend fun getInProgressOnce(): List<DownloadEntity>
+
     @Query("SELECT * FROM downloads WHERE status = 'COMPLETED'")
     suspend fun getCompletedOnce(): List<DownloadEntity>
 
@@ -145,6 +175,9 @@ interface SearchHistoryDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: SearchHistoryEntity)
+
+    @Query("DELETE FROM search_history WHERE query NOT IN (SELECT query FROM search_history ORDER BY timestamp DESC LIMIT :keepLimit)")
+    suspend fun pruneOlderThan(keepLimit: Int = 50)
 
     @Query("DELETE FROM search_history WHERE query = :query")
     suspend fun delete(query: String)

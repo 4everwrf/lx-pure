@@ -22,7 +22,11 @@ final class PlaybackSessionStore: @unchecked Sendable {
     private static let cursorFileName = "playback_cursor_v1.json"
 
     private let baseDir: URL
-    private let ioQueue = DispatchQueue(label: "com.lxpure.playbacksession.io", qos: .utility)
+    private let queueIOQueue = DispatchQueue(label: "com.lxpure.playbacksession.queue", qos: .utility)
+    private let cursorIOQueue = DispatchQueue(label: "com.lxpure.playbacksession.cursor", qos: .userInitiated)
+    private let genLock = NSLock()
+    private var queueWriteGen: UInt64 = 0
+    private var cursorWriteGen: UInt64 = 0
 
     init(baseDirectory: URL? = nil) {
         if let baseDirectory {
@@ -77,8 +81,17 @@ final class PlaybackSessionStore: @unchecked Sendable {
         }
 
         let currentTrack = queue[resolvedIndex]
-        let durationMs = max(cursorSnapshot?.durationMs ?? 0, currentTrack.durationMs, 0)
-        var positionMs = max(cursorSnapshot?.positionMs ?? 0, 0)
+        let trackMatched: Bool = {
+            guard let targetId = cursorSnapshot?.currentTrackId, !targetId.isEmpty else {
+                return true
+            }
+            return currentTrack.id == targetId
+        }()
+
+        let durationMs = trackMatched
+            ? max(cursorSnapshot?.durationMs ?? 0, currentTrack.durationMs, 0)
+            : max(currentTrack.durationMs, 0)
+        var positionMs = trackMatched ? max(cursorSnapshot?.positionMs ?? 0, 0) : 0
         if durationMs > 5_000 && positionMs >= durationMs - 1_500 {
             positionMs = max(durationMs - 2_000, 0)
         } else if durationMs > 0 && positionMs > durationMs {
@@ -92,8 +105,10 @@ final class PlaybackSessionStore: @unchecked Sendable {
             durationMs: durationMs,
             repeatMode: cursorSnapshot?.repeatMode ?? .listLoop,
             queueSource: queueSnapshot?.queueSource,
-            activeQualityBadge: cursorSnapshot?.activeQualityBadge ?? currentTrack.bestQualityBadge,
-            activeProviderName: cursorSnapshot?.activeProviderName
+            activeQualityBadge: trackMatched
+                ? (cursorSnapshot?.activeQualityBadge ?? currentTrack.bestQualityBadge)
+                : currentTrack.bestQualityBadge,
+            activeProviderName: trackMatched ? cursorSnapshot?.activeProviderName : nil
         )
     }
 
@@ -113,40 +128,65 @@ final class PlaybackSessionStore: @unchecked Sendable {
             return
         }
 
-        let (slicedQueue, slicedIndex) = Self.sliceQueueForPersistence(queue, currentIndex: currentIndex)
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let queueSnap = PlaybackQueueSnapshot(
-            version: 1,
-            queue: slicedQueue,
-            queueSource: queueSource,
-            savedAt: now
-        )
-        let cursorSnap = PlaybackCursorSnapshot(
-            version: 1,
-            currentIndex: slicedIndex,
-            currentTrackId: slicedQueue.indices.contains(slicedIndex) ? slicedQueue[slicedIndex].id : nil,
-            positionMs: max(positionMs, 0),
-            durationMs: max(durationMs, 0),
-            repeatMode: repeatMode,
-            activeQualityBadge: activeQualityBadge,
-            activeProviderName: activeProviderName,
-            updatedAt: now
-        )
-
-        guard let queueData = try? JSONEncoder().encode(queueSnap),
-              let cursorData = try? JSONEncoder().encode(cursorSnap) else { return }
-
         let qUrl = queueURL
         let cUrl = cursorURL
-        let work = {
+        let (qGen, cGen) = nextBothGenerations()
+
+        // Compute sliced index cheaply (no array copy) so cursor write stays independent of heavy queue encoding
+        let safeIdx = min(max(currentIndex, 0), queue.count - 1)
+        let slicedIndex: Int
+        if queue.count <= Self.maxPersistedQueueSize {
+            slicedIndex = safeIdx
+        } else {
+            let half = Self.maxPersistedQueueSize / 2
+            var start = max(safeIdx - half, 0)
+            let end = min(start + Self.maxPersistedQueueSize, queue.count)
+            start = max(end - Self.maxPersistedQueueSize, 0)
+            slicedIndex = safeIdx - start
+        }
+        let activeTrackId = queue[safeIdx].id
+
+        let queueWork = {
+            if !self.isLatestQueueGen(qGen) { return }
+            let (slicedQueue, _) = Self.sliceQueueForPersistence(queue, currentIndex: currentIndex)
+            let queueSnap = PlaybackQueueSnapshot(
+                version: 1,
+                queue: slicedQueue,
+                queueSource: queueSource,
+                savedAt: now
+            )
+            guard let queueData = try? JSONEncoder().encode(queueSnap) else { return }
+            if !self.isLatestQueueGen(qGen) { return }
             try? FileManager.default.createDirectory(at: self.baseDir, withIntermediateDirectories: true)
             try? queueData.write(to: qUrl, options: .atomic)
+        }
+
+        let cursorWork = {
+            if !self.isLatestCursorGen(cGen) { return }
+            let cursorSnap = PlaybackCursorSnapshot(
+                version: 1,
+                currentIndex: slicedIndex,
+                currentTrackId: activeTrackId,
+                positionMs: max(positionMs, 0),
+                durationMs: max(durationMs, 0),
+                repeatMode: repeatMode,
+                activeQualityBadge: activeQualityBadge,
+                activeProviderName: activeProviderName,
+                updatedAt: now
+            )
+            guard let cursorData = try? JSONEncoder().encode(cursorSnap) else { return }
+            if !self.isLatestCursorGen(cGen) { return }
+            try? FileManager.default.createDirectory(at: self.baseDir, withIntermediateDirectories: true)
             try? cursorData.write(to: cUrl, options: .atomic)
         }
+
         if synchronous {
-            ioQueue.sync(execute: work)
+            queueIOQueue.sync(execute: queueWork)
+            cursorIOQueue.sync(execute: cursorWork)
         } else {
-            ioQueue.async(execute: work)
+            queueIOQueue.async(execute: queueWork)
+            cursorIOQueue.async(execute: cursorWork)
         }
     }
 
@@ -161,50 +201,108 @@ final class PlaybackSessionStore: @unchecked Sendable {
         synchronous: Bool = false
     ) {
         guard currentIndex >= 0, let trackId = currentTrackId, !trackId.isEmpty else { return }
-        let cursorSnap = PlaybackCursorSnapshot(
-            version: 1,
-            currentIndex: currentIndex,
-            currentTrackId: trackId,
-            positionMs: max(positionMs, 0),
-            durationMs: max(durationMs, 0),
-            repeatMode: repeatMode,
-            activeQualityBadge: activeQualityBadge,
-            activeProviderName: activeProviderName,
-            updatedAt: Int64(Date().timeIntervalSince1970 * 1000)
-        )
-        guard let cursorData = try? JSONEncoder().encode(cursorSnap) else { return }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
         let cUrl = cursorURL
+        let cGen = nextCursorGeneration()
+
         let work = {
+            if !self.isLatestCursorGen(cGen) { return }
+            let cursorSnap = PlaybackCursorSnapshot(
+                version: 1,
+                currentIndex: currentIndex,
+                currentTrackId: trackId,
+                positionMs: max(positionMs, 0),
+                durationMs: max(durationMs, 0),
+                repeatMode: repeatMode,
+                activeQualityBadge: activeQualityBadge,
+                activeProviderName: activeProviderName,
+                updatedAt: now
+            )
+            guard let cursorData = try? JSONEncoder().encode(cursorSnap) else { return }
+            if !self.isLatestCursorGen(cGen) { return }
             try? FileManager.default.createDirectory(at: self.baseDir, withIntermediateDirectories: true)
             try? cursorData.write(to: cUrl, options: .atomic)
         }
         if synchronous {
-            ioQueue.sync(execute: work)
+            cursorIOQueue.sync(execute: work)
         } else {
-            ioQueue.async(execute: work)
+            cursorIOQueue.async(execute: work)
         }
     }
 
     func loadSession() -> RestoredPlaybackSession? {
-        ioQueue.sync {
-            let queueSnap: PlaybackQueueSnapshot? = readJson(at: queueURL)
-            let cursorSnap: PlaybackCursorSnapshot? = readJson(at: cursorURL)
-            return Self.resolveRestoredSession(queueSnapshot: queueSnap, cursorSnapshot: cursorSnap)
+        let queueSnap: PlaybackQueueSnapshot? = queueIOQueue.sync {
+            readJson(at: queueURL)
+        }
+        let cursorSnap: PlaybackCursorSnapshot? = cursorIOQueue.sync {
+            readJson(at: cursorURL)
+        }
+        return Self.resolveRestoredSession(queueSnapshot: queueSnap, cursorSnapshot: cursorSnap)
+    }
+
+    func loadSessionAsync() async -> RestoredPlaybackSession? {
+        await withCheckedContinuation { continuation in
+            queueIOQueue.async {
+                let queueSnap: PlaybackQueueSnapshot? = self.readJson(at: self.queueURL)
+                self.cursorIOQueue.async {
+                    let cursorSnap: PlaybackCursorSnapshot? = self.readJson(at: self.cursorURL)
+                    continuation.resume(returning: Self.resolveRestoredSession(queueSnapshot: queueSnap, cursorSnapshot: cursorSnap))
+                }
+            }
         }
     }
 
     func clear(synchronous: Bool = false) {
         let qUrl = queueURL
         let cUrl = cursorURL
-        let work = {
+        let (qGen, cGen) = nextBothGenerations()
+        let queueWork = {
+            if !self.isLatestQueueGen(qGen) { return }
             try? FileManager.default.removeItem(at: qUrl)
+        }
+        let cursorWork = {
+            if !self.isLatestCursorGen(cGen) { return }
             try? FileManager.default.removeItem(at: cUrl)
         }
         if synchronous {
-            ioQueue.sync(execute: work)
+            queueIOQueue.sync(execute: queueWork)
+            cursorIOQueue.sync(execute: cursorWork)
         } else {
-            ioQueue.async(execute: work)
+            queueIOQueue.async(execute: queueWork)
+            cursorIOQueue.async(execute: cursorWork)
         }
+    }
+
+    func flush() {
+        queueIOQueue.sync {}
+        cursorIOQueue.sync {}
+    }
+
+    private func nextBothGenerations() -> (UInt64, UInt64) {
+        genLock.lock()
+        defer { genLock.unlock() }
+        queueWriteGen &+= 1
+        cursorWriteGen &+= 1
+        return (queueWriteGen, cursorWriteGen)
+    }
+
+    private func nextCursorGeneration() -> UInt64 {
+        genLock.lock()
+        defer { genLock.unlock() }
+        cursorWriteGen &+= 1
+        return cursorWriteGen
+    }
+
+    private func isLatestQueueGen(_ gen: UInt64) -> Bool {
+        genLock.lock()
+        defer { genLock.unlock() }
+        return queueWriteGen == gen
+    }
+
+    private func isLatestCursorGen(_ gen: UInt64) -> Bool {
+        genLock.lock()
+        defer { genLock.unlock() }
+        return cursorWriteGen == gen
     }
 
     private func readJson<T: Decodable>(at url: URL) -> T? {

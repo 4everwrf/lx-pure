@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct AlbumArtworkView: View {
     let url: String?
@@ -31,13 +32,15 @@ struct AlbumArtworkView: View {
                 .stroke(lx.hairline, lineWidth: 0.6)
         )
         .task(id: "\(url ?? "")_\(isThumbnail)") {
-            if let key = optimizeCoverUrlForSize(url, isThumbnail: isThumbnail),
-               let cached = ImageMemoryCache.shared.cachedImage(for: key) {
+            let expectedId = "\(url ?? "")_\(isThumbnail)"
+            if let cached = ImageMemoryCache.shared.cachedImage(for: url, isThumbnail: isThumbnail) {
                 loadedImage = cached
                 return
             }
             loadedImage = nil
-            loadedImage = await ImageMemoryCache.shared.loadImage(from: url, isThumbnail: isThumbnail)
+            let img = await ImageMemoryCache.shared.loadImage(from: url, isThumbnail: isThumbnail)
+            guard !Task.isCancelled, "\(url ?? "")_\(isThumbnail)" == expectedId else { return }
+            loadedImage = img
         }
     }
 }
@@ -83,9 +86,12 @@ struct MiniEqualizerIndicator: View {
     let isPlaying: Bool
     let color: Color
 
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        if isPlaying {
-            TimelineView(.animation(minimumInterval: 0.12)) { timeline in
+        if isPlaying && scenePhase == .active && !reduceMotion {
+            TimelineView(.animation(minimumInterval: 0.12, paused: scenePhase != .active || reduceMotion)) { timeline in
                 let t = timeline.date.timeIntervalSinceReferenceDate * 6.0
                 HStack(alignment: .bottom, spacing: 2) {
                     bar(height: 5 + 9 * abs(sin(t)))
@@ -154,7 +160,7 @@ struct TrackListRow: View {
                     SmallPillBadge(
                         text: track.source.shortLabel,
                         color: lx.textSecondary,
-                        background: lx.surfaceElevated
+                        background: lx.hairline
                     )
                     Text(track.album.isEmpty ? track.artist : "\(track.artist) · \(track.album)")
                         .font(.system(size: 12))
@@ -182,6 +188,7 @@ struct TrackListRow: View {
 
 struct FloatingMiniPlayer: View {
     let state: PlayerState
+    @ObservedObject var progress: PlaybackProgressModel
     let onTap: () -> Void
     let onTogglePlayPause: () -> Void
     let onNext: () -> Void
@@ -189,12 +196,13 @@ struct FloatingMiniPlayer: View {
     let onOpenQueue: () -> Void
 
     @Environment(\.lxPalette) private var lx
-    @State private var dragOffsetX: CGFloat = 0
+    @GestureState private var dragOffsetX: CGFloat = 0
 
     var body: some View {
         if let track = state.currentTrack {
-            let progress = state.durationMs > 0
-                ? min(max(Double(state.positionMs) / Double(state.durationMs), 0), 1)
+            let effectiveDuration = max(progress.durationMs, state.durationMs)
+            let progressRatio = effectiveDuration > 0
+                ? min(max(Double(progress.positionMs) / Double(effectiveDuration), 0), 1)
                 : 0
 
             VStack(spacing: 0) {
@@ -244,7 +252,7 @@ struct FloatingMiniPlayer: View {
                         Rectangle().fill(lx.hairline)
                         Rectangle()
                             .fill(lx.accent)
-                            .frame(width: geo.size.width * progress)
+                            .frame(width: geo.size.width * progressRatio)
                     }
                 }
                 .frame(height: 2)
@@ -258,24 +266,23 @@ struct FloatingMiniPlayer: View {
             )
             .shadow(color: Color.black.opacity(lx.isDark ? 0.35 : 0.10), radius: 12, y: 4)
             .offset(x: dragOffsetX * 0.28)
+            .animation(.spring(response: 0.3, dampingFraction: 0.78), value: dragOffsetX)
             .contentShape(Rectangle())
             .onTapGesture(perform: onTap)
             .gesture(
                 DragGesture(minimumDistance: 16)
-                    .onChanged { value in
+                    .updating($dragOffsetX) { value, state, _ in
                         if abs(value.translation.width) > abs(value.translation.height) {
-                            dragOffsetX = value.translation.width
+                            state = value.translation.width
                         }
                     }
                     .onEnded { value in
+                        guard abs(value.translation.width) > abs(value.translation.height) else { return }
                         let threshold: CGFloat = 55
                         if value.translation.width < -threshold {
                             onNext()
                         } else if value.translation.width > threshold {
                             onPrevious()
-                        }
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                            dragOffsetX = 0
                         }
                     }
             )
@@ -318,43 +325,45 @@ struct TrackActionSheetView: View {
 
             Divider().overlay(lx.hairline)
 
-            VStack(spacing: 2) {
-                sheetRow(icon: "text.insert", title: "下一首播放") {
-                    dismiss(); onPlayNext()
-                }
-                sheetRow(icon: "text.append", title: "加入播放队列") {
-                    dismiss(); onAddToQueue()
-                }
-                sheetRow(
-                    icon: isFavorite ? "heart.fill" : "heart",
-                    title: isFavorite ? "取消喜欢" : "添加到我喜欢的",
-                    tint: isFavorite ? lx.danger : lx.textPrimary
-                ) {
-                    dismiss(); onToggleFavorite()
-                }
-                sheetRow(icon: "text.badge.plus", title: "添加到歌单") {
-                    onAddToPlaylist()
-                    dismiss()
-                }
-                if !track.isLocal {
+            ScrollView {
+                VStack(spacing: 2) {
+                    sheetRow(icon: "text.insert", title: "下一首播放") {
+                        dismiss(); onPlayNext()
+                    }
+                    sheetRow(icon: "text.append", title: "加入播放队列") {
+                        dismiss(); onAddToQueue()
+                    }
                     sheetRow(
-                        icon: isDownloaded ? "checkmark.circle.fill" : "arrow.down.circle",
-                        title: isDownloaded ? "已离线保存" : "离线下载",
-                        tint: isDownloaded ? lx.success : lx.textPrimary
+                        icon: isFavorite ? "heart.fill" : "heart",
+                        title: isFavorite ? "取消喜欢" : "添加到我喜欢的",
+                        tint: isFavorite ? lx.danger : lx.textPrimary
                     ) {
-                        dismiss(); onDownload()
+                        dismiss(); onToggleFavorite()
+                    }
+                    sheetRow(icon: "text.badge.plus", title: "添加到歌单") {
+                        onAddToPlaylist()
+                        dismiss()
+                    }
+                    if !track.isLocal {
+                        sheetRow(
+                            icon: isDownloaded ? "checkmark.circle.fill" : "arrow.down.circle",
+                            title: isDownloaded ? "已离线保存" : "离线下载",
+                            tint: isDownloaded ? lx.success : lx.textPrimary
+                        ) {
+                            dismiss(); onDownload()
+                        }
+                    }
+                    if let onRemoveFromPlaylist {
+                        sheetRow(icon: "trash", title: "从当前歌单移除", tint: lx.danger) {
+                            dismiss(); onRemoveFromPlaylist()
+                        }
                     }
                 }
-                if let onRemoveFromPlaylist {
-                    sheetRow(icon: "trash", title: "从当前歌单移除", tint: lx.danger) {
-                        dismiss(); onRemoveFromPlaylist()
-                    }
-                }
+                .padding(.vertical, 8)
             }
-            .padding(.vertical, 8)
-            Spacer(minLength: 12)
         }
-        .background(lx.surface)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(lx.surface.ignoresSafeArea())
     }
 
     private func sheetRow(icon: String, title: String, tint: Color? = nil, action: @escaping () -> Void) -> some View {
@@ -391,6 +400,7 @@ struct AddToPlaylistSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var newName: String = ""
     @State private var showCreate = false
+    @State private var hasSubmitted = false
 
     private var isAtCustomLimit: Bool {
         customPlaylistCount >= maxCustomPlaylists
@@ -410,6 +420,7 @@ struct AddToPlaylistSheetView: View {
                             .foregroundColor(lx.textSecondary)
                             .lineLimit(1)
                     }
+                    .listRowBackground(lx.surface)
 
                     if isAtCustomLimit {
                         Button {
@@ -422,17 +433,23 @@ struct AddToPlaylistSheetView: View {
                             )
                             .foregroundColor(lx.textTertiary)
                         }
+                        .listRowBackground(lx.surface)
                     } else if showCreate {
                         HStack {
                             TextField("输入新歌单名称", text: $newName)
+                                .foregroundColor(lx.textPrimary)
                             Button("创建") {
                                 let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-                                guard !trimmed.isEmpty else { return }
+                                guard !hasSubmitted, !trimmed.isEmpty else { return }
+                                hasSubmitted = true
                                 onCreateAndAdd(trimmed)
                                 dismiss()
                             }
-                            .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .buttonStyle(.borderless)
+                            .foregroundColor(lx.accent)
+                            .disabled(hasSubmitted || newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
+                        .listRowBackground(lx.surface)
                     } else {
                         Button {
                             showCreate = true
@@ -443,6 +460,7 @@ struct AddToPlaylistSheetView: View {
                             )
                             .foregroundColor(lx.accent)
                         }
+                        .listRowBackground(lx.surface)
                     }
                 }
 
@@ -450,11 +468,14 @@ struct AddToPlaylistSheetView: View {
                     if playlists.isEmpty {
                         Text("暂无歌单，点击上方新建（最多自建 \(maxCustomPlaylists) 个）")
                             .foregroundColor(lx.textSecondary)
+                            .listRowBackground(lx.surface)
                     } else {
                         ForEach(playlists) { pl in
                             let alreadyIn = containedPlaylistIds.contains(pl.id)
                             let isExternal = !LibraryStore.isCustomPlaylist(sourceUrl: pl.sourceUrl)
                             Button {
+                                guard !hasSubmitted else { return }
+                                hasSubmitted = true
                                 onSelectPlaylist(pl)
                                 dismiss()
                             } label: {
@@ -470,7 +491,7 @@ struct AddToPlaylistSheetView: View {
                                                 SmallPillBadge(
                                                     text: "外部导入",
                                                     color: lx.textSecondary,
-                                                    background: lx.surfaceElevated
+                                                    background: lx.hairline
                                                 )
                                             }
                                         }
@@ -494,10 +515,13 @@ struct AddToPlaylistSheetView: View {
                                     }
                                 }
                             }
+                            .listRowBackground(lx.surface)
                         }
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(lx.background)
             .navigationTitle("添加到歌单")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -557,7 +581,7 @@ struct TrackListFastScrollerOverlay: View {
     let onJumpToIndex: (Int) -> Void
 
     @Environment(\.lxPalette) private var lx
-    @State private var isDragging = false
+    @GestureState private var isDragging = false
     @State private var dragFraction: Double = 0
     @State private var lastScrubIndex: Int = -1
 
@@ -576,7 +600,7 @@ struct TrackListFastScrollerOverlay: View {
                                 Capsule()
                                     .fill(lx.hairline)
                                     .frame(width: 3, height: barHeight)
-                                    .padding(.trailing, 7)
+                                    .padding(.trailing, 5)
 
                                 Text("#\(activeIdx + 1) / \(trackCount)")
                                     .font(.system(size: 12, weight: .bold).monospacedDigit())
@@ -588,21 +612,23 @@ struct TrackListFastScrollerOverlay: View {
                                     .clipShape(Capsule())
                                     .overlay(Capsule().stroke(lx.accent.opacity(0.45), lineWidth: 0.8))
                                     .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
-                                    .offset(x: -36, y: max(thumbOffset + 4, 0))
+                                    .offset(x: -30, y: max(thumbOffset + 4, 0))
                             }
 
                             Capsule()
                                 .fill(isDragging ? lx.accent : lx.textTertiary.opacity(0.45))
                                 .frame(width: isDragging ? 7 : 5, height: thumbHeight)
-                                .padding(.trailing, 5)
+                                .padding(.trailing, 3)
                                 .offset(y: thumbOffset)
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                         .contentShape(Rectangle())
                         .gesture(
-                            DragGesture(minimumDistance: 0)
+                            DragGesture(minimumDistance: 6)
+                                .updating($isDragging) { _, state, _ in
+                                    state = true
+                                }
                                 .onChanged { value in
-                                    isDragging = true
                                     let fraction = min(max(Double(value.location.y / barHeight), 0), 1)
                                     dragFraction = fraction
                                     let idx = TrackListScrollHelper.targetIndex(forFraction: fraction, trackCount: trackCount)
@@ -612,12 +638,12 @@ struct TrackListFastScrollerOverlay: View {
                                     }
                                 }
                                 .onEnded { _ in
-                                    isDragging = false
                                     lastScrubIndex = -1
                                 }
                         )
                     }
-                    .frame(width: 28)
+                    // Keep inactive strip strictly in outer 16pt so it never overlaps TrackListRow's ellipsis button
+                    .frame(width: isDragging ? 28 : 16)
                     .padding(.top, 12)
                     .padding(.bottom, bottomInset + 148)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)

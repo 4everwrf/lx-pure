@@ -2,33 +2,63 @@ import Foundation
 
 enum LrcParser {
     private static let timeTagRegex = try! NSRegularExpression(
-        pattern: "\\[(\\d{1,3}):(\\d{1,2})(?:\\.(\\d{1,3}))?\\]",
+        pattern: "\\[(\\d{1,3}):(\\d{1,2})(?:[.:](\\d+))?\\]",
         options: []
+    )
+    private static let offsetTagRegex = try! NSRegularExpression(
+        pattern: "^\\[offset:([+-]?\\d+)\\]$",
+        options: [.caseInsensitive]
     )
     private static let yrcLineRegex = try! NSRegularExpression(
         pattern: "^\\[(\\d+),\\d+\\]",
         options: []
     )
     private static let yrcWordRegex = try! NSRegularExpression(
-        pattern: "\\(\\d+,\\d+,\\d+\\)",
+        pattern: "\\(-?\\d+,-?\\d+(?:,-?\\d+)?\\)",
         options: []
     )
 
     static func parse(_ rawLrc: String?, translation rawTranslation: String? = nil) -> ParsedLyrics {
-        let primary = parseSingle(rawLrc)
+        let (primary, primaryOffsetMs) = parseSingle(rawLrc)
         if primary.isEmpty { return ParsedLyrics() }
 
-        let translations = parseSingle(rawTranslation)
+        // Inherit primary [offset:] when translation track omits its own [offset:] tag
+        let (rawTranslations, _) = parseSingle(rawTranslation, defaultOffsetMs: primaryOffsetMs)
+        let translations = rawTranslations.filter {
+            let trimmed = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty && trimmed != "//"
+        }
         if translations.isEmpty {
-            return ParsedLyrics(lines: primary, hasTranslation: false)
+            let indexed = primary.enumerated().map { idx, line in
+                LyricLine(timeMs: line.timeMs, text: line.text, translation: nil, lineIndex: idx)
+            }
+            return ParsedLyrics(lines: indexed, hasTranslation: false)
         }
 
-        let merged: [LyricLine] = primary.map { line in
-            let best = translations.min { abs($0.timeMs - line.timeMs) < abs($1.timeMs - line.timeMs) }
-            let matched = (best != nil && abs(best!.timeMs - line.timeMs) <= 450 && !best!.text.trimmingCharacters(in: .whitespaces).isEmpty)
-                ? best?.text
-                : nil
-            return LyricLine(timeMs: line.timeMs, text: line.text, translation: matched)
+        // 1-to-1 nearest matching avoids bleeding a single translation onto adjacent lines
+        var usedTrans = Set<Int>()
+        var merged: [LyricLine] = []
+        merged.reserveCapacity(primary.count)
+
+        for (idx, line) in primary.enumerated() {
+            var bestIdx = -1
+            var bestDiff = Int64.max
+            for i in translations.indices {
+                if usedTrans.contains(i) { continue }
+                let diff = abs(translations[i].timeMs - line.timeMs)
+                if diff <= 450 && diff < bestDiff {
+                    bestDiff = diff
+                    bestIdx = i
+                }
+            }
+            let matched: String?
+            if bestIdx >= 0 {
+                usedTrans.insert(bestIdx)
+                matched = translations[bestIdx].text
+            } else {
+                matched = nil
+            }
+            merged.append(LyricLine(timeMs: line.timeMs, text: line.text, translation: matched, lineIndex: idx))
         }
 
         return ParsedLyrics(
@@ -37,16 +67,33 @@ enum LrcParser {
         )
     }
 
-    private static func parseSingle(_ raw: String?) -> [LyricLine] {
-        guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+    private static func parseSingle(_ raw: String?, defaultOffsetMs: Int64 = 0) -> ([LyricLine], Int64) {
+        guard var raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return ([], defaultOffsetMs) }
+        if raw.unicodeScalars.first == "\u{FEFF}" {
+            raw = String(raw.unicodeScalars.dropFirst())
+        }
         var result: [LyricLine] = []
+        var offsetMs: Int64 = defaultOffsetMs
 
-        for rawLine in raw.replacingOccurrences(of: "\r", with: "").components(separatedBy: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedRaw = raw.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        for rawLine in normalizedRaw.components(separatedBy: "\n") {
+            var line = rawLine
+            if line.unicodeScalars.first == "\u{FEFF}" {
+                line = String(line.unicodeScalars.dropFirst())
+            }
+            line = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("{\"") { continue }
 
             let nsLine = line as NSString
             let fullRange = NSRange(location: 0, length: nsLine.length)
+
+            if let offsetMatch = offsetTagRegex.firstMatch(in: line, options: [], range: fullRange),
+               offsetMatch.numberOfRanges > 1 {
+                offsetMs = Int64(nsLine.substring(with: offsetMatch.range(at: 1))) ?? 0
+                continue
+            }
 
             // Support NetEase YRC `[startMs,duration](word...)` lines
             if let yrcMatch = yrcLineRegex.firstMatch(in: line, options: [], range: fullRange),
@@ -54,14 +101,16 @@ enum LrcParser {
                 let timeStr = nsLine.substring(with: yrcMatch.range(at: 1))
                 guard let timeMs = Int64(timeStr) else { continue }
                 let remainder = nsLine.substring(from: yrcMatch.range.location + yrcMatch.range.length)
-                let cleaned = yrcWordRegex.stringByReplacingMatches(
-                    in: remainder,
-                    options: [],
-                    range: NSRange(location: 0, length: (remainder as NSString).length),
-                    withTemplate: ""
-                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                let cleaned = FormatUtils.decodeHtml(
+                    yrcWordRegex.stringByReplacingMatches(
+                        in: remainder,
+                        options: [],
+                        range: NSRange(location: 0, length: (remainder as NSString).length),
+                        withTemplate: ""
+                    ).trimmingCharacters(in: .whitespacesAndNewlines)
+                )
                 if !cleaned.isEmpty {
-                    result.append(LyricLine(timeMs: timeMs, text: FormatUtils.decodeHtml(cleaned)))
+                    result.append(LyricLine(timeMs: max(timeMs - offsetMs, 0), text: cleaned))
                 }
                 continue
             }
@@ -69,12 +118,14 @@ enum LrcParser {
             let matches = timeTagRegex.matches(in: line, options: [], range: fullRange)
             if matches.isEmpty { continue }
 
-            let text = timeTagRegex.stringByReplacingMatches(
-                in: line,
-                options: [],
-                range: fullRange,
-                withTemplate: ""
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = FormatUtils.decodeHtml(
+                timeTagRegex.stringByReplacingMatches(
+                    in: line,
+                    options: [],
+                    range: fullRange,
+                    withTemplate: ""
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+            )
             if text.isEmpty { continue }
 
             for m in matches {
@@ -93,15 +144,11 @@ enum LrcParser {
                 case 2: ms = (Int64(fracRaw) ?? 0) * 10
                 default: ms = Int64(String(fracRaw.prefix(3))) ?? 0
                 }
-                result.append(
-                    LyricLine(
-                        timeMs: minVal * 60_000 + secVal * 1_000 + ms,
-                        text: FormatUtils.decodeHtml(text)
-                    )
-                )
+                let shifted = max(minVal * 60_000 + secVal * 1_000 + ms - offsetMs, 0)
+                result.append(LyricLine(timeMs: shifted, text: text))
             }
         }
 
-        return result.sorted { $0.timeMs < $1.timeMs }
+        return (result.sorted { $0.timeMs < $1.timeMs }, offsetMs)
     }
 }

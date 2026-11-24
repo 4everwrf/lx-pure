@@ -43,8 +43,8 @@ struct QueueSheetView: View {
                     }
                     if !queue.isEmpty {
                         Button("清空队列", role: .destructive) {
-                            onClearQueue()
                             dismiss()
+                            onClearQueue()
                         }
                         .font(.system(size: 13))
                         .foregroundColor(lx.danger)
@@ -95,6 +95,9 @@ struct QueueSheetView: View {
                                         }
                                         Spacer()
                                         Button {
+                                            if queue.count <= 1 {
+                                                dismiss()
+                                            }
                                             onRemoveIndex(idx)
                                         } label: {
                                             Image(systemName: "xmark")

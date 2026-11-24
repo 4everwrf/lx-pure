@@ -1,6 +1,8 @@
 package com.lxpure.music.data.local
 
+import android.util.Log
 import androidx.room.Entity
+import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
 import com.lxpure.music.domain.model.AudioQuality
@@ -12,7 +14,14 @@ import kotlinx.serialization.json.Json
 internal val roomJson = Json {
     ignoreUnknownKeys = true
     encodeDefaults = true
+    coerceInputValues = true
+    isLenient = true
 }
+
+internal fun decodeTrackOrNull(trackJson: String, sourceTag: String): Track? =
+    runCatching { roomJson.decodeFromString<Track>(trackJson) }
+        .onFailure { runCatching { Log.w("RoomEntity", "Skipping corrupt track JSON in $sourceTag: ${it.message}") } }
+        .getOrNull()
 
 @Entity(tableName = "favorites")
 data class FavoriteEntity(
@@ -20,7 +29,7 @@ data class FavoriteEntity(
     val trackJson: String,
     val addedAt: Long = System.currentTimeMillis()
 ) {
-    fun toTrack(): Track = roomJson.decodeFromString(trackJson)
+    fun toTrackOrNull(): Track? = decodeTrackOrNull(trackJson, "favorites/$trackId")
 
     companion object {
         fun fromTrack(track: Track) = FavoriteEntity(
@@ -43,7 +52,18 @@ data class PlaylistEntity(
 @Entity(
     tableName = "playlist_tracks",
     primaryKeys = ["playlistId", "trackId"],
-    indices = [Index(value = ["playlistId"])]
+    foreignKeys = [
+        ForeignKey(
+            entity = PlaylistEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["playlistId"],
+            onDelete = ForeignKey.CASCADE
+        )
+    ],
+    indices = [
+        Index(value = ["playlistId"]),
+        Index(value = ["trackId"])
+    ]
 )
 data class PlaylistTrackEntity(
     val playlistId: Long,
@@ -52,7 +72,7 @@ data class PlaylistTrackEntity(
     val position: Int,
     val addedAt: Long = System.currentTimeMillis()
 ) {
-    fun toTrack(): Track = roomJson.decodeFromString(trackJson)
+    fun toTrackOrNull(): Track? = decodeTrackOrNull(trackJson, "playlist_tracks/$playlistId/$trackId")
 }
 
 @Entity(tableName = "play_history")
@@ -62,7 +82,7 @@ data class HistoryEntity(
     val playedAt: Long = System.currentTimeMillis(),
     val playCount: Int = 1
 ) {
-    fun toTrack(): Track = roomJson.decodeFromString(trackJson)
+    fun toTrackOrNull(): Track? = decodeTrackOrNull(trackJson, "play_history/$trackId")
 }
 
 @Entity(tableName = "user_apis")
@@ -92,7 +112,11 @@ data class DownloadEntity(
     val errorMessage: String?,
     val updatedAt: Long = System.currentTimeMillis()
 ) {
-    fun toTrack(): Track = roomJson.decodeFromString<Track>(trackJson).copy(cachedFilePath = filePath)
+    fun toTrackOrNull(): Track? {
+        val completedPath = filePath.takeIf { status == DownloadStatus.COMPLETED.name }
+        return decodeTrackOrNull(trackJson, "downloads/$trackId")?.copy(cachedFilePath = completedPath)
+    }
+
     fun toQuality(): AudioQuality = AudioQuality.fromLxType(quality)
     fun toStatus(): DownloadStatus = runCatching { DownloadStatus.valueOf(status) }.getOrDefault(DownloadStatus.FAILED)
 }

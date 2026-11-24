@@ -10,7 +10,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
+import androidx.compose.runtime.State
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -23,6 +25,7 @@ import kotlin.math.sin
 /**
  * Fluid ambient mesh gradient background inspired by Apple Music / Salt Player.
  * Smoothly crossfades album cover colors with subtle organic breathing drift.
+ * Reads animation state strictly inside the Draw phase to avoid 60–120 FPS recompositions.
  */
 @Composable
 fun FluidAmbientBackground(
@@ -34,27 +37,34 @@ fun FluidAmbientBackground(
     val lxColors = LocalLxColors.current
     val baseColor = if (immersive) Color(0xFF090B10) else lxColors.background
 
-    val primary by animateColorAsState(
+    if (!enabled) {
+        Canvas(modifier = modifier.fillMaxSize()) {
+            drawRect(color = baseColor)
+        }
+        return
+    }
+
+    val primaryState = animateColorAsState(
         targetValue = palette.primary,
         animationSpec = tween(durationMillis = 900),
         label = "ambientPrimary"
     )
-    val secondary by animateColorAsState(
+    val secondaryState = animateColorAsState(
         targetValue = palette.secondary,
         animationSpec = tween(durationMillis = 900),
         label = "ambientSecondary"
     )
-    val accent by animateColorAsState(
+    val accentState = animateColorAsState(
         targetValue = palette.accent,
         animationSpec = tween(durationMillis = 900),
         label = "ambientAccent"
     )
 
     // Only run continuous drift animation inside the active full-screen player;
-    // keeps Home/Discover/Search static at 0 extra GPU redraws per second.
-    val phase = if (immersive && enabled) {
+    // keep State<Float> unread in composition so only Canvas draw invalidates per frame.
+    val phaseState: State<Float> = if (immersive) {
         val transition = rememberInfiniteTransition(label = "fluidDrift")
-        val animatedPhase by transition.animateFloat(
+        transition.animateFloat(
             initialValue = 0f,
             targetValue = (2f * PI).toFloat(),
             animationSpec = infiniteRepeatable(
@@ -63,19 +73,32 @@ fun FluidAmbientBackground(
             ),
             label = "fluidPhase"
         )
-        animatedPhase
     } else {
-        0f
+        remember { mutableFloatStateOf(0f) }
     }
+
+    val immersiveScrim = remember {
+        Brush.verticalGradient(
+            colors = listOf(
+                Color.Black.copy(alpha = 0.28f),
+                Color.Black.copy(alpha = 0.38f),
+                Color.Black.copy(alpha = 0.62f)
+            )
+        )
+    }
+    val nonImmersiveAlpha = if (lxColors.isDark) 0.24f else 0.12f
 
     Canvas(modifier = modifier.fillMaxSize()) {
         drawRect(color = baseColor)
-        if (!enabled) return@Canvas
 
         val w = size.width
         val h = size.height
+        val primary = primaryState.value
+        val secondary = secondaryState.value
+        val accent = accentState.value
 
         if (immersive) {
+            val phase = phaseState.value
             val orb1 = Offset(
                 x = w * (0.24f + 0.14f * cos(phase)),
                 y = h * (0.20f + 0.08f * sin(phase))
@@ -91,7 +114,7 @@ fun FluidAmbientBackground(
 
             drawCircle(
                 brush = Brush.radialGradient(
-                    colors = listOf(primary.copy(alpha = 0.78f), Color.Transparent),
+                    colors = listOf(primary.copy(alpha = 0.72f), Color.Transparent),
                     center = orb1,
                     radius = w * 1.15f
                 ),
@@ -100,7 +123,7 @@ fun FluidAmbientBackground(
             )
             drawCircle(
                 brush = Brush.radialGradient(
-                    colors = listOf(secondary.copy(alpha = 0.62f), Color.Transparent),
+                    colors = listOf(secondary.copy(alpha = 0.58f), Color.Transparent),
                     center = orb2,
                     radius = w * 1.05f
                 ),
@@ -109,31 +132,21 @@ fun FluidAmbientBackground(
             )
             drawCircle(
                 brush = Brush.radialGradient(
-                    colors = listOf(accent.copy(alpha = 0.34f), Color.Transparent),
+                    colors = listOf(accent.copy(alpha = 0.30f), Color.Transparent),
                     center = orb3,
                     radius = w * 0.95f
                 ),
                 center = orb3,
                 radius = w * 0.95f
             )
-            // Soft dark scrim to keep white text and lyrics effortlessly legible
-            drawRect(
-                brush = Brush.verticalGradient(
-                    colors = listOf(
-                        Color.Black.copy(alpha = 0.22f),
-                        Color.Black.copy(alpha = 0.32f),
-                        Color.Black.copy(alpha = 0.56f)
-                    )
-                )
-            )
+            // Soft dark scrim to keep white text and lyrics effortlessly legible even on bright covers
+            drawRect(brush = immersiveScrim)
         } else {
-            // Subtle top ambient wash for main screens
-            val alphaScale = if (lxColors.isDark) 0.24f else 0.12f
             val topOrb = Offset(w * 0.22f, h * 0.04f)
             val sideOrb = Offset(w * 0.88f, h * 0.12f)
             drawCircle(
                 brush = Brush.radialGradient(
-                    colors = listOf(primary.copy(alpha = alphaScale), Color.Transparent),
+                    colors = listOf(primary.copy(alpha = nonImmersiveAlpha), Color.Transparent),
                     center = topOrb,
                     radius = w * 0.9f
                 ),
@@ -142,7 +155,7 @@ fun FluidAmbientBackground(
             )
             drawCircle(
                 brush = Brush.radialGradient(
-                    colors = listOf(accent.copy(alpha = alphaScale * 0.7f), Color.Transparent),
+                    colors = listOf(accent.copy(alpha = nonImmersiveAlpha * 0.7f), Color.Transparent),
                     center = sideOrb,
                     radius = w * 0.75f
                 ),

@@ -1,10 +1,11 @@
 package com.lxpure.music.core.musicsdk
 
-import android.util.Base64
 import com.lxpure.music.core.userapi.LxCrypto
 import java.nio.charset.StandardCharsets
 import java.security.KeyFactory
 import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
+import java.util.Locale
 import javax.crypto.Cipher
 import kotlin.random.Random
 
@@ -51,21 +52,21 @@ object NetEaseCrypto {
             iv = iv,
             mode = "AES/CBC/PKCS5Padding"
         )
-        val firstB64 = Base64.encodeToString(firstEnc, Base64.NO_WRAP)
+        val firstB64 = Base64.getEncoder().encodeToString(firstEnc)
         val secondEnc = LxCrypto.aesEncryptBytes(
             data = firstB64.toByteArray(StandardCharsets.UTF_8),
             key = secretKey.toByteArray(StandardCharsets.UTF_8),
             iv = iv,
             mode = "AES/CBC/PKCS5Padding"
         )
-        val params = Base64.encodeToString(secondEnc, Base64.NO_WRAP)
+        val params = Base64.getEncoder().encodeToString(secondEnc)
 
         // RSA NoPadding with zero-padded reversed secretKey (128 bytes)
         val reversed = secretKey.reversed().toByteArray(StandardCharsets.UTF_8)
         val padded = ByteArray(128)
         System.arraycopy(reversed, 0, padded, 128 - reversed.size, reversed.size)
 
-        val keySpec = X509EncodedKeySpec(Base64.decode(RSA_PUBLIC_KEY, Base64.DEFAULT))
+        val keySpec = X509EncodedKeySpec(Base64.getDecoder().decode(RSA_PUBLIC_KEY))
         val pubKey = KeyFactory.getInstance("RSA").generatePublic(keySpec)
         val cipher = Cipher.getInstance("RSA/ECB/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, pubKey)
@@ -74,8 +75,8 @@ object NetEaseCrypto {
         return mapOf("params" to params, "encSecKey" to encSecKey)
     }
 
-    private fun ByteArray.toHexUpper(): String = joinToString("") { "%02X".format(it) }
-    private fun ByteArray.toHexLower(): String = joinToString("") { "%02x".format(it) }
+    private fun ByteArray.toHexUpper(): String = joinToString("") { "%02X".format(Locale.US, it) }
+    private fun ByteArray.toHexLower(): String = joinToString("") { "%02x".format(Locale.US, it) }
 }
 
 object QqSign {
@@ -87,7 +88,7 @@ object QqSign {
     )
 
     fun zzcSign(payload: String): String {
-        val hash = LxCrypto.sha1Hex(payload).uppercase()
+        val hash = LxCrypto.sha1Hex(payload).uppercase(Locale.ROOT)
         val part1 = buildString {
             for (idx in part1Indexes) {
                 if (idx < hash.length) append(hash[idx])
@@ -102,37 +103,51 @@ object QqSign {
             val byteVal = hash.substring(i * 2, i * 2 + 2).toInt(16)
             (scrambleValues[i] xor byteVal).toByte()
         }
-        val b64 = Base64.encodeToString(scrambled, Base64.NO_WRAP)
+        val b64 = Base64.getEncoder().encodeToString(scrambled)
             .replace("[/+=]".toRegex(), "")
-        return "zzc${part1}${b64}${part2}".lowercase()
+        return "zzc${part1}${b64}${part2}".lowercase(Locale.ROOT)
     }
 }
 
 object FormatUtils {
+    private val emTagRegex = Regex("</?em>", RegexOption.IGNORE_CASE)
+    private val brTagRegex = Regex("<br\\s*/?>", RegexOption.IGNORE_CASE)
+    private val numericEntityRegex = Regex("&#(?:x([0-9a-fA-F]+)|(\\d+));")
+
     fun formatSize(bytes: Long): String {
         if (bytes <= 0L) return ""
         val mb = bytes / (1024.0 * 1024.0)
-        return if (mb >= 1.0) "%.1fMB".format(mb) else "${(bytes / 1024).coerceAtLeast(1)}KB"
+        return if (mb >= 1.0) "%.1fMB".format(Locale.US, mb) else "${(bytes / 1024).coerceAtLeast(1)}KB"
     }
 
     fun formatPlayCount(count: Long): String = when {
-        count >= 100_000_000L -> "%.1f亿".format(count / 100_000_000.0)
-        count >= 10_000L -> "%.1f万".format(count / 10_000.0)
+        count >= 100_000_000L -> "%.1f亿".format(Locale.US, count / 100_000_000.0)
+        count >= 10_000L -> "%.1f万".format(Locale.US, count / 10_000.0)
         else -> count.toString()
     }
 
     fun decodeHtml(input: String?): String {
         if (input.isNullOrEmpty()) return ""
-        return input
-            .replace("&amp;", "&")
+        val withoutTags = input
+            .replace(emTagRegex, "")
+            .replace(brTagRegex, "\n")
+        val withNumericDecoded = numericEntityRegex.replace(withoutTags) { m ->
+            val hex = m.groupValues[1]
+            val dec = m.groupValues[2]
+            val cp = if (hex.isNotEmpty()) hex.toIntOrNull(16) else dec.toIntOrNull(10)
+            if (cp != null && cp in 1..0x10FFFF && !Character.isSurrogate(cp.toChar())) {
+                runCatching { String(Character.toChars(cp)) }.getOrDefault(m.value)
+            } else {
+                m.value
+            }
+        }
+        return withNumericDecoded
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
             .replace("&apos;", "'")
-            .replace("&#39;", "'")
             .replace("&nbsp;", " ")
-            .replace("<br>", "\n")
-            .replace("<br/>", "\n")
+            .replace("&amp;", "&")
             .trim()
     }
 }

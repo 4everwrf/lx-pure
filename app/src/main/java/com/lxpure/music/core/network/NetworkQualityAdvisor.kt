@@ -19,9 +19,11 @@ class NetworkQualityAdvisor(context: Context) {
      */
     fun isNetworkConnected(): Boolean {
         val cm = connectivityManager ?: return true
-        val network = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(network) ?: return false
-        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        return runCatching {
+            val network = cm.activeNetwork ?: return@runCatching false
+            val caps = cm.getNetworkCapabilities(network) ?: return@runCatching false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        }.getOrDefault(true)
     }
 
     /**
@@ -29,14 +31,16 @@ class NetworkQualityAdvisor(context: Context) {
      */
     fun isMeteredNetwork(): Boolean {
         val cm = connectivityManager ?: return false
-        val network = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(network) ?: return false
-        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
-        ) {
-            return !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
-        }
-        return caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) || cm.isActiveNetworkMetered
+        return runCatching {
+            val network = cm.activeNetwork ?: return@runCatching false
+            val caps = cm.getNetworkCapabilities(network) ?: return@runCatching false
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+            ) {
+                return@runCatching !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+            }
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) || cm.isActiveNetworkMetered
+        }.getOrDefault(false)
     }
 
     fun decideQuality(

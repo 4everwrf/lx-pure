@@ -63,7 +63,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -71,6 +73,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -94,26 +97,33 @@ import androidx.core.view.WindowInsetsControllerCompat
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.size.Precision
+import com.lxpure.music.core.player.PlaybackProgress
 import com.lxpure.music.core.player.PlayerState
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.domain.model.UserPlaylist
 import com.lxpure.music.ui.theme.LocalLxColors
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
  * Synchronizes the status & navigation bar icon contrast for ModalBottomSheet Dialog windows
- * so dark theme / immersive player sheets never flash black status bar icons on light-mode phones.
+ * so dark theme / immersive player sheets never flash invisible system bar icons.
  */
 @Composable
-fun SyncDialogSystemBars(useLightSystemBars: Boolean) {
+fun SyncDialogSystemBars(
+    useLightSystemBars: Boolean = false,
+    useLightStatusBars: Boolean = useLightSystemBars,
+    useLightNavigationBars: Boolean = useLightSystemBars
+) {
     val view = LocalView.current
     SideEffect {
         val window = (view.parent as? DialogWindowProvider)?.window ?: return@SideEffect
         WindowInsetsControllerCompat(window, view).apply {
-            isAppearanceLightStatusBars = useLightSystemBars
-            isAppearanceLightNavigationBars = useLightSystemBars
+            isAppearanceLightStatusBars = useLightStatusBars
+            isAppearanceLightNavigationBars = useLightNavigationBars
         }
     }
 }
@@ -233,36 +243,41 @@ fun MiniEqualizerIndicator(
     color: Color,
     modifier: Modifier = Modifier
 ) {
-    val transition = rememberInfiniteTransition(label = "eq")
-    val bar1 by transition.animateFloat(
-        initialValue = 0.25f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(420, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "b1"
-    )
-    val bar2 by transition.animateFloat(
-        initialValue = 0.9f,
-        targetValue = 0.3f,
-        animationSpec = infiniteRepeatable(tween(540, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "b2"
-    )
-    val bar3 by transition.animateFloat(
-        initialValue = 0.4f,
-        targetValue = 0.85f,
-        animationSpec = infiniteRepeatable(tween(360, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "b3"
-    )
+    val bar1: Float
+    val bar2: Float
+    val bar3: Float
+    if (isPlaying) {
+        val transition = rememberInfiniteTransition(label = "eq")
+        bar1 = transition.animateFloat(
+            initialValue = 0.25f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(420, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "b1"
+        ).value
+        bar2 = transition.animateFloat(
+            initialValue = 0.9f,
+            targetValue = 0.3f,
+            animationSpec = infiniteRepeatable(tween(540, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "b2"
+        ).value
+        bar3 = transition.animateFloat(
+            initialValue = 0.4f,
+            targetValue = 0.85f,
+            animationSpec = infiniteRepeatable(tween(360, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "b3"
+        ).value
+    } else {
+        bar1 = 0.35f
+        bar2 = 0.55f
+        bar3 = 0.35f
+    }
 
     Row(
         modifier = modifier.height(14.dp),
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.Bottom
     ) {
-        listOf(
-            if (isPlaying) bar1 else 0.35f,
-            if (isPlaying) bar2 else 0.55f,
-            if (isPlaying) bar3 else 0.35f
-        ).forEach { fraction ->
+        listOf(bar1, bar2, bar3).forEach { fraction ->
             Box(
                 modifier = Modifier
                     .width(2.5.dp)
@@ -425,6 +440,7 @@ fun SmallPillBadge(
 @Composable
 fun FloatingMiniPlayer(
     state: PlayerState,
+    progressFlow: StateFlow<PlaybackProgress>,
     onExpand: () -> Unit,
     onTogglePlayPause: () -> Unit,
     onNext: () -> Unit,
@@ -434,15 +450,22 @@ fun FloatingMiniPlayer(
 ) {
     val track = state.currentTrack ?: return
     val lxColors = LocalLxColors.current
+    val liveProgress by progressFlow.collectAsState()
     var dragOffset by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(track.id) {
+        dragOffset = 0f
+    }
+    val currentOnNext by rememberUpdatedState(onNext)
+    val currentOnPrevious by rememberUpdatedState(onPrevious)
     val animatedOffset by animateFloatAsState(
         targetValue = dragOffset,
         animationSpec = spring(stiffness = 500f, dampingRatio = 0.8f),
         label = "miniSwipe"
     )
 
-    val progress = if (state.durationMs > 0L && !(state.isBuffering && state.positionMs == 0L)) {
-        (state.positionMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
+    val effectiveDuration = liveProgress.durationMs.takeIf { it > 0L } ?: state.durationMs
+    val progress = if (effectiveDuration > 0L && !(state.isBuffering && liveProgress.positionMs == 0L)) {
+        (liveProgress.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
     } else 0f
 
     Surface(
@@ -450,12 +473,12 @@ fun FloatingMiniPlayer(
             .fillMaxWidth()
             .padding(horizontal = 14.dp, vertical = 6.dp)
             .offset { IntOffset(animatedOffset.roundToInt(), 0) }
-            .pointerInput(track.id) {
+            .pointerInput(Unit) {
                 detectHorizontalDragGestures(
                     onDragEnd = {
                         when {
-                            dragOffset < -90f -> onNext()
-                            dragOffset > 90f -> onPrevious()
+                            dragOffset < -90f -> currentOnNext()
+                            dragOffset > 90f -> currentOnPrevious()
                         }
                         dragOffset = 0f
                     },
@@ -497,7 +520,10 @@ fun FloatingMiniPlayer(
                         overflow = TextOverflow.Ellipsis
                     )
                     Spacer(Modifier.height(1.dp))
-                    val activeLine = state.lyrics.lines.getOrNull(state.activeLyricIndex)?.text
+                    val activeIdx = remember(state.lyrics, liveProgress.positionMs) {
+                        state.lyrics.activeIndexAt(liveProgress.positionMs)
+                    }
+                    val activeLine = state.lyrics.lines.getOrNull(activeIdx)?.text
                     Text(
                         text = if (state.isPlaying && !activeLine.isNullOrBlank()) activeLine else track.artist,
                         style = MaterialTheme.typography.bodyMedium,
@@ -559,6 +585,7 @@ fun TrackActionSheet(
     isFavorite: Boolean,
     onDismiss: () -> Unit,
     onPlayNext: () -> Unit,
+    onAddToQueue: (() -> Unit)? = null,
     onToggleFavorite: () -> Unit,
     onAddToPlaylist: () -> Unit,
     onDownload: () -> Unit,
@@ -602,6 +629,11 @@ fun TrackActionSheet(
             )
             SheetActionRow(Icons.AutoMirrored.Rounded.PlaylistPlay, "下一首播放") {
                 onPlayNext(); onDismiss()
+            }
+            if (onAddToQueue != null) {
+                SheetActionRow(Icons.AutoMirrored.Rounded.QueueMusic, "加入播放队列") {
+                    onAddToQueue(); onDismiss()
+                }
             }
             SheetActionRow(
                 icon = if (isFavorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
@@ -674,7 +706,10 @@ fun AddToPlaylistSheet(
         containerColor = lxColors.surfaceElevated,
         contentColor = lxColors.textPrimary
     ) {
-        SyncDialogSystemBars(useLightSystemBars = !lxColors.isDark && !forceDarkStatusBar)
+        SyncDialogSystemBars(
+            useLightStatusBars = !lxColors.isDark && !forceDarkStatusBar,
+            useLightNavigationBars = !lxColors.isDark
+        )
         Column(modifier = Modifier.padding(bottom = 28.dp)) {
             Row(
                 modifier = Modifier
@@ -843,6 +878,7 @@ fun SimpleTextInputDialog(
     onConfirm: (String) -> Unit
 ) {
     var value by remember { mutableStateOf("") }
+    var submitted by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title, style = MaterialTheme.typography.titleLarge) },
@@ -863,8 +899,14 @@ fun SimpleTextInputDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { if (value.isNotBlank()) onConfirm(value.trim()) },
-                enabled = value.isNotBlank()
+                onClick = {
+                    val trimmed = value.trim()
+                    if (!submitted && trimmed.isNotEmpty()) {
+                        submitted = true
+                        onConfirm(trimmed)
+                    }
+                },
+                enabled = !submitted && value.isNotBlank()
             ) {
                 Text(confirmLabel)
             }
@@ -905,6 +947,7 @@ fun TrackListFastScroller(
     var isDragging by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(0f) }
     var barHeightPx by remember { mutableIntStateOf(0) }
+    var scrubJob by remember { mutableStateOf<Job?>(null) }
 
     val canScrollBackward by remember(listState) {
         derivedStateOf { listState.canScrollBackward }
@@ -927,7 +970,8 @@ fun TrackListFastScroller(
     val dragTrackIdx = computeFastScrollTrackIndex(dragFraction, trackCount)
 
     fun jumpToListItem(targetItemIndex: Int) {
-        scope.launch {
+        scrubJob?.cancel()
+        scrubJob = scope.launch {
             val clamped = targetItemIndex.coerceIn(0, (headerItemCount + trackCount - 1).coerceAtLeast(0))
             if (abs(listState.firstVisibleItemIndex - clamped) > 45) {
                 listState.scrollToItem(clamped)
@@ -944,13 +988,14 @@ fun TrackListFastScroller(
         dragFraction = fraction
         val trackIdx = computeFastScrollTrackIndex(fraction, trackCount)
         val targetItem = if (trackIdx == 0) 0 else headerItemCount + trackIdx
-        scope.launch {
+        scrubJob?.cancel()
+        scrubJob = scope.launch {
             listState.scrollToItem(targetItem)
         }
     }
 
     Box(modifier = modifier) {
-        // Right-edge interactive fast-scroll thumb (shown for 20+ tracks)
+        // Right-edge interactive fast-scroll thumb (kept strictly in outer 18dp so it never steals TrackListItem's MoreVert taps)
         if (trackCount >= 20) {
             val thumbHeightDp = 46.dp
             val thumbHeightPx = with(density) { thumbHeightDp.toPx() }
@@ -960,8 +1005,8 @@ fun TrackListFastScroller(
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
                     .fillMaxHeight()
-                    .padding(top = 12.dp, bottom = bottomPadding + 146.dp, end = 2.dp)
-                    .width(28.dp)
+                    .padding(top = 12.dp, bottom = bottomPadding + 146.dp)
+                    .width(if (isDragging) 28.dp else 18.dp)
                     .onSizeChanged { barHeightPx = it.height }
                     .pointerInput(trackCount, headerItemCount) {
                         awaitEachGesture {

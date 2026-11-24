@@ -32,6 +32,7 @@ import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -59,6 +60,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.lxpure.music.core.userapi.LxScriptParser
+import com.lxpure.music.core.userapi.SourceUrlUtils
 import com.lxpure.music.core.userapi.UserApiManager
 import com.lxpure.music.domain.model.UserApiRuntimeStatus
 import com.lxpure.music.domain.model.UserApiSource
@@ -69,7 +71,10 @@ import com.lxpure.music.ui.theme.LocalLxColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
+
+private const val MAX_LOCAL_SCRIPT_BYTES = 1 * 1024 * 1024
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -88,26 +93,46 @@ fun SourceManagerScreen(
     var showPasteDialog by remember { mutableStateOf(false) }
     var isImporting by remember { mutableStateOf(false) }
     var isUpdatingAll by remember { mutableStateOf(false) }
-    var testingId by remember { mutableStateOf<String?>(null) }
-    var updatingId by remember { mutableStateOf<String?>(null) }
+    var testingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var updatingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var pendingDeleteSource by remember { mutableStateOf<UserApiSource?>(null) }
 
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        if (uri == null || isImporting) return@rememberLauncherForActivityResult
         scope.launch {
             isImporting = true
-            val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    val content = context.contentResolver.openInputStream(uri)?.bufferedReader(StandardCharsets.UTF_8)?.use {
-                        it.readText()
-                    } ?: error("无法读取该文件")
-                    userApiManager.importRawScript(content).getOrThrow()
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
+                            val out = ByteArrayOutputStream()
+                            val buf = ByteArray(16 * 1024)
+                            var total = 0
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n == -1) break
+                                total += n
+                                if (total > MAX_LOCAL_SCRIPT_BYTES) {
+                                    error("文件过大（上限 1 MB），请选择标准 .js 音源脚本")
+                                }
+                                out.write(buf, 0, n)
+                            }
+                            out.toByteArray()
+                        } ?: error("无法读取该文件")
+                        if (bytes.any { it == 0.toByte() }) {
+                            error("该文件是二进制文件，不是有效的 JS 音源脚本")
+                        }
+                        val content = String(bytes, StandardCharsets.UTF_8)
+                        userApiManager.importRawScript(content).getOrThrow()
+                    }
                 }
+                result.onSuccess { onMessage("已导入音源：${it.name}") }
+                    .onFailure { onMessage("导入失败：${it.message}") }
+            } finally {
+                isImporting = false
             }
-            isImporting = false
-            result.onSuccess { onMessage("已导入音源：${it.name}") }
-                .onFailure { onMessage("导入失败：${it.message}") }
         }
     }
 
@@ -139,13 +164,18 @@ fun SourceManagerScreen(
             } else if (sources.isNotEmpty()) {
                 TextButton(
                     onClick = {
+                        if (isUpdatingAll || updatingIds.isNotEmpty() || testingIds.isNotEmpty()) return@TextButton
                         scope.launch {
                             isUpdatingAll = true
-                            val summary = userApiManager.updateAllSources()
-                            isUpdatingAll = false
-                            onMessage(summary.formatUserMessage())
+                            try {
+                                val summary = userApiManager.updateAllSources()
+                                onMessage(summary.formatUserMessage())
+                            } finally {
+                                isUpdatingAll = false
+                            }
                         }
                     },
+                    enabled = updatingIds.isEmpty() && testingIds.isEmpty(),
                     modifier = Modifier.padding(end = 4.dp)
                 ) {
                     Icon(Icons.Rounded.Refresh, contentDescription = null, tint = lxColors.accent, modifier = Modifier.size(17.dp))
@@ -169,6 +199,7 @@ fun SourceManagerScreen(
                         icon = Icons.Rounded.Link,
                         title = "在线链接",
                         subtitle = "粘贴 .js URL",
+                        enabled = !isImporting,
                         onClick = { showUrlDialog = true },
                         modifier = Modifier.weight(1f)
                     )
@@ -176,13 +207,21 @@ fun SourceManagerScreen(
                         icon = Icons.Rounded.FolderOpen,
                         title = "本地文件",
                         subtitle = "选择 .js 文件",
-                        onClick = { filePicker.launch(arrayOf("*/*")) },
+                        enabled = !isImporting,
+                        onClick = {
+                            runCatching {
+                                filePicker.launch(arrayOf("*/*"))
+                            }.onFailure {
+                                onMessage("无法打开系统文件选择器")
+                            }
+                        },
                         modifier = Modifier.weight(1f)
                     )
                     ImportActionTile(
                         icon = Icons.Rounded.Code,
                         title = "粘贴脚本",
                         subtitle = "源码导入",
+                        enabled = !isImporting,
                         onClick = { showPasteDialog = true },
                         modifier = Modifier.weight(1f)
                     )
@@ -211,11 +250,15 @@ fun SourceManagerScreen(
                 }
             } else {
                 itemsIndexed(sources, key = { _, s -> s.id }) { index, source ->
+                    val canUpdateOnline = remember(source.sourceUrl) {
+                        SourceUrlUtils.buildUpdateCandidateUrls(source.sourceUrl).isNotEmpty()
+                    }
                     SourceItemCard(
                         source = source,
                         isTopPriority = index == 0,
-                        isTesting = testingId == source.id,
-                        isUpdating = updatingId == source.id,
+                        isTesting = source.id in testingIds,
+                        isUpdating = isUpdatingAll || source.id in updatingIds,
+                        canUpdateOnline = canUpdateOnline,
                         onToggleEnabled = { enabled ->
                             scope.launch { userApiManager.toggleEnabled(source.id, enabled) }
                         },
@@ -223,40 +266,69 @@ fun SourceManagerScreen(
                             scope.launch { userApiManager.movePriorityUp(source.id) }
                         },
                         onTestHealth = {
+                            if (source.id in testingIds) return@SourceItemCard
                             scope.launch {
-                                testingId = source.id
-                                userApiManager.testSourceHealth(source.id)
-                                    .onSuccess { ms -> onMessage("${source.name} 解析可用 (${ms}ms)") }
-                                    .onFailure { err -> onMessage("${source.name} 测试失败：${err.message}") }
-                                testingId = null
+                                testingIds = testingIds + source.id
+                                try {
+                                    userApiManager.testSourceHealth(source.id)
+                                        .onSuccess { ms -> onMessage("${source.name} 解析可用 (${ms}ms)") }
+                                        .onFailure { err -> onMessage("${source.name} 测试失败：${err.message}") }
+                                } finally {
+                                    testingIds = testingIds - source.id
+                                }
                             }
                         },
                         onUpdateSource = {
+                            if (source.id in updatingIds || isUpdatingAll) return@SourceItemCard
                             scope.launch {
-                                updatingId = source.id
-                                val res = userApiManager.updateSingleSource(source.id)
-                                updatingId = null
-                                when {
-                                    res.updated -> onMessage(
-                                        "${res.sourceName} 已更新：${LxScriptParser.formatVersionBadge(res.oldVersion)} → ${LxScriptParser.formatVersionBadge(res.newVersion)}"
-                                    )
-                                    res.alreadyLatest -> onMessage(
-                                        "${res.sourceName} 已是最新 (${LxScriptParser.formatVersionBadge(res.newVersion)})"
-                                    )
-                                    else -> onMessage("${res.sourceName} 更新失败：${res.errorMessage ?: "请稍后重试"}")
+                                updatingIds = updatingIds + source.id
+                                try {
+                                    val res = userApiManager.updateSingleSource(source.id)
+                                    when {
+                                        res.updated -> onMessage(
+                                            "${res.sourceName} 已更新：${LxScriptParser.formatVersionBadge(res.oldVersion)} → ${LxScriptParser.formatVersionBadge(res.newVersion)}"
+                                        )
+                                        res.alreadyLatest -> onMessage(
+                                            "${res.sourceName} 已是最新 (${LxScriptParser.formatVersionBadge(res.newVersion)})"
+                                        )
+                                        else -> onMessage("${res.sourceName} 更新失败：${res.errorMessage ?: "请稍后重试"}")
+                                    }
+                                } finally {
+                                    updatingIds = updatingIds - source.id
                                 }
                             }
                         },
                         onDelete = {
-                            scope.launch {
-                                userApiManager.removeSource(source.id)
-                                onMessage("已移除音源：${source.name}")
-                            }
+                            pendingDeleteSource = source
                         }
                     )
                 }
             }
         }
+    }
+
+    pendingDeleteSource?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteSource = null },
+            title = { Text("移除自定义音源", style = MaterialTheme.typography.titleLarge) },
+            text = { Text("确定要移除音源「${target.name}」吗？", style = MaterialTheme.typography.bodyMedium) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingDeleteSource = null
+                        scope.launch {
+                            userApiManager.removeSource(target.id)
+                            onMessage("已移除音源：${target.name}")
+                        }
+                    }
+                ) {
+                    Text("移除", color = lxColors.danger)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteSource = null }) { Text("取消") }
+            }
+        )
     }
 
     if (showUrlDialog) {
@@ -268,12 +340,16 @@ fun SourceManagerScreen(
             onDismiss = { showUrlDialog = false },
             onConfirm = { url ->
                 showUrlDialog = false
+                if (isImporting) return@SimpleTextInputDialog
                 scope.launch {
                     isImporting = true
-                    userApiManager.importFromUrl(url)
-                        .onSuccess { onMessage("已导入并启用：${it.name}") }
-                        .onFailure { onMessage("导入失败：${it.message}") }
-                    isImporting = false
+                    try {
+                        userApiManager.importFromUrl(url)
+                            .onSuccess { onMessage("已导入并启用：${it.name}") }
+                            .onFailure { onMessage("导入失败：${it.message}") }
+                    } finally {
+                        isImporting = false
+                    }
                 }
             }
         )
@@ -288,12 +364,16 @@ fun SourceManagerScreen(
             onDismiss = { showPasteDialog = false },
             onConfirm = { code ->
                 showPasteDialog = false
+                if (isImporting) return@SimpleTextInputDialog
                 scope.launch {
                     isImporting = true
-                    userApiManager.importRawScript(code)
-                        .onSuccess { onMessage("已导入并启用：${it.name}") }
-                        .onFailure { onMessage("导入失败：${it.message}") }
-                    isImporting = false
+                    try {
+                        userApiManager.importRawScript(code)
+                            .onSuccess { onMessage("已导入并启用：${it.name}") }
+                            .onFailure { onMessage("导入失败：${it.message}") }
+                    } finally {
+                        isImporting = false
+                    }
                 }
             }
         )
@@ -305,17 +385,18 @@ private fun ImportActionTile(
     icon: ImageVector,
     title: String,
     subtitle: String,
+    enabled: Boolean = true,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val lxColors = LocalLxColors.current
-    GlassCard(modifier = modifier, cornerRadius = 16.dp, onClick = onClick) {
+    GlassCard(modifier = modifier, cornerRadius = 16.dp, onClick = if (enabled) onClick else null) {
         Column(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Icon(icon, contentDescription = null, tint = lxColors.accent, modifier = Modifier.size(22.dp))
-            Text(title, style = MaterialTheme.typography.titleMedium, color = lxColors.textPrimary)
+            Icon(icon, contentDescription = null, tint = if (enabled) lxColors.accent else lxColors.textTertiary, modifier = Modifier.size(22.dp))
+            Text(title, style = MaterialTheme.typography.titleMedium, color = if (enabled) lxColors.textPrimary else lxColors.textTertiary)
             Text(subtitle, style = MaterialTheme.typography.labelMedium, color = lxColors.textTertiary)
         }
     }
@@ -328,6 +409,7 @@ private fun SourceItemCard(
     isTopPriority: Boolean,
     isTesting: Boolean,
     isUpdating: Boolean,
+    canUpdateOnline: Boolean,
     onToggleEnabled: (Boolean) -> Unit,
     onMoveUp: () -> Unit,
     onTestHealth: () -> Unit,
@@ -451,18 +533,20 @@ private fun SourceItemCard(
                     Spacer(Modifier.width(3.dp))
                     Text("测速", maxLines = 1)
                 }
-                TextButton(
-                    onClick = onUpdateSource,
-                    enabled = !isUpdating && !isTesting,
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                ) {
-                    if (isUpdating) {
-                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                    } else {
-                        Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                if (canUpdateOnline) {
+                    TextButton(
+                        onClick = onUpdateSource,
+                        enabled = !isUpdating && !isTesting,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        if (isUpdating) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                        }
+                        Spacer(Modifier.width(3.dp))
+                        Text("更新", maxLines = 1)
                     }
-                    Spacer(Modifier.width(3.dp))
-                    Text("更新", maxLines = 1)
                 }
                 IconButton(onClick = onDelete) {
                     Icon(Icons.Rounded.DeleteOutline, contentDescription = "删除", tint = lxColors.danger, modifier = Modifier.size(19.dp))

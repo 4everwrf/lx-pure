@@ -42,6 +42,7 @@ struct LibraryView: View {
     @State private var newPlaylistName = ""
     @State private var showImportSheet = false
     @State private var importInput = ""
+    @State private var pendingDeletePlaylist: UserPlaylist?
 
     private var customPlaylistCount: Int {
         playlists.filter { LibraryStore.isCustomPlaylist(sourceUrl: $0.sourceUrl) }.count
@@ -63,7 +64,7 @@ struct LibraryView: View {
                     Spacer()
                     HStack(spacing: 6) {
                         Button {
-                            showImportSheet = true
+                            if !isImportingPlaylist { showImportSheet = true }
                         } label: {
                             if isImportingPlaylist {
                                 ProgressView()
@@ -76,6 +77,7 @@ struct LibraryView: View {
                                     .frame(width: 36, height: 36)
                             }
                         }
+                        .disabled(isImportingPlaylist)
                         .accessibilityLabel("导入外部歌单")
 
                         Button(action: onOpenSettings) {
@@ -279,7 +281,7 @@ struct LibraryView: View {
                                 .buttonStyle(.plain)
                                 .contextMenu {
                                     Button(role: .destructive) {
-                                        onDeletePlaylist(pl)
+                                        pendingDeletePlaylist = pl
                                     } label: {
                                         Label("删除歌单", systemImage: "trash")
                                     }
@@ -302,6 +304,23 @@ struct LibraryView: View {
         } message: {
             Text("最多支持自建 \(LibraryStore.maxCustomPlaylists) 个歌单（当前 \(customPlaylistCount)/\(LibraryStore.maxCustomPlaylists)）")
         }
+        .alert(
+            "删除歌单",
+            isPresented: Binding(
+                get: { pendingDeletePlaylist != nil },
+                set: { if !$0 { pendingDeletePlaylist = nil } }
+            )
+        ) {
+            Button("取消", role: .cancel) { pendingDeletePlaylist = nil }
+            Button("删除", role: .destructive) {
+                if let target = pendingDeletePlaylist {
+                    pendingDeletePlaylist = nil
+                    onDeletePlaylist(target)
+                }
+            }
+        } message: {
+            Text("确定要删除歌单「\(pendingDeletePlaylist?.name ?? "")」吗？此操作不可撤销。")
+        }
         .sheet(isPresented: $showImportSheet) {
             NavigationStack {
                 VStack(alignment: .leading, spacing: 14) {
@@ -310,6 +329,8 @@ struct LibraryView: View {
                         .foregroundColor(lx.textSecondary)
 
                     TextEditor(text: $importInput)
+                        .scrollContentBackground(.hidden)
+                        .foregroundColor(lx.textPrimary)
                         .frame(minHeight: 120)
                         .padding(10)
                         .background(lx.surfaceElevated)
@@ -337,6 +358,7 @@ struct LibraryView: View {
                     }
                 }
             }
+            .preferredColorScheme(lx.isDark ? .dark : .light)
             .presentationDetents([.medium])
         }
     }

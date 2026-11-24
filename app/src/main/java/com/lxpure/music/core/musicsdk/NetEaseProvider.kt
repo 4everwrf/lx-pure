@@ -40,12 +40,12 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
     )
 
     suspend fun search(query: String, page: Int = 1, limit: Int = 25): List<Track> = withContext(Dispatchers.IO) {
-        val eapiResult = runCatching { searchViaEapi(query, page, limit) }.getOrDefault(emptyList())
+        val eapiResult = suspendRunCatching { searchViaEapi(query, page, limit) }.getOrDefault(emptyList())
         if (eapiResult.isNotEmpty()) return@withContext eapiResult
-        runCatching { searchViaWeapi(query, page, limit) }.getOrDefault(emptyList())
+        suspendRunCatching { searchViaWeapi(query, page, limit) }.getOrDefault(emptyList())
     }
 
-    private fun searchViaEapi(query: String, page: Int, limit: Int): List<Track> {
+    private suspend fun searchViaEapi(query: String, page: Int, limit: Int): List<Track> {
         val payload = buildJsonObject {
             put("keyword", query)
             put("needCorrect", "1")
@@ -72,7 +72,7 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
         }
     }
 
-    private fun searchViaWeapi(query: String, page: Int, limit: Int): List<Track> {
+    private suspend fun searchViaWeapi(query: String, page: Int, limit: Int): List<Track> {
         val payload = buildJsonObject {
             put("s", query)
             put("type", 1)
@@ -94,7 +94,7 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getHotPlaylists(page: Int = 1, limit: Int = 20): List<OnlinePlaylist> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val payload = buildJsonObject {
                 put("cat", "全部")
                 put("order", "hot")
@@ -103,10 +103,10 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
                 put("total", true)
             }.toString()
             val body = postForm("https://music.163.com/weapi/playlist/list", NetEaseCrypto.weapi(payload))
-                ?: return@runCatching emptyList()
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@runCatching emptyList()
-            if (root["code"].asIntOrNull() != 200) return@runCatching emptyList()
-            val playlists = root["playlists"].asJsonArrayOrNull() ?: return@runCatching emptyList()
+                ?: return@suspendRunCatching emptyList()
+            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@suspendRunCatching emptyList()
+            if (root["code"].asIntOrNull() != 200) return@suspendRunCatching emptyList()
+            val playlists = root["playlists"].asJsonArrayOrNull() ?: return@suspendRunCatching emptyList()
             playlists.mapNotNull { el ->
                 runCatching {
                     val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
@@ -127,7 +127,7 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getPlaylistDetail(rawIdOrUrl: String): Result<PlaylistDetailResult> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val playlistId = extractPlaylistId(rawIdOrUrl) ?: error("无法识别网易云歌单 ID")
             val linuxPayload = buildJsonObject {
                 put("method", "POST")
@@ -181,14 +181,12 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
                 directTracks
             } else {
                 // Keep already-returned tracks and hydrate ALL remaining trackIds in parallel waves
-                // (supports large playlists with 2,400–10,000+ songs while preserving original order)
                 val hydratedMap = LinkedHashMap<String, Track>(trackIds.size)
-                directTracks.forEach { hydratedMap[it.songmid] = it }
+                directTracks.forEach { hydratedMap.putIfAbsent(it.songmid, it) }
 
-                val missingIds = trackIds.filter { it !in hydratedMap }
+                val missingIds = trackIds.filter { it !in hydratedMap }.distinct()
                 val chunks = missingIds.chunked(400)
                 coroutineScope {
-                    // Run 3 chunks concurrently per wave to stay fast while avoiding NetEase rate limits
                     chunks.chunked(3).forEach { wave ->
                         val batchResults = wave.map { chunk ->
                             async { fetchSongsByIdsWithRetry(chunk) }
@@ -207,15 +205,15 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
         }
     }
 
-    private fun fetchSongsByIdsWithRetry(ids: List<String>, maxAttempts: Int = 2): List<Track> {
+    private suspend fun fetchSongsByIdsWithRetry(ids: List<String>, maxAttempts: Int = 2): List<Track> {
         repeat(maxAttempts) {
-            val res = runCatching { fetchSongsByIds(ids) }.getOrDefault(emptyList())
+            val res = suspendRunCatching { fetchSongsByIds(ids) }.getOrDefault(emptyList())
             if (res.isNotEmpty()) return res
         }
         return emptyList()
     }
 
-    private fun fetchSongsByIds(ids: List<String>): List<Track> {
+    private suspend fun fetchSongsByIds(ids: List<String>): List<Track> {
         if (ids.isEmpty()) return emptyList()
         val cParam = "[" + ids.joinToString(",") { """{"id":$it}""" } + "]"
         val idsParam = "[" + ids.joinToString(",") + "]"
@@ -246,7 +244,7 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getLyric(songmid: String): ParsedLyrics = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val payload = buildJsonObject {
                 put("id", songmid)
                 put("cp", false)
@@ -259,32 +257,35 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
                 put("yrv", 0)
             }.toString()
             val body = postForm("https://interface3.music.163.com/eapi/song/lyric/v1", NetEaseCrypto.eapi("/api/song/lyric/v1", payload))
-                ?: return@runCatching ParsedLyrics()
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@runCatching ParsedLyrics()
-            val rawLrc = root["yrc"].asJsonObjectOrNull()?.get("lyric").asStringOrNull()
-                ?.takeIf { it.isNotBlank() }
-                ?: root["lrc"].asJsonObjectOrNull()?.get("lyric").asStringOrNull()
-            val rawTrans = root["ytlrc"].asJsonObjectOrNull()?.get("lyric").asStringOrNull()
-                ?.takeIf { it.isNotBlank() }
-                ?: root["tlyric"].asJsonObjectOrNull()?.get("lyric").asStringOrNull()
-            LrcParser.parse(rawLrc, rawTrans)
+                ?: return@suspendRunCatching ParsedLyrics()
+            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@suspendRunCatching ParsedLyrics()
+            val yrcText = root["yrc"].asJsonObjectOrNull()?.get("lyric").asNonBlankStringOrNull()
+            val lrcText = root["lrc"].asJsonObjectOrNull()?.get("lyric").asNonBlankStringOrNull()
+            val ytlrcText = root["ytlrc"].asJsonObjectOrNull()?.get("lyric").asNonBlankStringOrNull()
+            val tlyricText = root["tlyric"].asJsonObjectOrNull()?.get("lyric").asNonBlankStringOrNull()
+
+            if (yrcText != null) {
+                val yrcParsed = LrcParser.parse(yrcText, ytlrcText ?: tlyricText)
+                if (!yrcParsed.isEmpty) return@suspendRunCatching yrcParsed
+            }
+            LrcParser.parse(lrcText, tlyricText ?: ytlrcText)
         }.getOrDefault(ParsedLyrics())
     }
 
-    private fun extractPlaylistId(raw: String): String? {
+    internal suspend fun extractPlaylistId(raw: String): String? {
         val trimmed = raw.trim()
         if (trimmed.all { it.isDigit() } && trimmed.isNotEmpty()) return trimmed
 
-        val directMatch = Regex("(?:[?&]id=|/playlist/)(\\d+)").find(trimmed)
-        if (directMatch != null) return directMatch.groupValues[1]
+        val idRegex = Regex("(?:[?&]id=|/playlist/)(\\d+)", RegexOption.IGNORE_CASE)
+        idRegex.find(trimmed)?.let { return it.groupValues[1] }
 
-        // Follow short links such as 163cn.tv
-        val urlMatch = Regex("https?://\\S+").find(trimmed)?.value ?: return null
+        // Follow short links such as 163cn.tv (stopping cleanly before CJK share text/punctuation)
+        val urlMatch = extractFirstHttpUrl(trimmed) ?: return null
         val req = Request.Builder().url(urlMatch).header("User-Agent", ua).build()
-        return runCatching {
-            httpClient.newCall(req).execute().use { resp ->
+        return suspendRunCatching {
+            httpClient.newCall(req).awaitResponse().use { resp ->
                 val finalUrl = resp.request.url.toString()
-                Regex("(?:[?&]id=|/playlist/)(\\d+)").find(finalUrl)?.groupValues?.getOrNull(1)
+                idRegex.find(finalUrl)?.groupValues?.getOrNull(1)
             }
         }.getOrNull()
     }
@@ -354,7 +355,7 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
         )
     }
 
-    private fun postForm(url: String, params: Map<String, String>): String? {
+    private suspend fun postForm(url: String, params: Map<String, String>): String? {
         val form = FormBody.Builder().apply {
             params.forEach { (k, v) -> add(k, v) }
         }.build()
@@ -365,7 +366,7 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
             .header("Referer", "https://music.163.com/")
             .post(form)
             .build()
-        return httpClient.newCall(req).execute().use { resp ->
+        return httpClient.newCall(req).awaitResponse().use { resp ->
             if (resp.isSuccessful) resp.body?.string() else null
         }
     }

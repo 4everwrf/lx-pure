@@ -18,9 +18,11 @@ struct CollectionDetailView: View {
     var onImportLocalFiles: (([URL]) -> Void)? = nil
     var onClearHistory: (() -> Void)? = nil
     var onRemoveTrack: ((Track) -> Void)? = nil
+    var onDeletePlaylist: (() -> Void)? = nil
 
     @Environment(\.lxPalette) private var lx
     @State private var showAudioFileImporter = false
+    @State private var showDeletePlaylistConfirm = false
 
     var body: some View {
         let currentTrackIndex = currentTrackId.flatMap { id in
@@ -131,7 +133,7 @@ struct CollectionDetailView: View {
                                     onTap: { onPlayTracks(tracks, idx) },
                                     onMore: { onTrackMore(track) }
                                 )
-                                .id("track_\(idx)")
+                                .id(track.id)
                                 .contextMenu {
                                     if canDeleteTracks, let onRemoveTrack {
                                         Button(role: .destructive) {
@@ -143,12 +145,13 @@ struct CollectionDetailView: View {
                                 }
                             }
 
+                            // Include MiniPlayer + fast-scroller quick-jump dock clearance INSIDE LazyVStack
+                            // so jumping to bottom never hides the last 2–3 rows behind FloatingMiniPlayer or quick-jump buttons.
                             Color.clear
-                                .frame(height: 1)
+                                .frame(height: bottomInset + (tracks.count >= 15 ? 148 : 0))
                                 .id("list_bottom")
                         }
                     }
-                    .padding(.bottom, bottomInset)
                 }
 
                 TrackListFastScrollerOverlay(
@@ -162,7 +165,12 @@ struct CollectionDetailView: View {
                         proxy.scrollTo("list_bottom", anchor: .bottom)
                     },
                     onJumpToIndex: { idx in
-                        proxy.scrollTo("track_\(idx)", anchor: idx == tracks.count - 1 ? .bottom : .center)
+                        guard idx >= 0 && idx < tracks.count else { return }
+                        if idx == tracks.count - 1 {
+                            proxy.scrollTo("list_bottom", anchor: .bottom)
+                        } else {
+                            proxy.scrollTo(tracks[idx].id, anchor: .center)
+                        }
                     }
                 )
             }
@@ -170,6 +178,27 @@ struct CollectionDetailView: View {
         .background(lx.background)
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if onDeletePlaylist != nil {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(role: .destructive) {
+                        showDeletePlaylistConfirm = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .foregroundColor(lx.danger)
+                    }
+                    .accessibilityLabel("删除歌单")
+                }
+            }
+        }
+        .alert("删除歌单", isPresented: $showDeletePlaylistConfirm) {
+            Button("取消", role: .cancel) {}
+            Button("删除", role: .destructive) {
+                onDeletePlaylist?()
+            }
+        } message: {
+            Text("确定要删除歌单「\(title)」吗？此操作不可撤销。")
+        }
         .fileImporter(
             isPresented: $showAudioFileImporter,
             allowedContentTypes: [.audio, .mp3, .mpeg4Audio, .wav, .aiff],

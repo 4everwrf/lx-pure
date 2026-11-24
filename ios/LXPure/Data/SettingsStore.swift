@@ -3,7 +3,7 @@ import Foundation
 
 @MainActor
 final class SettingsStore: ObservableObject {
-    @Published var settings: AppSettings
+    @Published private(set) var settings: AppSettings
 
     private let defaults: UserDefaults
     private let key = "com.lxpure.settings.v1"
@@ -21,6 +21,7 @@ final class SettingsStore: ObservableObject {
     func update(_ transform: (inout AppSettings) -> Void) {
         var copy = settings
         transform(&copy)
+        guard copy != settings else { return }
         settings = copy
         if let data = try? JSONEncoder().encode(copy) {
             defaults.set(data, forKey: key)

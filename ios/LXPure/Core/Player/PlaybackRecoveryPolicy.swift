@@ -32,6 +32,37 @@ enum PlaybackRecoveryPolicy {
     ]
 
     static func classify(error: Error?, httpStatusCode: Int? = nil) -> PlaybackErrorKind {
+        if let code = httpStatusCode {
+            return classifyError(httpStatusCode: code)
+        }
+
+        // Walk NSUnderlyingErrorKey / NSMultipleUnderlyingErrorsKey chains because AVFoundation
+        // frequently wraps NSURLErrorDomain inside AVFoundationErrorDomain.
+        if let rootErr = error as NSError? {
+            var queue: [NSError] = [rootErr]
+            var visited = 0
+            while !queue.isEmpty && visited < 8 {
+                let current = queue.removeFirst()
+                visited += 1
+                let kind = classifyError(
+                    errorDomain: current.domain,
+                    errorCode: current.code,
+                    httpStatusCode: nil,
+                    message: current.localizedDescription
+                )
+                if kind != .streamOrSourceBroken {
+                    return kind
+                }
+                if let underlying = current.userInfo[NSUnderlyingErrorKey] as? NSError {
+                    queue.append(underlying)
+                }
+                if #available(iOS 14.5, *),
+                   let multiples = current.userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError] {
+                    queue.append(contentsOf: multiples)
+                }
+            }
+        }
+
         let nsErr = error as NSError?
         return classifyError(
             errorDomain: nsErr?.domain,

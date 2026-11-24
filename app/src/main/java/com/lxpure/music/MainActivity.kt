@@ -116,7 +116,7 @@ private enum class BottomTab(val label: String, val icon: ImageVector) {
 
 private sealed interface SubRoute {
     data class Collection(val type: LibraryCollectionType) : SubRoute
-    data class UserPlaylistDetail(val playlist: UserPlaylist) : SubRoute
+    data class UserPlaylistDetail(val playlistId: Long) : SubRoute
     data class OnlinePlaylistDetail(val playlist: OnlinePlaylist) : SubRoute
     data class LeaderboardDetail(val board: LeaderboardItem) : SubRoute
     data object Settings : SubRoute
@@ -139,7 +139,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        (application as? LxPureApp)?.container?.playerController?.persistSnapshotNow()
+        (application as? LxPureApp)?.container?.playerController?.persistSnapshotAsync()
     }
 
     override fun onStop() {
@@ -195,7 +195,17 @@ private fun LxPureRoot(container: AppContainer) {
         val existing = downloads.firstOrNull { it.trackId == track.id }
         when (existing?.status) {
             DownloadStatus.COMPLETED -> {
-                showToast("《${track.title}》已离线保存")
+                scope.launch {
+                    val validLocal = container.downloadManager.getLocalCachedPath(track.id)
+                    if (validLocal != null) {
+                        showToast("《${track.title}》已离线保存")
+                    } else {
+                        showToast("离线文件已失效，重新下载《${track.title}》…")
+                        container.downloadManager.enqueueDownload(track, settings.preferredQuality) { msg ->
+                            showToast(msg)
+                        }
+                    }
+                }
                 return
             }
             DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING -> {
@@ -288,6 +298,12 @@ private fun LxPureRoot(container: AppContainer) {
         }
     }
 
+    fun popBackStack() {
+        if (backStack.isNotEmpty()) {
+            backStack.removeAt(backStack.lastIndex)
+        }
+    }
+
     fun navigateToQueueSource(source: PlaybackQueueSource) {
         isPlayerExpanded = false
         val target: SubRoute? = when (source.type) {
@@ -297,7 +313,7 @@ private fun LxPureRoot(container: AppContainer) {
             QueueSourceType.HISTORY -> SubRoute.Collection(LibraryCollectionType.HISTORY)
             QueueSourceType.USER_PLAYLIST -> {
                 val matched = playlists.firstOrNull { it.id == source.userPlaylistId }
-                matched?.let { SubRoute.UserPlaylistDetail(it) }
+                matched?.let { SubRoute.UserPlaylistDetail(it.id) }
             }
             QueueSourceType.ONLINE_PLAYLIST -> source.onlinePlaylist?.let { SubRoute.OnlinePlaylistDetail(it) }
             QueueSourceType.LEADERBOARD -> source.leaderboard?.let { SubRoute.LeaderboardDetail(it) }
@@ -353,16 +369,14 @@ private fun LxPureRoot(container: AppContainer) {
         }
     }
 
-    // Refresh offline storage bytes whenever download statuses/sizes change or user opens Settings
+    // Refresh offline storage bytes only when Settings is visible or completed downloads change
     val downloadStatsKey = remember(downloads) {
-        Triple(
-            downloads.size,
-            downloads.count { it.status == DownloadStatus.COMPLETED },
-            downloads.sumOf { it.totalBytes }
-        )
+        val completed = downloads.filter { it.status == DownloadStatus.COMPLETED }
+        completed.size to completed.sumOf { it.totalBytes }
     }
     val isSettingsVisible = backStack.lastOrNull() == SubRoute.Settings
     LaunchedEffect(downloadStatsKey, isSettingsVisible) {
+        if (!isSettingsVisible) return@LaunchedEffect
         val diskBytes = container.downloadManager.calculateDownloadedBytes()
         val dbBytes = downloads
             .filter { it.status == DownloadStatus.COMPLETED }
@@ -391,7 +405,7 @@ private fun LxPureRoot(container: AppContainer) {
     BackHandler(enabled = isPlayerExpanded || backStack.isNotEmpty() || activeTab != BottomTab.LIBRARY) {
         when {
             isPlayerExpanded -> isPlayerExpanded = false
-            backStack.isNotEmpty() -> backStack.removeAt(backStack.lastIndex)
+            backStack.isNotEmpty() -> popBackStack()
             activeTab != BottomTab.LIBRARY -> activeTab = BottomTab.LIBRARY
         }
     }
@@ -402,7 +416,10 @@ private fun LxPureRoot(container: AppContainer) {
         val showBottomNav = backStack.isEmpty()
 
         LaunchedEffect(hasCurrentTrack) {
-            if (!hasCurrentTrack) isPlayerExpanded = false
+            if (!hasCurrentTrack) {
+                isPlayerExpanded = false
+                showQueueSheet = false
+            }
         }
 
         // Dynamically sync system status bar & navigation bar icon contrast with App theme and immersive player
@@ -446,7 +463,7 @@ private fun LxPureRoot(container: AppContainer) {
                         onOpenSettings = { backStack.add(SubRoute.Settings) },
                         onOpenSourceManager = { backStack.add(SubRoute.SourceManager) },
                         onOpenCollection = { type -> backStack.add(SubRoute.Collection(type)) },
-                        onOpenPlaylist = { playlist -> backStack.add(SubRoute.UserPlaylistDetail(playlist)) },
+                        onOpenPlaylist = { playlist -> backStack.add(SubRoute.UserPlaylistDetail(playlist.id)) },
                         onPlayTrack = { track ->
                             val idx = recentHistory.indexOfFirst { it.id == track.id }
                             if (idx >= 0) {
@@ -473,24 +490,28 @@ private fun LxPureRoot(container: AppContainer) {
                             }
                         },
                         onImportExternalPlaylist = { raw ->
+                            if (isImportingPlaylist) return@LibraryScreen
                             scope.launch {
                                 isImportingPlaylist = true
-                                showToast("正在全量拉取歌单曲目，大歌单请稍候…")
-                                container.musicAggregator.importExternalPlaylist(raw)
-                                    .onSuccess { res ->
-                                        container.libraryRepository.createPlaylist(
-                                            name = res.playlist.name,
-                                            description = res.playlist.description,
-                                            coverUrl = res.playlist.coverUrl,
-                                            sourceUrl = raw,
-                                            tracks = res.tracks
-                                        )
-                                        showToast("已导入《${res.playlist.name}》(${res.tracks.size} 首)")
-                                    }
-                                    .onFailure { err ->
-                                        showToast("导入歌单失败：${err.message}")
-                                    }
-                                isImportingPlaylist = false
+                                try {
+                                    showToast("正在全量拉取歌单曲目，大歌单请稍候…")
+                                    container.musicAggregator.importExternalPlaylist(raw)
+                                        .onSuccess { res ->
+                                            container.libraryRepository.createPlaylist(
+                                                name = res.playlist.name,
+                                                description = res.playlist.description,
+                                                coverUrl = res.playlist.coverUrl,
+                                                sourceUrl = raw,
+                                                tracks = res.tracks
+                                            )
+                                            showToast("已导入《${res.playlist.name}》(${res.tracks.size} 首)")
+                                        }
+                                        .onFailure { err ->
+                                            showToast("导入歌单失败：${err.message}")
+                                        }
+                                } finally {
+                                    isImportingPlaylist = false
+                                }
                             }
                         },
                         onPlaylistLimitReached = {
@@ -524,6 +545,7 @@ private fun LxPureRoot(container: AppContainer) {
                     )
                 }
             } else {
+                androidx.compose.runtime.key(topRoute) {
                 when (topRoute) {
                     is SubRoute.Collection -> when (topRoute.type) {
                         LibraryCollectionType.FAVORITES -> CollectionDetailScreen(
@@ -534,7 +556,7 @@ private fun LxPureRoot(container: AppContainer) {
                             isPlaying = playerState.isPlaying,
                             bottomPadding = contentBottomPadding,
                             emptyHint = "还没有喜欢的歌曲，听到心动的旋律点亮红心吧",
-                            onBack = { backStack.removeAt(backStack.lastIndex) },
+                            onBack = { popBackStack() },
                             onPlayAll = {
                                 container.playerController.playTracks(
                                     favorites,
@@ -562,7 +584,7 @@ private fun LxPureRoot(container: AppContainer) {
                             isLoading = isScanningLocal,
                             showScanAction = true,
                             emptyHint = "点击下方按钮扫描手机中的无损或 MP3 音频",
-                            onBack = { backStack.removeAt(backStack.lastIndex) },
+                            onBack = { popBackStack() },
                             onPlayAll = {
                                 container.playerController.playTracks(
                                     localTracks,
@@ -586,7 +608,7 @@ private fun LxPureRoot(container: AppContainer) {
                             currentTrackId = playerState.currentTrack?.id,
                             isPlaying = playerState.isPlaying,
                             bottomPadding = contentBottomPadding,
-                            onBack = { backStack.removeAt(backStack.lastIndex) },
+                            onBack = { popBackStack() },
                             onPlayTrack = { track ->
                                 val completedTracks = downloads
                                     .filter { it.status == DownloadStatus.COMPLETED }
@@ -605,6 +627,14 @@ private fun LxPureRoot(container: AppContainer) {
                                     )
                                 }
                             },
+                            onPlayAllCompleted = { completedList ->
+                                container.playerController.playTracks(
+                                    completedList,
+                                    0,
+                                    PlaybackQueueSource(QueueSourceType.DOWNLOADS, "离线下载")
+                                )
+                            },
+                            onRetryDownload = { track -> triggerTrackDownload(track) },
                             onDeleteDownload = { id ->
                                 scope.launch {
                                     container.downloadManager.deleteDownload(id)
@@ -622,7 +652,7 @@ private fun LxPureRoot(container: AppContainer) {
                             bottomPadding = contentBottomPadding,
                             showClearAction = true,
                             emptyHint = "还没有播放记录",
-                            onBack = { backStack.removeAt(backStack.lastIndex) },
+                            onBack = { popBackStack() },
                             onPlayAll = {
                                 container.playerController.playTracks(
                                     recentHistory,
@@ -648,20 +678,22 @@ private fun LxPureRoot(container: AppContainer) {
                     }
 
                     is SubRoute.UserPlaylistDetail -> {
-                        val plTracksFlow = remember(topRoute.playlist.id) {
-                            container.libraryRepository.observePlaylistTracks(topRoute.playlist.id)
+                        val livePlaylist = playlists.firstOrNull { it.id == topRoute.playlistId }
+                        val plName = livePlaylist?.name ?: "歌单"
+                        val plTracksFlow = remember(topRoute.playlistId) {
+                            container.libraryRepository.observePlaylistTracks(topRoute.playlistId)
                         }
                         val plTracks by plTracksFlow.collectAsState(initial = emptyList())
-                        val plSource = remember(topRoute.playlist.id, topRoute.playlist.name) {
+                        val plSource = remember(topRoute.playlistId, plName) {
                             PlaybackQueueSource(
                                 type = QueueSourceType.USER_PLAYLIST,
-                                title = topRoute.playlist.name,
-                                userPlaylistId = topRoute.playlist.id
+                                title = plName,
+                                userPlaylistId = topRoute.playlistId
                             )
                         }
 
                         CollectionDetailScreen(
-                            title = topRoute.playlist.name,
+                            title = plName,
                             subtitle = "${plTracks.size} 首歌曲",
                             tracks = plTracks,
                             currentTrackId = playerState.currentTrack?.id,
@@ -669,14 +701,15 @@ private fun LxPureRoot(container: AppContainer) {
                             bottomPadding = contentBottomPadding,
                             showDeletePlaylistAction = true,
                             emptyHint = "歌单里还没有歌曲，可在播放页或歌曲菜单中添加",
-                            onBack = { backStack.removeAt(backStack.lastIndex) },
+                            onBack = { popBackStack() },
                             onPlayAll = { container.playerController.playTracks(plTracks, 0, plSource) },
                             onPlayTrackAt = { idx -> container.playerController.playTracks(plTracks, idx, plSource) },
                             onTrackMore = { actionSheetTrack = it },
                             onDeletePlaylist = {
+                                val deletedId = topRoute.playlistId
                                 scope.launch {
-                                    container.libraryRepository.deletePlaylist(topRoute.playlist.id)
-                                    backStack.removeAt(backStack.lastIndex)
+                                    container.libraryRepository.deletePlaylist(deletedId)
+                                    backStack.removeAll { it is SubRoute.UserPlaylistDetail && it.playlistId == deletedId }
                                     showToast("已删除歌单")
                                 }
                             }
@@ -684,13 +717,14 @@ private fun LxPureRoot(container: AppContainer) {
                     }
 
                     is SubRoute.OnlinePlaylistDetail -> OnlinePlaylistDetailScreen(
+                        loadKey = "pl_${topRoute.playlist.source.code}_${topRoute.playlist.id}",
                         title = topRoute.playlist.name,
                         coverUrl = topRoute.playlist.coverUrl,
                         loadDetail = { container.musicAggregator.getPlaylistDetail(topRoute.playlist.source, topRoute.playlist.id) },
                         currentTrackId = playerState.currentTrack?.id,
                         isPlaying = playerState.isPlaying,
                         bottomPadding = contentBottomPadding,
-                        onBack = { backStack.removeAt(backStack.lastIndex) },
+                        onBack = { popBackStack() },
                         onPlayTracks = { list, idx ->
                             container.playerController.playTracks(
                                 list,
@@ -703,12 +737,17 @@ private fun LxPureRoot(container: AppContainer) {
                             )
                         },
                         onSaveToLibrary = { res ->
+                            val srcKey = "${res.playlist.source.code}:${res.playlist.id}"
+                            if (playlists.any { it.sourceUrl == srcKey }) {
+                                showToast("《${res.playlist.name}》已在我的歌单中")
+                                return@OnlinePlaylistDetailScreen
+                            }
                             scope.launch {
                                 container.libraryRepository.createPlaylist(
                                     name = res.playlist.name,
                                     description = res.playlist.description,
                                     coverUrl = res.playlist.coverUrl,
-                                    sourceUrl = "${res.playlist.source.code}:${res.playlist.id}",
+                                    sourceUrl = srcKey,
                                     tracks = res.tracks
                                 )
                                 showToast("已收藏到我的歌单：《${res.playlist.name}》")
@@ -718,13 +757,14 @@ private fun LxPureRoot(container: AppContainer) {
                     )
 
                     is SubRoute.LeaderboardDetail -> OnlinePlaylistDetailScreen(
+                        loadKey = "lb_${topRoute.board.source.code}_${topRoute.board.id}",
                         title = topRoute.board.name,
                         coverUrl = null,
                         loadDetail = { container.musicAggregator.getLeaderboardDetail(topRoute.board) },
                         currentTrackId = playerState.currentTrack?.id,
                         isPlaying = playerState.isPlaying,
                         bottomPadding = contentBottomPadding,
-                        onBack = { backStack.removeAt(backStack.lastIndex) },
+                        onBack = { popBackStack() },
                         onPlayTracks = { list, idx ->
                             container.playerController.playTracks(
                                 list,
@@ -737,12 +777,17 @@ private fun LxPureRoot(container: AppContainer) {
                             )
                         },
                         onSaveToLibrary = { res ->
+                            val srcKey = "leaderboard:${topRoute.board.source.code}:${topRoute.board.id}"
+                            if (playlists.any { it.sourceUrl == srcKey }) {
+                                showToast("榜单《${res.playlist.name}》已在我的歌单中")
+                                return@OnlinePlaylistDetailScreen
+                            }
                             scope.launch {
                                 container.libraryRepository.createPlaylist(
                                     name = res.playlist.name,
                                     description = res.playlist.description,
                                     coverUrl = res.playlist.coverUrl,
-                                    sourceUrl = "leaderboard:${topRoute.board.source.code}:${topRoute.board.id}",
+                                    sourceUrl = srcKey,
                                     tracks = res.tracks
                                 )
                                 showToast("已收藏榜单：《${res.playlist.name}》")
@@ -758,7 +803,7 @@ private fun LxPureRoot(container: AppContainer) {
                         cacheBytes = cacheBytes,
                         isCheckingUpdate = updateState is AppUpdateState.Checking,
                         bottomPadding = contentBottomPadding,
-                        onBack = { backStack.removeAt(backStack.lastIndex) },
+                        onBack = { popBackStack() },
                         onOpenSourceManager = { backStack.add(SubRoute.SourceManager) },
                         onSelectQuality = { q -> scope.launch { container.settingsDataStore.setPreferredQuality(q) } },
                         onToggleAutoFallback = { e -> scope.launch { container.settingsDataStore.setAutoFallback(e) } },
@@ -781,9 +826,10 @@ private fun LxPureRoot(container: AppContainer) {
                         sources = sources,
                         userApiManager = container.userApiManager,
                         bottomPadding = contentBottomPadding,
-                        onBack = { backStack.removeAt(backStack.lastIndex) },
+                        onBack = { popBackStack() },
                         onMessage = { showToast(it) }
                     )
+                }
                 }
             }
 
@@ -815,18 +861,11 @@ private fun LxPureRoot(container: AppContainer) {
                     if (hasBottomDock) {
                         Spacer(Modifier.height(10.dp))
                     }
-                    if (!isPlayerExpanded) {
-                        SnackbarHost(
-                            hostState = snackbarHostState,
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)
-                        ) { data ->
-                            MinimalGlassSnackbar(data = data)
-                        }
-                    }
 
                     if (hasCurrentTrack) {
                         FloatingMiniPlayer(
                             state = playerState,
+                            progressFlow = container.playerController.progress,
                             onExpand = { isPlayerExpanded = true },
                             onTogglePlayPause = { container.playerController.togglePlayPause() },
                             onNext = { container.playerController.next() },
@@ -861,6 +900,7 @@ private fun LxPureRoot(container: AppContainer) {
                 ) {
                     FullPlayerScreen(
                         state = playerState,
+                        progressFlow = container.playerController.progress,
                         isFavorite = cur != null && cur.id in favoriteIds,
                         downloadRecord = currentDownloadRecord,
                         preferredQuality = settings.preferredQuality,
@@ -882,25 +922,32 @@ private fun LxPureRoot(container: AppContainer) {
                         onDownload = { track -> triggerTrackDownload(track) },
                         onOpenQueue = { showQueueSheet = true },
                         onSelectQuality = { q ->
+                            scope.launch { container.settingsDataStore.setPreferredQuality(q) }
                             container.playerController.retryWithQuality(q)
-                            showToast("正在切换至 ${q.label}")
                         },
                         onSetSleepTimer = { mins ->
                             container.playerController.setSleepTimerMinutes(mins)
                         }
                     )
-
-                    // Float glass toast cleanly above the 4 bottom utility icons in FullPlayerScreen
-                    SnackbarHost(
-                        hostState = snackbarHostState,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .navigationBarsPadding()
-                            .padding(start = 18.dp, end = 18.dp, bottom = 82.dp)
-                    ) { data ->
-                        MinimalGlassSnackbar(data = data)
-                    }
                 }
+            }
+
+            // Single root SnackbarHost eliminates dual-mount clashes during FullPlayer expand/collapse animations
+            val snackbarBottomOffset = when {
+                isPlayerExpanded && hasCurrentTrack -> 82.dp
+                showBottomNav && hasCurrentTrack -> 152.dp
+                showBottomNav -> 84.dp
+                hasCurrentTrack -> 84.dp
+                else -> 16.dp
+            }
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(start = 16.dp, end = 16.dp, bottom = snackbarBottomOffset)
+            ) { data ->
+                MinimalGlassSnackbar(data = data)
             }
         }
 
@@ -918,8 +965,13 @@ private fun LxPureRoot(container: AppContainer) {
                     )
                     showQueueSheet = false
                 },
-                onRemoveIndex = { idx -> container.playerController.removeFromQueue(idx) },
+                onRemoveIndex = { idx ->
+                    val willEmpty = playerState.queue.size <= 1
+                    container.playerController.removeFromQueue(idx)
+                    if (willEmpty) showQueueSheet = false
+                },
                 onClearQueue = { container.playerController.clearQueue() },
+                onCycleRepeat = { container.playerController.cycleRepeatMode() },
                 onOpenQueueSource = { source -> navigateToQueueSource(source) }
             )
         }
@@ -936,12 +988,14 @@ private fun LxPureRoot(container: AppContainer) {
         }
 
         actionSheetTrack?.let { track ->
-            val activeUserPlaylist = (backStack.lastOrNull() as? SubRoute.UserPlaylistDetail)?.playlist
+            val activePlaylistId = (backStack.lastOrNull() as? SubRoute.UserPlaylistDetail)?.playlistId
+            val activeUserPlaylist = activePlaylistId?.let { id -> playlists.firstOrNull { it.id == id } }
             TrackActionSheet(
                 track = track,
                 isFavorite = track.id in favoriteIds,
                 onDismiss = { actionSheetTrack = null },
                 onPlayNext = { container.playerController.playNextInQueue(track) },
+                onAddToQueue = { container.playerController.addToQueue(track) },
                 onToggleFavorite = {
                     scope.launch {
                         val liked = container.libraryRepository.toggleFavorite(track)

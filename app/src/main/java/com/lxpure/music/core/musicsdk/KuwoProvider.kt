@@ -1,6 +1,7 @@
 package com.lxpure.music.core.musicsdk
 
 import com.lxpure.music.domain.model.LeaderboardItem
+import com.lxpure.music.domain.model.LyricLine
 import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.OnlinePlaylist
 import com.lxpure.music.domain.model.ParsedLyrics
@@ -17,6 +18,9 @@ import kotlinx.serialization.json.JsonObject
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.URLEncoder
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.roundToLong
 
 class KuwoProvider(private val httpClient: OkHttpClient) {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -56,27 +60,27 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
     )
 
     suspend fun search(query: String, page: Int = 1, limit: Int = 25): List<Track> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val encoded = URLEncoder.encode(query, "UTF-8")
             val url = "http://search.kuwo.cn/r.s?client=kt&all=$encoded&pn=${page - 1}&rn=$limit&uid=794762570&ver=kwplayer_ar_9.2.2.1&vipver=1&show_copyright_off=1&newver=1&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1&issubtitle=1"
-            val body = getString(url) ?: return@runCatching emptyList()
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@runCatching emptyList()
-            val absList = root["abslist"].asJsonArrayOrNull() ?: return@runCatching emptyList()
+            val body = getString(url) ?: return@suspendRunCatching emptyList()
+            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@suspendRunCatching emptyList()
+            val absList = root["abslist"].asJsonArrayOrNull() ?: return@suspendRunCatching emptyList()
 
             absList.mapNotNull { el ->
                 runCatching {
                     val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
-                    val rid = obj["MUSICRID"].asStringOrNull()?.removePrefix("MUSIC_") ?: return@mapNotNull null
-                    val name = FormatUtils.decodeHtml(obj["SONGNAME"].asStringOrNull() ?: obj["NAME"].asStringOrNull())
+                    val rid = obj["MUSICRID"].asNonBlankStringOrNull()?.removePrefix("MUSIC_") ?: return@mapNotNull null
+                    val name = FormatUtils.decodeHtml(obj["SONGNAME"].asNonBlankStringOrNull() ?: obj["NAME"].asNonBlankStringOrNull())
                         .ifBlank { return@mapNotNull null }
                     val artist = FormatUtils.decodeHtml(obj["ARTIST"].asStringOrNull())
                         .replace("&", " / ")
                         .ifBlank { "未知歌手" }
                     val album = FormatUtils.decodeHtml(obj["ALBUM"].asStringOrNull())
                     val durationSec = obj["DURATION"].asLongOrNull() ?: 0L
-                    val rawPic = obj["hts_MVPIC"].asStringOrNull()
-                        ?: obj["web_albumpic_short"].asStringOrNull()
-                        ?: obj["albumpic"].asStringOrNull()
+                    val rawPic = obj["hts_MVPIC"].asNonBlankStringOrNull()
+                        ?: obj["web_albumpic_short"].asNonBlankStringOrNull()
+                        ?: obj["albumpic"].asNonBlankStringOrNull()
                     val cover = normalizeKuwoImageUrl(rawPic)
 
                     Track(
@@ -89,7 +93,7 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                         durationMs = durationSec * 1000L,
                         coverUrl = cover,
                         albumId = obj["ALBUMID"].asStringOrNull(),
-                        qualities = parseMinfoQualities(obj["N_MINFO"].asStringOrNull())
+                        qualities = parseMinfoQualities(obj["N_MINFO"].asNonBlankStringOrNull() ?: obj["n_minfo"].asNonBlankStringOrNull())
                     )
                 }.getOrNull()
             }
@@ -97,11 +101,11 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getHotPlaylists(page: Int = 1, limit: Int = 20): List<OnlinePlaylist> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val url = "http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList?loginUid=0&loginSid=0&appUid=76039576&pn=$page&rn=$limit&order=hot"
-            val body = getString(url) ?: return@runCatching emptyList()
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@runCatching emptyList()
-            val list = root["data"].asJsonObjectOrNull()?.get("data").asJsonArrayOrNull() ?: return@runCatching emptyList()
+            val body = getString(url) ?: return@suspendRunCatching emptyList()
+            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@suspendRunCatching emptyList()
+            val list = root["data"].asJsonObjectOrNull()?.get("data").asJsonArrayOrNull() ?: return@suspendRunCatching emptyList()
             list.mapNotNull { el ->
                 runCatching {
                     val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
@@ -122,7 +126,7 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getPlaylistDetail(rawIdOrUrl: String): Result<PlaylistDetailResult> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val id = extractPlaylistId(rawIdOrUrl) ?: error("无法识别酷我歌单 ID")
             val pageSize = 500
             val maxPages = 20
@@ -138,6 +142,9 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                     ?: if (page == 0) error("获取酷我歌单失败，请检查网络连接") else break
                 val root = json.parseToJsonElement(body).asJsonObjectOrNull()
                     ?: if (page == 0) error("酷我歌单数据异常") else break
+                if (root["result"].asStringOrNull().equals("fail", ignoreCase = true)) {
+                    if (page == 0) error("酷我歌单不存在或暂无访问权限") else break
+                }
                 if (firstRoot == null) {
                     firstRoot = root
                     totalExpected = root["total"].asIntOrNull() ?: pageSize
@@ -150,18 +157,19 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                 musicList.forEach { el ->
                     val track = runCatching {
                         val obj = el.asJsonObjectOrNull() ?: return@runCatching null
-                        val rid = obj["id"].asStringOrNull() ?: return@runCatching null
+                        val rid = obj["id"].asNonBlankStringOrNull() ?: return@runCatching null
+                        val title = FormatUtils.decodeHtml(obj["name"].asNonBlankStringOrNull()).ifBlank { return@runCatching null }
                         Track(
                             id = "kw_$rid",
-                            title = FormatUtils.decodeHtml(obj["name"].asStringOrNull()),
-                            artist = FormatUtils.decodeHtml(obj["artist"].asStringOrNull()).replace("&", " / "),
+                            title = title,
+                            artist = FormatUtils.decodeHtml(obj["artist"].asStringOrNull()).replace("&", " / ").ifBlank { "未知歌手" },
                             album = FormatUtils.decodeHtml(obj["album"].asStringOrNull()),
                             source = MusicSource.KW,
                             songmid = rid,
                             durationMs = (obj["duration"].asLongOrNull() ?: 0L) * 1000L,
                             coverUrl = extractInlineCover(obj),
                             albumId = obj["albumid"].asStringOrNull(),
-                            qualities = parseMinfoQualities(obj["N_MINFO"].asStringOrNull() ?: obj["n_minfo"].asStringOrNull())
+                            qualities = parseMinfoQualities(obj["N_MINFO"].asNonBlankStringOrNull() ?: obj["n_minfo"].asNonBlankStringOrNull())
                         )
                     }.getOrNull()
                     if (track != null && seenIds.add(track.id)) {
@@ -171,11 +179,16 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                 }
                 if (added == 0 || musicList.size < pageSize) break
             }
-            val tracks = hydrateMissingCovers(allRawTracks)
 
+            val rootTitle = firstRoot?.get("title").asNonBlankStringOrNull()
+            if (allRawTracks.isEmpty() && rootTitle == null) {
+                error("酷我歌单不存在或暂无访问权限")
+            }
+
+            val tracks = hydrateMissingCovers(allRawTracks)
             val meta = OnlinePlaylist(
                 id = id,
-                name = FormatUtils.decodeHtml(firstRoot?.get("title").asStringOrNull() ?: "酷我歌单"),
+                name = FormatUtils.decodeHtml(rootTitle ?: "酷我歌单"),
                 coverUrl = normalizeKuwoImageUrl(firstRoot?.get("pic").asStringOrNull()).orEmpty(),
                 author = FormatUtils.decodeHtml(firstRoot?.get("uname").asStringOrNull()),
                 playCount = FormatUtils.formatPlayCount(firstRoot?.get("playnum").asLongOrNull() ?: 0L),
@@ -188,7 +201,7 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getLeaderboardDetail(board: LeaderboardItem): Result<PlaylistDetailResult> = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val url = "http://kbangserver.kuwo.cn/ksong.s?from=pc&fmt=json&pn=0&rn=100&type=bang&data=content&id=${board.bangId}&show_copyright_off=0&pcmp4=1&isbang=1"
             val body = getString(url) ?: error("获取酷我榜单失败，请检查网络连接")
             val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: error("酷我榜单数据异常")
@@ -196,30 +209,31 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
             val rawTracks = list.mapNotNull { el ->
                 runCatching {
                     val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
-                    val rid = obj["id"].asStringOrNull() ?: return@mapNotNull null
+                    val rid = obj["id"].asNonBlankStringOrNull() ?: return@mapNotNull null
+                    val title = FormatUtils.decodeHtml(obj["name"].asNonBlankStringOrNull()).ifBlank { return@mapNotNull null }
                     Track(
                         id = "kw_$rid",
-                        title = FormatUtils.decodeHtml(obj["name"].asStringOrNull()),
-                        artist = FormatUtils.decodeHtml(obj["artist"].asStringOrNull()).replace("&", " / "),
+                        title = title,
+                        artist = FormatUtils.decodeHtml(obj["artist"].asStringOrNull()).replace("&", " / ").ifBlank { "未知歌手" },
                         album = FormatUtils.decodeHtml(obj["album"].asStringOrNull()),
                         source = MusicSource.KW,
                         songmid = rid,
                         durationMs = (obj["duration"].asLongOrNull() ?: 0L) * 1000L,
                         coverUrl = extractInlineCover(obj),
                         albumId = obj["albumid"].asStringOrNull(),
-                        qualities = parseMinfoQualities(obj["n_minfo"].asStringOrNull() ?: obj["N_MINFO"].asStringOrNull())
+                        qualities = parseMinfoQualities(obj["n_minfo"].asNonBlankStringOrNull() ?: obj["N_MINFO"].asNonBlankStringOrNull())
                     )
                 }.getOrNull()
             }
             val tracks = hydrateMissingCovers(rawTracks)
             val boardPic = normalizeKuwoImageUrl(
-                root["pic5"].asStringOrNull()?.takeIf { it.isNotBlank() }
-                    ?: root["pic2"].asStringOrNull()?.takeIf { it.isNotBlank() }
-                    ?: root["pic"].asStringOrNull()
+                root["pic5"].asNonBlankStringOrNull()
+                    ?: root["pic2"].asNonBlankStringOrNull()
+                    ?: root["pic"].asNonBlankStringOrNull()
             ).orEmpty()
             val meta = OnlinePlaylist(
                 id = board.bangId,
-                name = root["name"].asStringOrNull() ?: board.name,
+                name = root["name"].asNonBlankStringOrNull() ?: board.name,
                 coverUrl = boardPic,
                 author = "酷我音乐官方榜",
                 playCount = root["pub"].asStringOrNull().orEmpty(),
@@ -231,27 +245,37 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
     }
 
     suspend fun getLyric(songmid: String): ParsedLyrics = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val url = "http://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=$songmid"
-            val body = getString(url) ?: return@runCatching ParsedLyrics()
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@runCatching ParsedLyrics()
+            val body = getString(url) ?: return@suspendRunCatching ParsedLyrics()
+            val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return@suspendRunCatching ParsedLyrics()
             val lrcList = root["data"].asJsonObjectOrNull()?.get("lrclist").asJsonArrayOrNull()
-                ?: return@runCatching ParsedLyrics()
-            val sb = StringBuilder()
+                ?: return@suspendRunCatching ParsedLyrics()
+            val lines = mutableListOf<LyricLine>()
             lrcList.forEach { el ->
                 val obj = el.asJsonObjectOrNull() ?: return@forEach
                 val sec = obj["time"].asDoubleOrNull() ?: return@forEach
-                val text = obj["lineLyric"].asStringOrNull().orEmpty()
-                val min = (sec / 60).toInt()
-                val remSec = sec % 60
-                sb.append("[%02d:%05.2f]%s\n".format(min, remSec, text))
+                if (!sec.isFinite()) return@forEach
+                val text = FormatUtils.decodeHtml(obj["lineLyric"].asStringOrNull())
+                if (text.isNotEmpty()) {
+                    lines.add(
+                        LyricLine(
+                            timeMs = (sec * 1000.0).roundToLong().coerceAtLeast(0L),
+                            text = text
+                        )
+                    )
+                }
             }
-            LrcParser.parse(sb.toString())
+            if (lines.isEmpty()) {
+                ParsedLyrics()
+            } else {
+                ParsedLyrics(lines = lines.sortedBy { it.timeMs }, hasTranslation = false)
+            }
         }.getOrDefault(ParsedLyrics())
     }
 
     suspend fun resolveCover(songmid: String): String? = withContext(Dispatchers.IO) {
-        runCatching {
+        suspendRunCatching {
             val url = "http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype=500&size=500&rid=$songmid"
             val pic = getString(url)?.trim()
             if (pic != null && pic.startsWith("http", ignoreCase = true)) {
@@ -263,27 +287,33 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
     }
 
     private fun extractInlineCover(obj: JsonObject): String? {
-        val raw = obj["albumpic"].asStringOrNull()?.takeIf { it.isNotBlank() }
-            ?: obj["pic"].asStringOrNull()?.takeIf { it.isNotBlank() }
-            ?: obj["web_albumpic_short"].asStringOrNull()?.takeIf { it.isNotBlank() }
-            ?: obj["pic120"].asStringOrNull()?.takeIf { it.isNotBlank() }
+        val raw = obj["albumpic"].asNonBlankStringOrNull()
+            ?: obj["pic"].asNonBlankStringOrNull()
+            ?: obj["web_albumpic_short"].asNonBlankStringOrNull()
+            ?: obj["pic120"].asNonBlankStringOrNull()
         return normalizeKuwoImageUrl(raw)
     }
 
     /**
      * Kuwo chart/playlist payloads sometimes omit per-track cover URLs.
-     * Concurrently hydrates covers for the visible head items with a tight 1.5s budget so lists never appear gray.
+     * Concurrently hydrates covers with cancellable HTTP calls and preserves partial results on timeout.
      */
     private suspend fun hydrateMissingCovers(tracks: List<Track>, maxHydrate: Int = 24): List<Track> {
         val targets = tracks.take(maxHydrate).filter { it.coverUrl.isNullOrBlank() }
         if (targets.isEmpty()) return tracks
-        val coverMap = withTimeoutOrNull(1_500L) {
+        val coverMap = ConcurrentHashMap<String, String>()
+        withTimeoutOrNull(1_500L) {
             coroutineScope {
                 targets.map { t ->
-                    async { t.songmid to runCatching { resolveCover(t.songmid) }.getOrNull() }
+                    async {
+                        val url = suspendRunCatching { resolveCover(t.songmid) }.getOrNull()
+                        if (!url.isNullOrBlank()) {
+                            coverMap[t.songmid] = url
+                        }
+                    }
                 }.awaitAll()
             }
-        }?.mapNotNull { (rid, url) -> url?.let { rid to it } }?.toMap().orEmpty()
+        }
         if (coverMap.isEmpty()) return tracks
         return tracks.map { track ->
             val hydrated = coverMap[track.songmid]
@@ -291,11 +321,24 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
         }
     }
 
-    private fun extractPlaylistId(raw: String): String? {
+    internal suspend fun extractPlaylistId(raw: String): String? {
         val trimmed = raw.trim()
         if (trimmed.all { it.isDigit() } && trimmed.isNotEmpty()) return trimmed
-        return Regex("/playlist(?:_detail)?/(\\d+)").find(trimmed)?.groupValues?.getOrNull(1)
-            ?: Regex("[?&]pid=(\\d+)").find(trimmed)?.groupValues?.getOrNull(1)
+
+        val idRegex = Regex("(?:/playlist(?:_detail)?/|[?&](?:pid|id)=)(\\d+)", RegexOption.IGNORE_CASE)
+        idRegex.find(trimmed)?.let { return it.groupValues[1] }
+
+        val urlMatch = extractFirstHttpUrl(trimmed) ?: return null
+        val req = Request.Builder()
+            .url(urlMatch)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .build()
+        return suspendRunCatching {
+            httpClient.newCall(req).awaitResponse().use { resp ->
+                val finalUrl = resp.request.url.toString()
+                idRegex.find(finalUrl)?.groupValues?.getOrNull(1)
+            }
+        }.getOrNull()
     }
 
     private fun parseMinfoQualities(minfo: String?): List<QualityInfo> {
@@ -305,7 +348,7 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
         minfo.split(";").forEach { segment ->
             val m = minfoRegex.find(segment) ?: return@forEach
             val bitrate = m.groupValues[2]
-            val size = m.groupValues[4].uppercase()
+            val size = m.groupValues[4].uppercase(Locale.ROOT)
             val type = when (bitrate) {
                 "4000" -> "flac24bit"
                 "2000" -> "flac"
@@ -320,11 +363,11 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
         return result.ifEmpty { listOf(QualityInfo("128k")) }
     }
 
-    private fun getString(url: String): String? {
+    private suspend fun getString(url: String): String? {
         val req = Request.Builder()
             .url(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             .build()
-        return httpClient.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
+        return httpClient.newCall(req).awaitResponse().use { if (it.isSuccessful) it.body?.string() else null }
     }
 }

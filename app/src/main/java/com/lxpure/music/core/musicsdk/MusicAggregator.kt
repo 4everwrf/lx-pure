@@ -9,10 +9,17 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import okhttp3.OkHttpClient
+import java.util.Locale
 import kotlin.math.abs
 
 class MusicAggregator(httpClient: OkHttpClient) {
     companion object {
+        private val variantMarkers = listOf(
+            "伴奏", "纯音乐", "instrumental", "dj", "remix", "live", "现场", "cover", "翻唱", "ktv", "伴唱"
+        )
+        private val artistSplitRegex = Regex("[/、,，&]")
+        private val stripCharsRegex = Regex("[\\s'.,，&\"、()（）`~\\-<>|/\\[\\]!！·]")
+
         /**
          * Platform priority tuned by real-world playback success rate across community LX sources:
          * WY (4) > TX (3) > KW (2) > KG (1) > MG (0)
@@ -28,16 +35,58 @@ class MusicAggregator(httpClient: OkHttpClient) {
 
         /**
          * Picks the primary track and orders alternate platform tracks by real playback reliability first,
-         * then cover availability, then quality richness.
+         * preserving original search rank within each platform so rank #1 is never demoted by an obscure remaster.
          */
         fun selectPrimaryAndAlternates(group: List<Track>): Track {
-            val sorted = group.sortedWith(
+            val bestPerPlatform = group.distinctBy { it.source }
+            val sorted = bestPerPlatform.sortedWith(
                 compareByDescending<Track> { platformPriority(it.source) }
                     .thenByDescending { !it.coverUrl.isNullOrBlank() }
                     .thenByDescending { it.qualities.size }
             )
             val primary = sorted.first()
             return primary.copy(alternates = sorted.drop(1))
+        }
+
+        internal fun normalizeText(str: String): String =
+            str.lowercase(Locale.ROOT).replace(stripCharsRegex, "")
+
+        internal fun artistTokens(artist: String): Set<String> =
+            artist.split(artistSplitRegex)
+                .map { normalizeText(it) }
+                .filter { it.isNotEmpty() && it != "未知歌手" && it != "unknown" }
+                .toSet()
+
+        internal fun hasVariantMismatch(titleA: String, titleB: String): Boolean {
+            val a = titleA.lowercase(Locale.ROOT)
+            val b = titleB.lowercase(Locale.ROOT)
+            return variantMarkers.any { marker -> a.contains(marker) != b.contains(marker) }
+        }
+
+        internal fun isTrackMatch(source: Track, candidate: Track, maxDurationDiffMs: Long = 7_000L): Boolean {
+            val fTitle = normalizeText(source.title)
+            val cTitle = normalizeText(candidate.title)
+            if (fTitle.isEmpty() || cTitle.isEmpty()) return false
+            if (hasVariantMismatch(source.title, candidate.title)) return false
+
+            val titleMatch = if (fTitle.length <= 1 || cTitle.length <= 1) {
+                fTitle == cTitle
+            } else {
+                cTitle == fTitle || cTitle.contains(fTitle) || fTitle.contains(cTitle)
+            }
+            if (!titleMatch) return false
+
+            val fTokens = artistTokens(source.artist)
+            val cTokens = artistTokens(candidate.artist)
+            val artistMatch = if (fTokens.isEmpty() || cTokens.isEmpty()) {
+                true
+            } else {
+                fTokens.any { ft -> cTokens.any { ct -> ct == ft || ct.contains(ft) || ft.contains(ct) } }
+            }
+            if (!artistMatch) return false
+
+            return source.durationMs <= 0L || candidate.durationMs <= 0L ||
+                abs(source.durationMs - candidate.durationMs) <= maxDurationDiffMs
         }
     }
 
@@ -62,7 +111,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
     suspend fun searchAggregated(query: String, limitPerPlatform: Int = 15): List<Track> = coroutineScope {
         val platforms = listOf(MusicSource.WY, MusicSource.TX, MusicSource.KW, MusicSource.KG)
         val batches = platforms.map { platform ->
-            async { runCatching { searchSinglePlatform(platform, query, 1, limitPerPlatform) }.getOrDefault(emptyList()) }
+            async { suspendRunCatching { searchSinglePlatform(platform, query, 1, limitPerPlatform) }.getOrDefault(emptyList()) }
         }.awaitAll()
 
         // Interleave by rank so top matches from all platforms surface fairly
@@ -74,13 +123,29 @@ class MusicAggregator(httpClient: OkHttpClient) {
             }
         }
 
-        val grouped = LinkedHashMap<String, MutableList<Track>>()
+        // Group only truly equivalent cross-platform tracks (never collapsing distinct durations or same-platform tracks)
+        val groups = mutableListOf<MutableList<Track>>()
+        val keyBuckets = HashMap<String, MutableList<MutableList<Track>>>()
+
         interleaved.forEach { track ->
             val key = normalizeKey(track.title, track.artist)
-            grouped.getOrPut(key) { mutableListOf() }.add(track)
+            val buckets = keyBuckets.getOrPut(key) { mutableListOf() }
+            val matchingGroup = buckets.firstOrNull { group ->
+                val head = group.first()
+                group.none { it.source == track.source } &&
+                    !hasVariantMismatch(head.title, track.title) &&
+                    (head.durationMs <= 0L || track.durationMs <= 0L || abs(head.durationMs - track.durationMs) <= 12_000L)
+            }
+            if (matchingGroup != null) {
+                matchingGroup.add(track)
+            } else {
+                val newGroup = mutableListOf(track)
+                buckets.add(newGroup)
+                groups.add(newGroup)
+            }
         }
 
-        grouped.values.map { group -> selectPrimaryAndAlternates(group) }
+        groups.map { group -> selectPrimaryAndAlternates(group) }
     }
 
     /**
@@ -91,22 +156,21 @@ class MusicAggregator(httpClient: OkHttpClient) {
             .filter { it != track.source && it.code in allowedPlatformCodes }
         if (targetPlatforms.isEmpty()) return@coroutineScope emptyList()
 
-        val query = "${track.title} ${track.artist.split("/").firstOrNull().orEmpty()}".trim()
         val fTitle = normalizeText(track.title)
-        val fArtist = normalizeText(track.artist)
+        if (fTitle.isEmpty()) return@coroutineScope emptyList()
+
+        val primaryArtist = track.artist.split(artistSplitRegex)
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && it != "未知歌手" }
+            .orEmpty()
+        val query = "${track.title} $primaryArtist".trim()
 
         val candidates = targetPlatforms.map { platform ->
-            async { runCatching { searchSinglePlatform(platform, query, 1, 10) }.getOrDefault(emptyList()) }
+            async { suspendRunCatching { searchSinglePlatform(platform, query, 1, 10) }.getOrDefault(emptyList()) }
         }.awaitAll().flatten()
 
         candidates.filter { candidate ->
-            val cTitle = normalizeText(candidate.title)
-            val cArtist = normalizeText(candidate.artist)
-            val titleMatch = cTitle == fTitle || cTitle.contains(fTitle) || fTitle.contains(cTitle)
-            val artistMatch = fArtist.isEmpty() || cArtist.contains(fArtist) || fArtist.contains(cArtist)
-            val durationMatch = track.durationMs <= 0L || candidate.durationMs <= 0L ||
-                abs(track.durationMs - candidate.durationMs) <= 7_000L
-            titleMatch && artistMatch && durationMatch
+            isTrackMatch(track, candidate)
         }.sortedWith(
             compareBy<Track> { if (normalizeText(it.title) == fTitle) 0 else 1 }
                 .thenByDescending { platformPriority(it.source) }
@@ -175,10 +239,21 @@ class MusicAggregator(httpClient: OkHttpClient) {
         }
         if (!direct.isEmpty) return direct
 
-        // Fallback lyric lookup via NetEase search (great for local files or tracks lacking lyrics)
-        val matched = runCatching {
-            netEase.search("${track.title} ${track.artist}".trim(), 1, 3).firstOrNull()
-        }.getOrNull() ?: return ParsedLyrics()
+        // Fallback lyric lookup via NetEase search (guarded by title/artist/duration match)
+        val primaryArtist = track.artist.split(artistSplitRegex)
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && it != "未知歌手" }
+            .orEmpty()
+        val query = "${track.title} $primaryArtist".trim()
+        if (query.isEmpty()) return ParsedLyrics()
+
+        val candidates = suspendRunCatching {
+            netEase.search(query, 1, 5)
+        }.getOrDefault(emptyList())
+        val matched = candidates.firstOrNull { cand ->
+            !(track.source == MusicSource.WY && cand.songmid == track.songmid) &&
+                isTrackMatch(track, cand, maxDurationDiffMs = 10_000L)
+        } ?: return ParsedLyrics()
         return netEase.getLyric(matched.songmid)
     }
 
@@ -190,12 +265,8 @@ class MusicAggregator(httpClient: OkHttpClient) {
         return null
     }
 
-    private fun normalizeText(str: String): String =
-        str.lowercase()
-            .replace(Regex("[\\s'.,，&\"、()（）`~\\-<>|/\\[\\]!！·]"), "")
-
     private fun normalizeKey(title: String, artist: String): String {
-        val firstArtist = artist.split("/", "、", ",", "，", "&").firstOrNull().orEmpty()
-        return "${normalizeText(title)}_${normalizeText(firstArtist)}"
+        val sortedArtists = artistTokens(artist).sorted().joinToString("_")
+        return "${normalizeText(title)}_$sortedArtists"
     }
 }

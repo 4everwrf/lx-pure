@@ -1,6 +1,12 @@
 import Foundation
 
 final class MusicAggregator: Sendable {
+    private static let variantMarkers: [String] = [
+        "伴奏", "纯音乐", "instrumental", "dj", "remix", "live", "现场", "cover", "翻唱", "ktv", "伴唱"
+    ]
+    private static let artistSeparators = CharacterSet(charactersIn: "/、,，&")
+    private static let stripPunctuation = CharacterSet(charactersIn: "'.,，&\"、()（）`~-<>|/[]!！·")
+
     let netEase: NetEaseProvider
     let qq: QqMusicProvider
     let kuwo: KuwoProvider
@@ -25,7 +31,9 @@ final class MusicAggregator: Sendable {
     }
 
     static func selectPrimaryAndAlternates(_ group: [Track]) -> Track {
-        let sorted = group.sorted { lhs, rhs in
+        var seenPlatforms = Set<MusicSource>()
+        let bestPerPlatform = group.filter { seenPlatforms.insert($0.source).inserted }
+        let sorted = bestPerPlatform.sorted { lhs, rhs in
             let lp = platformPriority(lhs.source)
             let rp = platformPriority(rhs.source)
             if lp != rp { return lp > rp }
@@ -37,6 +45,60 @@ final class MusicAggregator: Sendable {
         var primary = sorted[0]
         primary.alternates = Array(sorted.dropFirst())
         return primary
+    }
+
+    static func normalizeText(_ str: String) -> String {
+        let lowered = str.lowercased()
+        return lowered.unicodeScalars.filter { scalar in
+            !CharacterSet.whitespacesAndNewlines.contains(scalar) && !stripPunctuation.contains(scalar)
+        }.map(String.init).joined()
+    }
+
+    static func artistTokens(_ artist: String) -> Set<String> {
+        Set(
+            artist.components(separatedBy: artistSeparators)
+                .map { normalizeText($0) }
+                .filter { !$0.isEmpty && $0 != "未知歌手" && $0 != "unknown" }
+        )
+    }
+
+    static func hasVariantMismatch(_ titleA: String, _ titleB: String) -> Bool {
+        let a = titleA.lowercased()
+        let b = titleB.lowercased()
+        return variantMarkers.contains { marker in
+            a.contains(marker) != b.contains(marker)
+        }
+    }
+
+    static func isTrackMatch(_ source: Track, _ candidate: Track, maxDurationDiffMs: Int64 = 7_000) -> Bool {
+        let fTitle = normalizeText(source.title)
+        let cTitle = normalizeText(candidate.title)
+        guard !fTitle.isEmpty, !cTitle.isEmpty else { return false }
+        if hasVariantMismatch(source.title, candidate.title) { return false }
+
+        let titleMatch: Bool
+        if fTitle.count <= 1 || cTitle.count <= 1 {
+            titleMatch = (fTitle == cTitle)
+        } else {
+            titleMatch = (cTitle == fTitle) || cTitle.contains(fTitle) || fTitle.contains(cTitle)
+        }
+        guard titleMatch else { return false }
+
+        let fTokens = artistTokens(source.artist)
+        let cTokens = artistTokens(candidate.artist)
+        if !fTokens.isEmpty && !cTokens.isEmpty {
+            let hasOverlap = fTokens.contains { ft in
+                cTokens.contains { ct in ct == ft || ct.contains(ft) || ft.contains(ct) }
+            }
+            if !hasOverlap { return false }
+        }
+
+        if source.durationMs > 0 && candidate.durationMs > 0 {
+            if abs(source.durationMs - candidate.durationMs) > maxDurationDiffMs {
+                return false
+            }
+        }
+        return true
     }
 
     func searchSinglePlatform(source: MusicSource, query: String, page: Int = 1, limit: Int = 25) async -> [Track] {
@@ -72,22 +134,34 @@ final class MusicAggregator: Sendable {
             }
         }
 
-        var keyOrder: [String] = []
-        var grouped: [String: [Track]] = [:]
+        var groups: [[Track]] = []
+        var keyToGroupIndices: [String: [Int]] = [:]
+
         for track in interleaved {
             let key = normalizeKey(title: track.title, artist: track.artist)
-            if grouped[key] == nil {
-                keyOrder.append(key)
-                grouped[key] = [track]
+            let bucketIndices = keyToGroupIndices[key] ?? []
+            var matchedGroupIdx: Int?
+            for gIdx in bucketIndices {
+                let group = groups[gIdx]
+                guard let head = group.first else { continue }
+                let samePlatformExists = group.contains { $0.source == track.source }
+                let variantClash = Self.hasVariantMismatch(head.title, track.title)
+                let durationOk = head.durationMs <= 0 || track.durationMs <= 0 || abs(head.durationMs - track.durationMs) <= 12_000
+                if !samePlatformExists && !variantClash && durationOk {
+                    matchedGroupIdx = gIdx
+                    break
+                }
+            }
+            if let gIdx = matchedGroupIdx {
+                groups[gIdx].append(track)
             } else {
-                grouped[key]?.append(track)
+                let newIdx = groups.count
+                groups.append([track])
+                keyToGroupIndices[key, default: []].append(newIdx)
             }
         }
 
-        return keyOrder.compactMap { key in
-            guard let group = grouped[key], !group.isEmpty else { return nil }
-            return Self.selectPrimaryAndAlternates(group)
-        }
+        return groups.map { Self.selectPrimaryAndAlternates($0) }
     }
 
     func findAlternativeTracks(for track: Track, allowedPlatformCodes: Set<String>) async -> [Track] {
@@ -96,10 +170,14 @@ final class MusicAggregator: Sendable {
         }
         guard !targetPlatforms.isEmpty else { return [] }
 
-        let firstArtist = track.artist.components(separatedBy: "/").first ?? ""
-        let query = "\(track.title) \(firstArtist)".trimmingCharacters(in: .whitespacesAndNewlines)
-        let fTitle = normalizeText(track.title)
-        let fArtist = normalizeText(track.artist)
+        let fTitle = Self.normalizeText(track.title)
+        guard !fTitle.isEmpty else { return [] }
+
+        let primaryArtist = track.artist
+            .components(separatedBy: Self.artistSeparators)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && $0 != "未知歌手" } ?? ""
+        let query = "\(track.title) \(primaryArtist)".trimmingCharacters(in: .whitespacesAndNewlines)
 
         let candidates: [Track] = await withTaskGroup(of: [Track].self) { group in
             for platform in targetPlatforms {
@@ -113,16 +191,10 @@ final class MusicAggregator: Sendable {
         }
 
         return candidates.filter { candidate in
-            let cTitle = normalizeText(candidate.title)
-            let cArtist = normalizeText(candidate.artist)
-            let titleMatch = cTitle == fTitle || cTitle.contains(fTitle) || fTitle.contains(cTitle)
-            let artistMatch = fArtist.isEmpty || cArtist.contains(fArtist) || fArtist.contains(cArtist)
-            let durationMatch = track.durationMs <= 0 || candidate.durationMs <= 0 ||
-                abs(track.durationMs - candidate.durationMs) <= 7_000
-            return titleMatch && artistMatch && durationMatch
+            Self.isTrackMatch(track, candidate)
         }.sorted { lhs, rhs in
-            let lExact = normalizeText(lhs.title) == fTitle ? 0 : 1
-            let rExact = normalizeText(rhs.title) == fTitle ? 0 : 1
+            let lExact = Self.normalizeText(lhs.title) == fTitle ? 0 : 1
+            let rExact = Self.normalizeText(rhs.title) == fTitle ? 0 : 1
             if lExact != rExact { return lExact < rExact }
             let lp = Self.platformPriority(lhs.source)
             let rp = Self.platformPriority(rhs.source)
@@ -202,9 +274,18 @@ final class MusicAggregator: Sendable {
         }
         if !direct.isEmpty { return direct }
 
-        let query = "\(track.title) \(track.artist)".trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty,
-              let matched = await netEase.search(query: query, page: 1, limit: 3).first else {
+        let primaryArtist = track.artist
+            .components(separatedBy: Self.artistSeparators)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && $0 != "未知歌手" } ?? ""
+        let query = "\(track.title) \(primaryArtist)".trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return ParsedLyrics() }
+
+        let candidates = await netEase.search(query: query, page: 1, limit: 5)
+        guard let matched = candidates.first(where: { cand in
+            !(track.source == .wy && cand.songmid == track.songmid) &&
+                Self.isTrackMatch(track, cand, maxDurationDiffMs: 10_000)
+        }) else {
             return ParsedLyrics()
         }
         return await netEase.getLyric(songmid: matched.songmid)
@@ -218,15 +299,8 @@ final class MusicAggregator: Sendable {
         return nil
     }
 
-    private func normalizeText(_ str: String) -> String {
-        let lowered = str.lowercased()
-        let invalid = CharacterSet(charactersIn: " \t\n\r'.,，&\"、()（）`~-<>|/[]!！·")
-        return lowered.unicodeScalars.filter { !invalid.contains($0) }.map(String.init).joined()
-    }
-
     private func normalizeKey(title: String, artist: String) -> String {
-        let separators = CharacterSet(charactersIn: "/、,，&")
-        let firstArtist = artist.components(separatedBy: separators).first ?? ""
-        return "\(normalizeText(title))_\(normalizeText(firstArtist))"
+        let sortedArtists = Self.artistTokens(artist).sorted().joined(separator: "_")
+        return "\(Self.normalizeText(title))_\(sortedArtists)"
     }
 }

@@ -11,6 +11,7 @@ import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.domain.model.UserApiRuntimeStatus
 import com.lxpure.music.domain.model.UserApiSource
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,18 +26,25 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.CacheControl
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.nio.charset.StandardCharsets
 import java.util.Collections
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 
 data class ResolvedStream(
@@ -99,19 +107,41 @@ class UserApiManager(
         private const val SCRIPT_URL_TIMEOUT_MS = 4_500L
         private const val STREAM_PROBE_TIMEOUT_MS = 2_500L
         private const val COOLDOWN_MS = 45_000L
+        private const val MAX_SCRIPT_DOWNLOAD_BYTES = 2 * 1024 * 1024 // 2 MB cap
 
         /**
-         * Validates a downloaded custom source script while rejecting HTML/JSON error pages.
-         * Supports both plain JS and hex-escaped scripts referencing `globalThis.lx`.
+         * Validates a downloaded custom source script while rejecting HTML/JSON error pages
+         * (including those prefixed with a UTF-8 BOM).
          */
         fun isValidDownloadedScript(content: String?): Boolean {
             if (content.isNullOrBlank() || content.length < 150) return false
-            val trimmed = content.trimStart()
-            if (trimmed.startsWith("<") || trimmed.startsWith("{")) return false
-            return content.contains("lx", ignoreCase = true) ||
-                content.contains("\\x6c\\x78", ignoreCase = true) ||
-                content.contains("@name") ||
-                content.contains("globalThis")
+            val cleaned = content.removePrefix("\uFEFF").trimStart()
+            if (cleaned.isEmpty() || cleaned.startsWith("<") || cleaned.startsWith("{")) return false
+            return cleaned.contains("lx", ignoreCase = true) ||
+                cleaned.contains("\\x6c\\x78", ignoreCase = true) ||
+                cleaned.contains("@name") ||
+                cleaned.contains("globalThis")
+        }
+
+        /**
+         * Distinguishes infrastructure/runtime failures (worthy of source pruning & 45s cooldown)
+         * from per-track/per-tier misses (e.g., track has no FLAC, allowing 320k/128k fallback).
+         */
+        internal fun isTransportOrRuntimeFailure(rawMessage: String?): Boolean {
+            val lower = rawMessage.orEmpty().lowercase(Locale.ROOT)
+            if (lower.isEmpty()) return false
+            return lower.contains("超时") ||
+                lower.contains("timeout") ||
+                lower.contains("timed out") ||
+                lower.contains("无法连接") ||
+                lower.contains("连接失败") ||
+                lower.contains("校验失败") ||
+                lower.contains("运行异常") ||
+                lower.contains("引擎") ||
+                lower.contains("未正确注册") ||
+                lower.contains("已卸载") ||
+                lower.contains("已停用") ||
+                lower.contains("已切换")
         }
     }
 
@@ -125,9 +155,12 @@ class UserApiManager(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val runtimes = ConcurrentHashMap<String, LxQuickJsRuntime>()
+    private val sourceMutexes = ConcurrentHashMap<String, Mutex>()
+    private val sourceGenerations = ConcurrentHashMap<String, AtomicLong>()
     private val platformCooldowns = ConcurrentHashMap<String, Long>()
 
     private val probeClient = httpClient.newBuilder()
+        .cache(null)
         .connectTimeout(STREAM_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .readTimeout(STREAM_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .callTimeout(STREAM_PROBE_TIMEOUT_MS + 300L, TimeUnit.MILLISECONDS)
@@ -148,6 +181,14 @@ class UserApiManager(
             }
         }
     }
+
+    private fun mutexFor(id: String): Mutex = sourceMutexes.computeIfAbsent(id) { Mutex() }
+
+    private fun bumpGeneration(id: String): Long =
+        sourceGenerations.computeIfAbsent(id) { AtomicLong(0L) }.incrementAndGet()
+
+    private fun currentGeneration(id: String): Long =
+        sourceGenerations[id]?.get() ?: 0L
 
     /**
      * Waits briefly during cold start so hitting Play right after launching the app
@@ -190,6 +231,7 @@ class UserApiManager(
 
         val validIds = entities.filter { it.enabled }.map { it.id }.toSet()
         runtimes.keys.filter { it !in validIds }.forEach { id ->
+            bumpGeneration(id)
             runtimes.remove(id)?.destroy()
         }
 
@@ -199,40 +241,71 @@ class UserApiManager(
     }
 
     private suspend fun startRuntime(source: UserApiSource) {
-        runtimes.remove(source.id)?.destroy()
-        updateSourceState(source.id) {
-            it.copy(status = UserApiRuntimeStatus.INITIALIZING, errorMessage = null, latencyMs = null)
-        }
-
-        val runtime = LxQuickJsRuntime(context, httpClient, source)
-        val result = runtime.initialize()
-
-        if (result.success) {
-            runtimes[source.id] = runtime
-            clearCooldownsForSource(source.id)
-            updateSourceState(source.id) {
-                it.copy(
-                    status = UserApiRuntimeStatus.READY,
-                    supportedPlatforms = result.supportedPlatforms,
-                    // Do NOT display local JS preload time as network latency; populated on real test/resolve
-                    latencyMs = null,
-                    errorMessage = null
-                )
+        val gen = bumpGeneration(source.id)
+        mutexFor(source.id).withLock {
+            if (currentGeneration(source.id) != gen) return
+            val liveSource = _sources.value.firstOrNull { it.id == source.id }
+            if (liveSource == null || !liveSource.enabled) {
+                runtimes.remove(source.id)?.destroy()
+                return
             }
-        } else {
-            runtime.destroy()
+
+            runtimes.remove(source.id)?.destroy()
             updateSourceState(source.id) {
-                it.copy(
-                    status = UserApiRuntimeStatus.ERROR,
-                    errorMessage = LxQuickJsRuntime.formatFriendlyError(result.errorMessage ?: "初始化失败"),
-                    latencyMs = null
-                )
+                it.copy(status = UserApiRuntimeStatus.INITIALIZING, errorMessage = null, latencyMs = null)
+            }
+
+            val runtime = LxQuickJsRuntime(context, httpClient, liveSource)
+            val result = try {
+                runtime.initialize()
+            } catch (ce: CancellationException) {
+                runtime.destroy()
+                throw ce
+            }
+
+            val postLive = _sources.value.firstOrNull { it.id == source.id }
+            if (currentGeneration(source.id) != gen || postLive == null || !postLive.enabled) {
+                runtime.destroy()
+                return
+            }
+
+            if (result.success) {
+                runtimes.put(source.id, runtime)?.takeIf { it !== runtime }?.destroy()
+                val verifiedLive = _sources.value.firstOrNull { it.id == source.id }
+                if (currentGeneration(source.id) != gen || verifiedLive == null || !verifiedLive.enabled) {
+                    if (runtimes.remove(source.id, runtime)) {
+                        runtime.destroy()
+                    }
+                    return
+                }
+                clearCooldownsForSource(source.id)
+                updateSourceState(source.id) {
+                    if (currentGeneration(source.id) != gen || !it.enabled) {
+                        it
+                    } else {
+                        it.copy(
+                            status = UserApiRuntimeStatus.READY,
+                            supportedPlatforms = result.supportedPlatforms,
+                            latencyMs = null,
+                            errorMessage = null
+                        )
+                    }
+                }
+            } else {
+                runtime.destroy()
+                updateSourceState(source.id) {
+                    it.copy(
+                        status = UserApiRuntimeStatus.ERROR,
+                        errorMessage = LxQuickJsRuntime.formatFriendlyError(result.errorMessage ?: "初始化失败"),
+                        latencyMs = null
+                    )
+                }
             }
         }
     }
 
     suspend fun importFromUrl(url: String): Result<UserApiSource> = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
             val cleanUrl = url.trim()
             require(cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")) {
                 "请输入有效的 http:// 或 https:// 自定义源链接"
@@ -241,18 +314,37 @@ class UserApiManager(
             require(isValidDownloadedScript(script)) {
                 "下载内容不是有效的自定义源 JavaScript 脚本"
             }
-            importRawScript(script, sourceUrl = cleanUrl).getOrThrow()
+            importRawScript(script, sourceUrl = cleanUrl)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Result.failure(t)
         }
     }
 
     private fun downloadText(url: String): String? {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "LXPure/1.0")
+            .cacheControl(CacheControl.FORCE_NETWORK)
+            .header("User-Agent", "LXPure/1.1")
             .build()
         return httpClient.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) return null
-            resp.body?.string()?.takeIf { it.isNotBlank() }
+            val body = resp.body ?: return null
+            val bytes = body.byteStream().use { input ->
+                val out = ByteArrayOutputStream()
+                val buf = ByteArray(8192)
+                var total = 0
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    total += n
+                    if (total > MAX_SCRIPT_DOWNLOAD_BYTES) return null
+                    out.write(buf, 0, n)
+                }
+                out.toByteArray()
+            }
+            String(bytes, StandardCharsets.UTF_8).takeIf { it.isNotBlank() }
         }
     }
 
@@ -261,13 +353,16 @@ class UserApiManager(
         sourceUrl: String? = null,
         fallbackName: String = "自定义音源"
     ): Result<UserApiSource> = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
             val normalizedScript = LxScriptParser.normalizeScript(script)
             require(normalizedScript.isNotBlank()) { "脚本内容为空" }
+            require(!normalizedScript.contains('\u0000')) { "文件包含二进制内容，不是有效的 JS 音源脚本" }
+            val scriptBytes = normalizedScript.toByteArray(StandardCharsets.UTF_8).size
+            require(scriptBytes <= 1 * 1024 * 1024) { "脚本体积过大（上限 1 MB），请导入标准 JS 音源文件" }
             val meta = LxScriptParser.parse(normalizedScript, fallbackName)
             val existing = dao.getAllOnce()
             val existingMatch = existing.firstOrNull { it.id == meta.id }
-            val priority = existingMatch?.priority ?: existing.size
+            val priority = existingMatch?.priority ?: ((existing.maxOfOrNull { it.priority } ?: -1) + 1)
 
             val entity = UserApiEntity(
                 id = meta.id,
@@ -279,15 +374,44 @@ class UserApiManager(
                 script = normalizedScript,
                 sourceUrl = sourceUrl ?: existingMatch?.sourceUrl,
                 enabled = true,
-                priority = priority
+                priority = priority,
+                addedAt = existingMatch?.addedAt ?: System.currentTimeMillis()
             )
             dao.upsert(entity)
-            reloadAllFromDatabase()
-            _sources.value.first { it.id == entity.id }
+
+            val model = UserApiSource(
+                id = entity.id,
+                name = entity.name,
+                description = entity.description,
+                version = entity.version,
+                author = entity.author,
+                homepage = entity.homepage,
+                script = entity.script,
+                sourceUrl = entity.sourceUrl,
+                enabled = true,
+                priority = entity.priority,
+                status = UserApiRuntimeStatus.INITIALIZING
+            )
+            _sources.update { list ->
+                val existsInMem = list.any { it.id == model.id }
+                val nextList = if (existsInMem) {
+                    list.map { if (it.id == model.id) model else it }
+                } else {
+                    list + model
+                }
+                nextList.sortedBy { it.priority }
+            }
+            scope.launch { startRuntime(model) }
+            Result.success(model)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Result.failure(t)
         }
     }
 
     suspend fun toggleEnabled(id: String, enabled: Boolean) {
+        bumpGeneration(id)
         dao.setEnabled(id, enabled)
         if (!enabled) {
             runtimes.remove(id)?.destroy()
@@ -303,6 +427,7 @@ class UserApiManager(
     }
 
     suspend fun removeSource(id: String) {
+        bumpGeneration(id)
         runtimes.remove(id)?.destroy()
         clearCooldownsForSource(id)
         dao.delete(id)
@@ -343,7 +468,13 @@ class UserApiManager(
         var fetchedScript: String? = null
         var usedUrl: String? = null
         for (url in candidateUrls) {
-            val content = runCatching { downloadText(url) }.getOrNull()
+            val content = try {
+                downloadText(url)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                null
+            }
             if (isValidDownloadedScript(content)) {
                 fetchedScript = LxScriptParser.normalizeScript(content!!)
                 usedUrl = url
@@ -362,56 +493,66 @@ class UserApiManager(
             )
         }
 
-        val oldHash = LxCrypto.md5Hex(LxScriptParser.normalizeScript(current.script).trim())
-        val newHash = LxCrypto.md5Hex(fetchedScript.trim())
-        val parsed = LxScriptParser.parse(fetchedScript, fallbackName = current.name)
-
-        if (oldHash == newHash) {
-            // If previously had an error or disabled, still re-verify cleanly without claiming version bump
-            if (current.enabled && current.status == UserApiRuntimeStatus.ERROR) {
-                startRuntime(current)
-            }
-            return@withContext SourceUpdateResult(
+        // Re-read live DB record after network I/O so we never resurrect a deleted source or revert user edits
+        val liveEntity = dao.getAllOnce().firstOrNull { it.id == id }
+            ?: return@withContext SourceUpdateResult(
                 sourceName = current.name,
                 oldVersion = current.version,
+                newVersion = current.version,
+                updated = false,
+                alreadyLatest = false,
+                errorMessage = "该音源已被删除"
+            )
+        val liveState = _sources.value.firstOrNull { it.id == id }
+
+        val oldHash = LxCrypto.md5Hex(LxScriptParser.normalizeScript(liveEntity.script).trim())
+        val newHash = LxCrypto.md5Hex(fetchedScript.trim())
+        val parsed = LxScriptParser.parse(fetchedScript, fallbackName = liveEntity.name)
+
+        if (oldHash == newHash) {
+            if (liveEntity.enabled && liveState?.status == UserApiRuntimeStatus.ERROR) {
+                startRuntime(liveState)
+            }
+            return@withContext SourceUpdateResult(
+                sourceName = liveEntity.name,
+                oldVersion = liveEntity.version,
                 newVersion = parsed.version,
                 updated = false,
                 alreadyLatest = true
             )
         }
 
-        // Preserve user's source id, priority, and enabled flag while hot-swapping script & metadata
-        val updatedEntity = UserApiEntity(
-            id = current.id,
+        // Preserve live source id, priority, enabled flag, and addedAt while hot-swapping script & metadata
+        val updatedEntity = liveEntity.copy(
             name = parsed.name,
-            description = parsed.description.ifBlank { current.description },
+            description = parsed.description.ifBlank { liveEntity.description },
             version = parsed.version,
             author = parsed.author,
-            homepage = parsed.homepage.ifBlank { current.homepage },
+            homepage = parsed.homepage.ifBlank { liveEntity.homepage },
             script = fetchedScript,
-            sourceUrl = usedUrl ?: current.sourceUrl,
-            enabled = current.enabled,
-            priority = current.priority
+            sourceUrl = usedUrl ?: liveEntity.sourceUrl
         )
         dao.upsert(updatedEntity)
-        val updatedModel = current.copy(
-            name = updatedEntity.name,
-            description = updatedEntity.description,
-            version = updatedEntity.version,
-            author = updatedEntity.author,
-            homepage = updatedEntity.homepage,
-            script = updatedEntity.script,
-            sourceUrl = updatedEntity.sourceUrl
-        )
-        updateSourceState(current.id) { updatedModel }
-        if (updatedModel.enabled) {
-            startRuntime(updatedModel)
+        updateSourceState(id) { live ->
+            live.copy(
+                name = updatedEntity.name,
+                description = updatedEntity.description,
+                version = updatedEntity.version,
+                author = updatedEntity.author,
+                homepage = updatedEntity.homepage,
+                script = updatedEntity.script,
+                sourceUrl = updatedEntity.sourceUrl
+            )
+        }
+        val refreshedLive = _sources.value.firstOrNull { it.id == id }
+        if (updatedEntity.enabled && refreshedLive != null) {
+            startRuntime(refreshedLive)
         }
 
         SourceUpdateResult(
-            sourceName = updatedModel.name,
-            oldVersion = current.version,
-            newVersion = updatedModel.version,
+            sourceName = updatedEntity.name,
+            oldVersion = liveEntity.version,
+            newVersion = updatedEntity.version,
             updated = true,
             alreadyLatest = false
         )
@@ -464,7 +605,14 @@ class UserApiManager(
         current.add(index - 1, item)
         val updated = current.mapIndexed { idx, entity -> entity.copy(priority = idx) }
         dao.updateAll(updated)
-        reloadAllFromDatabase()
+
+        val priorityMap = updated.associate { it.id to it.priority }
+        _sources.update { list ->
+            list.map { src ->
+                val newPriority = priorityMap[src.id]
+                if (newPriority != null) src.copy(priority = newPriority) else src
+            }.sortedBy { it.priority }
+        }
     }
 
     suspend fun testSourceHealth(id: String): Result<Long> = withContext(Dispatchers.IO) {
@@ -481,7 +629,12 @@ class UserApiManager(
 
         val currentMeta = _sources.value.firstOrNull { it.id == id }
         val platformOrder = currentMeta?.supportedPlatforms?.keys
-            ?.map { MusicSource.fromCode(it) }
+            ?.mapNotNull { code ->
+                MusicSource.entries.firstOrNull {
+                    it.code.equals(code, ignoreCase = true) && it != MusicSource.LOCAL
+                }
+            }
+            ?.distinct()
             ?.sortedByDescending { MusicAggregator.platformPriority(it) }
             .orEmpty()
         if (platformOrder.isEmpty()) {
@@ -494,9 +647,13 @@ class UserApiManager(
 
         var probeTrack: Track? = null
         for (platform in platformOrder) {
-            val found = runCatching { aggregator.searchSinglePlatform(platform, "晴天", limit = 3) }
-                .getOrDefault(emptyList())
-                .firstOrNull()
+            val found = try {
+                aggregator.searchSinglePlatform(platform, "晴天", limit = 3).firstOrNull()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                null
+            }
             if (found != null) {
                 probeTrack = found
                 break
@@ -540,7 +697,7 @@ class UserApiManager(
     /**
      * High-speed concurrent racing stream resolver:
      * 1. Quality-tier-first parallel racing across all ready sources (guarantees SQ/HR priority over single-source downgrade)
-     * 2. Per-source/platform pruning & 45s cooldown (never wastes 3x timeouts on a dead source)
+     * 2. Per-source/platform pruning & 45s cooldown ONLY on transport/runtime failures (preserves FLAC -> 320k -> 128k fallback)
      * 3. Live cancellable HTTP Range audio-header probe (2.5s timeout; first valid URL wins & cancels all siblings)
      * 4. Parallel cross-platform fallback across attached alternates & dynamic fuzzy search matches
      */
@@ -571,7 +728,6 @@ class UserApiManager(
             return@withContext Result.failure(IllegalStateException(msg))
         }
 
-        // Per-request pruned (sourceId_platformCode) pairs so a dead/timed-out source skips lower qualities immediately
         val prunedSourcePlatforms = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
         // 1. Primary track: race across ready sources by quality tier
@@ -616,7 +772,6 @@ class UserApiManager(
             }.orEmpty().filter { it.id !in excludedTrackIds }
 
             if (dynamicAlts.isNotEmpty()) {
-                // Keep best match per platform to avoid redundant requests
                 val bestPerPlatform = dynamicAlts.distinctBy { it.source }.take(3)
                 tryResolveTracksByQualityTiers(
                     tracks = bestPerPlatform,
@@ -632,10 +787,6 @@ class UserApiManager(
         Result.failure(IllegalStateException("所有音源与平台均无法获取《${track.title}》的可用音频流"))
     }
 
-    /**
-     * Races eligible `(track, source)` pairs one quality tier at a time (e.g. FLAC -> 320k -> 128k).
-     * Non-cooling sources always race first; cooling sources are only retried as a last resort.
-     */
     private suspend fun tryResolveTracksByQualityTiers(
         tracks: List<Track>,
         preferredQuality: AudioQuality,
@@ -713,7 +864,6 @@ class UserApiManager(
     ): ResolvedStream? {
         if (candidates.isEmpty()) return null
 
-        // If user explicitly asked for a specific source, let it try first
         if (!preferredSourceId.isNullOrBlank()) {
             val preferred = candidates.filter { it.source.id == preferredSourceId }
             val others = candidates.filterNot { it.source.id == preferredSourceId }
@@ -729,10 +879,6 @@ class UserApiManager(
         return raceInBalancedWaves(candidates, prunedSourcePlatforms, initialSwitched = false)
     }
 
-    /**
-     * Races candidates in compact waves (2 concurrent on metered cellular, 3 on Wi-Fi)
-     * to balance instant <1.5s playback speed against mobile data & battery conservation.
-     */
     private suspend fun raceInBalancedWaves(
         candidates: List<ResolveCandidate>,
         prunedSourcePlatforms: MutableSet<String>,
@@ -749,10 +895,6 @@ class UserApiManager(
         return null
     }
 
-    /**
-     * Launches all [candidates] concurrently and resolves immediately with the FIRST URL that passes
-     * live HTTP Range verification, cancelling all sibling probes/requests right away.
-     */
     private suspend fun raceFirstValid(
         candidates: List<ResolveCandidate>,
         prunedSourcePlatforms: MutableSet<String>,
@@ -764,7 +906,6 @@ class UserApiManager(
         val remaining = AtomicInteger(candidates.size)
         val raceJob = SupervisorJob(coroutineContext[Job])
         val raceScope = CoroutineScope(coroutineContext + raceJob)
-        val hadAnyFailure = AtomicInteger(0)
 
         candidates.forEach { candidate ->
             raceScope.launch {
@@ -776,7 +917,6 @@ class UserApiManager(
                     if (activeRuntime == null) {
                         prunedSourcePlatforms.add(key)
                         markCooldown(candidate.source.id, platformCode)
-                        hadAnyFailure.incrementAndGet()
                         return@launch
                     }
                     val res = activeRuntime.requestMusicUrl(
@@ -820,22 +960,25 @@ class UserApiManager(
                             )
                         }
                     } else {
+                        val errMsg = res.exceptionOrNull()?.message
                         Log.w(
                             TAG,
-                            "Script resolve failed from ${candidate.source.name} ($platformCode/${candidate.quality.lxType}): ${res.exceptionOrNull()?.message}"
+                            "Script resolve failed from ${candidate.source.name} ($platformCode/${candidate.quality.lxType}): $errMsg"
                         )
+                        // Only prune & cooldown on transport/runtime failures so FLAC -> 320k -> 128k fallback stays intact
+                        if (isTransportOrRuntimeFailure(errMsg)) {
+                            prunedSourcePlatforms.add(key)
+                            markCooldown(candidate.source.id, platformCode)
+                        }
                     }
-                    // Prune this (source, platform) for lower qualities of this track & apply short cooldown
-                    prunedSourcePlatforms.add(key)
-                    markCooldown(candidate.source.id, platformCode)
-                    hadAnyFailure.incrementAndGet()
-                } catch (e: kotlinx.coroutines.CancellationException) {
+                } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {
                     Log.w(TAG, "Race candidate error (${candidate.source.name}): ${t.message}")
-                    prunedSourcePlatforms.add(key)
-                    markCooldown(candidate.source.id, platformCode)
-                    hadAnyFailure.incrementAndGet()
+                    if (isTransportOrRuntimeFailure(t.message)) {
+                        prunedSourcePlatforms.add(key)
+                        markCooldown(candidate.source.id, platformCode)
+                    }
                 } finally {
                     if (remaining.decrementAndGet() == 0 && !winner.isCompleted) {
                         winner.complete(null)
@@ -853,10 +996,6 @@ class UserApiManager(
         }
     }
 
-    /**
-     * Cancellable live HTTP Range audio-header verification.
-     * Immediately cancels the underlying OkHttp call if another source wins the race.
-     */
     private suspend fun verifyPlayableAudioUrl(url: String): Boolean = suspendCancellableCoroutine { cont ->
         val req = runCatching {
             Request.Builder()
@@ -883,7 +1022,7 @@ class UserApiManager(
             override fun onResponse(call: Call, response: Response) {
                 val ok = response.use { resp ->
                     if (resp.code !in listOf(200, 206)) return@use false
-                    val contentType = resp.header("Content-Type").orEmpty().lowercase()
+                    val contentType = resp.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
                     if (contentType.contains("text/html") ||
                         contentType.contains("application/json") ||
                         contentType.contains("text/plain")
@@ -930,34 +1069,65 @@ class UserApiManager(
     }
 
     /**
-     * Releases native QuickJS VMs for lower-priority backup sources when app moves to background
-     * or memory is constrained. Preserves metadata & READY status so they revive on demand in ~25ms.
+     * Releases native QuickJS VMs for idle lower-priority backup sources when app moves to background
+     * or memory is constrained. Never interrupts runtimes with active requests or initializing status.
      */
     fun trimIdleRuntimes(keepTopCount: Int = 2) {
-        val keepIds = _sources.value
+        val snapshot = _sources.value
+        val initializingIds = snapshot
+            .filter { it.status == UserApiRuntimeStatus.INITIALIZING }
+            .map { it.id }
+            .toSet()
+        val keepIds = snapshot
             .filter { it.enabled && it.status == UserApiRuntimeStatus.READY }
             .sortedBy { it.priority }
             .take(keepTopCount.coerceAtLeast(1))
             .map { it.id }
-            .toSet()
+            .toSet() + initializingIds
 
-        runtimes.keys.filter { it !in keepIds }.forEach { id ->
-            runtimes.remove(id)?.destroy()
-            Log.d(TAG, "Trimmed idle backup QuickJS runtime $id to conserve RAM")
+        runtimes.entries.toList().forEach { (id, rt) ->
+            if (id !in keepIds && !rt.hasActiveRequests()) {
+                if (runtimes.remove(id, rt)) {
+                    rt.destroy()
+                    Log.d(TAG, "Trimmed idle backup QuickJS runtime $id to conserve RAM")
+                }
+            }
         }
     }
 
     private suspend fun ensureRuntimeReady(source: UserApiSource): LxQuickJsRuntime? {
         runtimes[source.id]?.let { return it }
-        LxQuickJsRuntime.ensureQuickJsLoaded()
-        val runtime = LxQuickJsRuntime(context, httpClient, source)
-        val init = runtime.initialize(timeoutMs = 5_000L)
-        return if (init.success) {
-            runtimes[source.id] = runtime
-            runtime
-        } else {
-            runtime.destroy()
-            null
+        return mutexFor(source.id).withLock {
+            runtimes[source.id]?.let { return@withLock it }
+            val liveSource = _sources.value.firstOrNull { it.id == source.id }
+            if (liveSource == null || !liveSource.enabled) return@withLock null
+            val gen = currentGeneration(source.id)
+
+            LxQuickJsRuntime.ensureQuickJsLoaded()
+            val runtime = LxQuickJsRuntime(context, httpClient, liveSource)
+            val init = try {
+                runtime.initialize(timeoutMs = 5_000L)
+            } catch (ce: CancellationException) {
+                runtime.destroy()
+                throw ce
+            }
+
+            val postLive = _sources.value.firstOrNull { it.id == source.id }
+            if (init.success && currentGeneration(source.id) == gen && postLive != null && postLive.enabled) {
+                runtimes.put(source.id, runtime)?.takeIf { it !== runtime }?.destroy()
+                val verifiedLive = _sources.value.firstOrNull { it.id == source.id }
+                if (currentGeneration(source.id) != gen || verifiedLive == null || !verifiedLive.enabled) {
+                    if (runtimes.remove(source.id, runtime)) {
+                        runtime.destroy()
+                    }
+                    null
+                } else {
+                    runtime
+                }
+            } else {
+                runtime.destroy()
+                null
+            }
         }
     }
 

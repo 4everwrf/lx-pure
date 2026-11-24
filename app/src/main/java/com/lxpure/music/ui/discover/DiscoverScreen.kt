@@ -42,6 +42,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -63,6 +64,7 @@ import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.OnlinePlaylist
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.ui.components.AlbumArtwork
+import kotlinx.coroutines.CancellationException
 import com.lxpure.music.ui.components.TrackListFastScroller
 import com.lxpure.music.ui.components.TrackListItem
 import com.lxpure.music.ui.theme.LocalLxColors
@@ -80,13 +82,31 @@ fun DiscoverScreen(
     var selectedSource by remember { mutableStateOf(MusicSource.WY) }
     var hotPlaylists by remember { mutableStateOf<List<OnlinePlaylist>>(emptyList()) }
     var isLoading by remember { mutableStateOf(false) }
+    var retryNonce by remember { mutableIntStateOf(0) }
+    var loadGen by remember { mutableLongStateOf(0L) }
 
     val leaderboards = remember(selectedSource) { aggregator.getLeaderboards(selectedSource) }
 
-    LaunchedEffect(selectedSource) {
+    LaunchedEffect(selectedSource, retryNonce) {
+        val gen = ++loadGen
         isLoading = true
-        hotPlaylists = runCatching { aggregator.getHotPlaylists(selectedSource) }.getOrDefault(emptyList())
-        isLoading = false
+        hotPlaylists = emptyList()
+        try {
+            val fetched = aggregator.getHotPlaylists(selectedSource).distinctBy { "${it.source.code}_${it.id}" }
+            if (loadGen == gen) {
+                hotPlaylists = fetched
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            if (loadGen == gen) {
+                hotPlaylists = emptyList()
+            }
+        } finally {
+            if (loadGen == gen) {
+                isLoading = false
+            }
+        }
     }
 
     LazyColumn(
@@ -138,7 +158,7 @@ fun DiscoverScreen(
                     modifier = Modifier.padding(horizontal = 20.dp)
                 )
 
-                if (isLoading && hotPlaylists.isEmpty()) {
+                if (isLoading) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -148,18 +168,35 @@ fun DiscoverScreen(
                         CircularProgressIndicator(strokeWidth = 2.dp, color = lxColors.accent)
                     }
                 } else if (hotPlaylists.isEmpty()) {
-                    Text(
-                        text = "歌单加载中或网络不可达，可切换平台重试",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = lxColors.textSecondary,
-                        modifier = Modifier.padding(horizontal = 20.dp)
-                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "歌单加载失败或网络不可达",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = lxColors.textSecondary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedButton(
+                            onClick = { retryNonce++ },
+                            shape = RoundedCornerShape(50),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("重试", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
                 } else {
                     LazyRow(
                         contentPadding = PaddingValues(horizontal = 18.dp),
                         horizontalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        items(hotPlaylists, key = { "${it.source.code}_${it.id}" }) { playlist ->
+                        itemsIndexed(hotPlaylists, key = { idx, p -> "${p.source.code}_${p.id}_$idx" }) { _, playlist ->
                             Column(
                                 modifier = Modifier
                                     .width(152.dp)
@@ -274,6 +311,7 @@ fun DiscoverScreen(
 
 @Composable
 fun OnlinePlaylistDetailScreen(
+    loadKey: String,
     title: String,
     coverUrl: String?,
     loadDetail: suspend () -> Result<PlaylistDetailResult>,
@@ -287,10 +325,11 @@ fun OnlinePlaylistDetailScreen(
 ) {
     val lxColors = LocalLxColors.current
     val onPrimaryColor = MaterialTheme.colorScheme.onPrimary
-    var detail by remember { mutableStateOf<PlaylistDetailResult?>(null) }
-    var errorMsg by remember { mutableStateOf<String?>(null) }
-    var isLoading by remember { mutableStateOf(true) }
-    var retryNonce by remember { mutableIntStateOf(0) }
+    var detail by remember(loadKey) { mutableStateOf<PlaylistDetailResult?>(null) }
+    var errorMsg by remember(loadKey) { mutableStateOf<String?>(null) }
+    var isLoading by remember(loadKey) { mutableStateOf(true) }
+    var isSaved by remember(loadKey) { mutableStateOf(false) }
+    var retryNonce by remember(loadKey) { mutableIntStateOf(0) }
     val listState = rememberLazyListState()
 
     val showTopBarTitle by remember(detail) {
@@ -306,20 +345,37 @@ fun OnlinePlaylistDetailScreen(
         label = "detailTopTitleAlpha"
     )
 
-    LaunchedEffect(title, retryNonce) {
+    var detailLoadGen by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(loadKey, retryNonce) {
+        val gen = ++detailLoadGen
         isLoading = true
         errorMsg = null
-        loadDetail()
-            .onSuccess { detail = it }
-            .onFailure { err ->
-                val raw = err.message.orEmpty()
-                errorMsg = if (raw.isBlank() || raw.none { it.code > 0x4E00 }) {
-                    "加载失败，请检查网络连接后重试"
-                } else {
-                    raw
+        detail = null
+        try {
+            loadDetail()
+                .onSuccess { loaded ->
+                    if (detailLoadGen == gen) {
+                        detail = loaded
+                    }
                 }
+                .onFailure { err ->
+                    if (err is CancellationException) throw err
+                    if (detailLoadGen == gen) {
+                        val raw = err.message.orEmpty()
+                        errorMsg = if (raw.isBlank() || raw.none { it.code > 0x4E00 }) {
+                            "加载失败，请检查网络连接后重试"
+                        } else {
+                            raw
+                        }
+                    }
+                }
+        } catch (ce: CancellationException) {
+            throw ce
+        } finally {
+            if (detailLoadGen == gen) {
+                isLoading = false
             }
-        isLoading = false
+        }
     }
 
     Column(
@@ -392,6 +448,11 @@ fun OnlinePlaylistDetailScreen(
                 val currentTrackIndex = remember(res.tracks, currentTrackId) {
                     currentTrackId?.let { id -> res.tracks.indexOfFirst { it.id == id } } ?: -1
                 }
+                val extraDockClearance = when {
+                    res.tracks.size < 15 -> 0.dp
+                    currentTrackIndex >= 0 -> 114.dp
+                    else -> 74.dp
+                }
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -400,7 +461,7 @@ fun OnlinePlaylistDetailScreen(
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(bottom = bottomPadding)
+                        contentPadding = PaddingValues(bottom = bottomPadding + extraDockClearance)
                     ) {
                         item {
                             Row(
@@ -449,13 +510,19 @@ fun OnlinePlaylistDetailScreen(
                                             Text("播放全部", style = MaterialTheme.typography.labelMedium)
                                         }
                                         OutlinedButton(
-                                            onClick = { onSaveToLibrary(res) },
+                                            onClick = {
+                                                if (!isSaved) {
+                                                    isSaved = true
+                                                    onSaveToLibrary(res)
+                                                }
+                                            },
+                                            enabled = !isSaved,
                                             shape = RoundedCornerShape(50),
                                             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                                         ) {
                                             Icon(Icons.Rounded.BookmarkAdd, contentDescription = null, modifier = Modifier.size(16.dp))
                                             Spacer(Modifier.width(4.dp))
-                                            Text("收藏", style = MaterialTheme.typography.labelMedium)
+                                            Text(if (isSaved) "已收藏" else "收藏", style = MaterialTheme.typography.labelMedium)
                                         }
                                     }
                                 }

@@ -13,6 +13,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -69,11 +70,15 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -94,6 +99,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.lxpure.music.core.player.PlaybackProgress
 import com.lxpure.music.core.player.PlayerState
 import com.lxpure.music.domain.model.AudioQuality
 import com.lxpure.music.domain.model.DownloadRecord
@@ -112,6 +118,7 @@ import com.lxpure.music.ui.theme.LocalLxColors
 @Composable
 fun FullPlayerScreen(
     state: PlayerState,
+    progressFlow: StateFlow<PlaybackProgress>,
     isFavorite: Boolean,
     downloadRecord: DownloadRecord?,
     preferredQuality: AudioQuality,
@@ -131,13 +138,24 @@ fun FullPlayerScreen(
     onSetSleepTimer: (Int?) -> Unit
 ) {
     val track = state.currentTrack ?: return
+    val liveProgress by progressFlow.collectAsState()
+    val effectiveDurationMs = liveProgress.durationMs.takeIf { it > 0L } ?: state.durationMs
+    val activeLyricIndex = remember(state.lyrics, liveProgress.positionMs) {
+        state.lyrics.activeIndexAt(liveProgress.positionMs)
+    }
     var showLyrics by remember { mutableStateOf(false) }
     var showTranslation by remember(showTranslationDefault) { mutableStateOf(showTranslationDefault) }
     var showQualitySheet by remember { mutableStateOf(false) }
     var showSleepSheet by remember { mutableStateOf(false) }
 
-    var isDraggingSlider by remember(track.id) { mutableStateOf(false) }
-    var sliderDragMs by remember(track.id) { mutableFloatStateOf(0f) }
+    var isDraggingSlider by remember { mutableStateOf(false) }
+    var sliderDragMs by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(track.id) {
+        isDraggingSlider = false
+        sliderDragMs = 0f
+    }
+
+    val currentOnCollapse by rememberUpdatedState(onCollapse)
 
     val artworkScale by animateFloatAsState(
         targetValue = if (state.isPlaying) 1.0f else 0.89f,
@@ -176,11 +194,14 @@ fun FullPlayerScreen(
                         var totalDrag = 0f
                         detectVerticalDragGestures(
                             onDragEnd = {
-                                if (totalDrag > 90f) onCollapse()
+                                if (totalDrag > 90f) currentOnCollapse()
+                                totalDrag = 0f
+                            },
+                            onDragCancel = {
                                 totalDrag = 0f
                             },
                             onVerticalDrag = { _, delta ->
-                                if (delta > 0f) totalDrag += delta
+                                totalDrag = (totalDrag + delta).coerceAtLeast(0f)
                             }
                         )
                     }
@@ -241,8 +262,8 @@ fun FullPlayerScreen(
                         Icon(
                             imageVector = Icons.Rounded.Bedtime,
                             contentDescription = "睡眠定时",
-                            tint = if (state.sleepTimerRemainingMs != null) {
-                                state.ambientPalette.accent
+                            tint = if (liveProgress.sleepTimerRemainingMs != null) {
+                                Color(0xFF38BDF8)
                             } else {
                                 Color.White.copy(alpha = 0.72f)
                             },
@@ -265,56 +286,66 @@ fun FullPlayerScreen(
                     label = "coverLyricSwitch"
                 ) { lyricsVisible ->
                     if (!lyricsVisible) {
-                        Column(
+                        BoxWithConstraints(
                             modifier = Modifier.fillMaxSize(),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
+                            contentAlignment = Alignment.Center
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth(0.84f)
-                                    .aspectRatio(1f)
-                                    .scale(artworkScale)
-                                    .shadow(
-                                        elevation = 32.dp,
-                                        shape = RoundedCornerShape(26.dp),
-                                        ambientColor = Color.Black.copy(alpha = 0.65f),
-                                        spotColor = Color.Black.copy(alpha = 0.65f)
-                                    )
-                                    .clickable(
-                                        interactionSource = remember { MutableInteractionSource() },
-                                        indication = null
-                                    ) { showLyrics = true }
+                            val artSize = minOf(
+                                maxWidth * 0.84f,
+                                (maxHeight - 54.dp).coerceAtLeast(110.dp)
+                            )
+                            val teaserGap = if (maxHeight < 280.dp) 12.dp else 24.dp
+                            Column(
+                                modifier = Modifier.fillMaxSize(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
                             ) {
-                                AlbumArtwork(
-                                    url = track.coverUrl,
-                                    contentDescription = track.title,
-                                    size = 340.dp,
-                                    cornerRadius = 26.dp,
-                                    modifier = Modifier.fillMaxSize()
+                                Box(
+                                    modifier = Modifier
+                                        .size(artSize)
+                                        .scale(artworkScale)
+                                        .shadow(
+                                            elevation = 32.dp,
+                                            shape = RoundedCornerShape(26.dp),
+                                            ambientColor = Color.Black.copy(alpha = 0.65f),
+                                            spotColor = Color.Black.copy(alpha = 0.65f)
+                                        )
+                                        .clickable(
+                                            interactionSource = remember { MutableInteractionSource() },
+                                            indication = null
+                                        ) { showLyrics = true }
+                                ) {
+                                    AlbumArtwork(
+                                        url = track.coverUrl,
+                                        contentDescription = track.title,
+                                        size = 340.dp,
+                                        cornerRadius = 26.dp,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+
+                                Spacer(Modifier.height(teaserGap))
+
+                                // Live single-line lyric teaser right under the cover
+                                val currentLine = state.lyrics.lines.getOrNull(activeLyricIndex)?.text
+                                Text(
+                                    text = currentLine ?: if (state.isLoadingLyrics) "正在匹配歌词…" else "轻点封面查看沉浸歌词",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Color.White.copy(alpha = if (currentLine != null) 0.84f else 0.50f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { showLyrics = true }
+                                        .padding(horizontal = 8.dp)
                                 )
                             }
-
-                            Spacer(Modifier.height(26.dp))
-
-                            // Live single-line lyric teaser right under the cover
-                            val currentLine = state.lyrics.lines.getOrNull(state.activeLyricIndex)?.text
-                            Text(
-                                text = currentLine ?: if (state.isLoadingLyrics) "正在匹配歌词…" else "轻点封面查看沉浸歌词",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Color.White.copy(alpha = if (currentLine != null) 0.78f else 0.42f),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { showLyrics = true }
-                                    .padding(horizontal = 8.dp)
-                            )
                         }
                     } else {
                         ImmersiveLyricsView(
                             state = state,
+                            activeIdx = activeLyricIndex,
                             showTranslation = showTranslation,
                             onSeekTo = onSeek,
                             onTapEmpty = { showLyrics = false },
@@ -365,11 +396,12 @@ fun FullPlayerScreen(
             Spacer(Modifier.height(10.dp))
 
             // Minimalist Capsule Progress Scrubber (replaces heavy default M3 Slider)
-            val duration = state.durationMs.coerceAtLeast(1L)
-            val displayPos = if (isDraggingSlider) sliderDragMs.toLong() else state.positionMs
+            val duration = effectiveDurationMs.coerceAtLeast(1L)
+            val displayPos = if (isDraggingSlider) sliderDragMs.toLong() else liveProgress.positionMs
             val progressFraction = (displayPos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
 
             MinimalCapsuleProgressBar(
+                trackKey = track.id,
                 progress = progressFraction,
                 isDragging = isDraggingSlider,
                 onScrubStart = { fraction ->
@@ -383,7 +415,12 @@ fun FullPlayerScreen(
                 onScrubEnd = { fraction ->
                     val target = (fraction * duration).toLong().coerceIn(0L, duration)
                     isDraggingSlider = false
-                    onSeek(target)
+                    if (effectiveDurationMs > 0L) {
+                        onSeek(target)
+                    }
+                },
+                onScrubCancel = {
+                    isDraggingSlider = false
                 },
                 modifier = Modifier.fillMaxWidth()
             )
@@ -397,19 +434,19 @@ fun FullPlayerScreen(
                 Text(
                     text = formatTime(displayPos),
                     style = MaterialTheme.typography.labelMedium,
-                    color = Color.White.copy(alpha = 0.65f)
+                    color = Color.White.copy(alpha = 0.72f)
                 )
-                if (state.sleepTimerRemainingMs != null) {
+                liveProgress.sleepTimerRemainingMs?.let { remaining ->
                     Text(
-                        text = "定时 ${formatTime(state.sleepTimerRemainingMs)}",
+                        text = "定时 ${formatTime(remaining)}",
                         style = MaterialTheme.typography.labelMedium,
-                        color = state.ambientPalette.accent
+                        color = Color(0xFF38BDF8)
                     )
                 }
                 Text(
-                    text = formatTime(state.durationMs),
+                    text = formatTime(effectiveDurationMs),
                     style = MaterialTheme.typography.labelMedium,
-                    color = Color.White.copy(alpha = 0.65f)
+                    color = Color.White.copy(alpha = 0.72f)
                 )
             }
 
@@ -589,7 +626,10 @@ fun FullPlayerScreen(
             onDismissRequest = { showQualitySheet = false },
             containerColor = lxColors.surfaceElevated
         ) {
-            SyncDialogSystemBars(useLightSystemBars = false)
+            SyncDialogSystemBars(
+                useLightStatusBars = false,
+                useLightNavigationBars = !lxColors.isDark
+            )
             Column(
                 modifier = Modifier
                     .padding(horizontal = 20.dp, vertical = 10.dp)
@@ -651,27 +691,64 @@ fun FullPlayerScreen(
 
     if (showSleepSheet) {
         val lxColors = LocalLxColors.current
+        val sleepRemaining = liveProgress.sleepTimerRemainingMs
+        val isSleepActive = sleepRemaining != null
         ModalBottomSheet(
             onDismissRequest = { showSleepSheet = false },
             containerColor = lxColors.surfaceElevated
         ) {
-            SyncDialogSystemBars(useLightSystemBars = false)
-            Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp).padding(bottom = 24.dp)) {
-                Text("睡眠定时", style = MaterialTheme.typography.titleLarge, color = lxColors.textPrimary)
-                Spacer(Modifier.height(10.dp))
+            SyncDialogSystemBars(
+                useLightStatusBars = false,
+                useLightNavigationBars = !lxColors.isDark
+            )
+            Column(
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp).padding(bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("睡眠定时", style = MaterialTheme.typography.titleLarge, color = lxColors.textPrimary)
+                    if (sleepRemaining != null) {
+                        Text(
+                            text = "剩余 ${formatTime(sleepRemaining)}",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                            color = lxColors.accent
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
                 listOf(null to "关闭定时", 15 to "15 分钟后暂停", 30 to "30 分钟后暂停", 45 to "45 分钟后暂停", 60 to "60 分钟后暂停")
                     .forEach { (mins, label) ->
+                        val isSelected = mins == null && !isSleepActive
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
+                                .background(if (isSelected) lxColors.accentSoft else Color.Transparent)
                                 .clickable {
                                     onSetSleepTimer(mins)
                                     showSleepSheet = false
                                 }
-                                .padding(horizontal = 12.dp, vertical = 14.dp)
+                                .padding(horizontal = 12.dp, vertical = 14.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(label, style = MaterialTheme.typography.bodyLarge, color = lxColors.textPrimary)
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = if (isSelected) lxColors.accent else lxColors.textPrimary
+                            )
+                            if (isSelected) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Check,
+                                    contentDescription = null,
+                                    tint = lxColors.accent,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
             }
@@ -685,15 +762,22 @@ fun FullPlayerScreen(
  */
 @Composable
 private fun MinimalCapsuleProgressBar(
+    trackKey: String,
     progress: Float,
     isDragging: Boolean,
     onScrubStart: (Float) -> Unit,
     onScrub: (Float) -> Unit,
     onScrubEnd: (Float) -> Unit,
+    onScrubCancel: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var widthPx by remember { mutableFloatStateOf(1f) }
-    var lastFraction by remember { mutableFloatStateOf(progress) }
+    var lastFraction by remember(trackKey) { mutableFloatStateOf(progress) }
+    val currentOnScrubStart by rememberUpdatedState(onScrubStart)
+    val currentOnScrub by rememberUpdatedState(onScrub)
+    val currentOnScrubEnd by rememberUpdatedState(onScrubEnd)
+    val currentOnScrubCancel by rememberUpdatedState(onScrubCancel)
+
     val trackHeight by animateDpAsState(
         targetValue = if (isDragging) 8.dp else 4.dp,
         animationSpec = spring(dampingRatio = 0.72f, stiffness = 420f),
@@ -704,28 +788,28 @@ private fun MinimalCapsuleProgressBar(
         modifier = modifier
             .height(28.dp)
             .onSizeChanged { widthPx = it.width.toFloat().coerceAtLeast(1f) }
-            .pointerInput(Unit) {
+            .pointerInput(trackKey) {
                 detectTapGestures { offset ->
                     val f = (offset.x / widthPx).coerceIn(0f, 1f)
                     lastFraction = f
-                    onScrubEnd(f)
+                    currentOnScrubEnd(f)
                 }
             }
-            .pointerInput(Unit) {
+            .pointerInput(trackKey) {
                 detectHorizontalDragGestures(
                     onDragStart = { offset ->
                         val f = (offset.x / widthPx).coerceIn(0f, 1f)
                         lastFraction = f
-                        onScrubStart(f)
+                        currentOnScrubStart(f)
                     },
                     onHorizontalDrag = { change, _ ->
                         change.consume()
                         val f = (change.position.x / widthPx).coerceIn(0f, 1f)
                         lastFraction = f
-                        onScrub(f)
+                        currentOnScrub(f)
                     },
-                    onDragEnd = { onScrubEnd(lastFraction) },
-                    onDragCancel = { onScrubEnd(lastFraction) }
+                    onDragEnd = { currentOnScrubEnd(lastFraction) },
+                    onDragCancel = { currentOnScrubCancel() }
                 )
             },
         contentAlignment = Alignment.CenterStart
@@ -751,15 +835,31 @@ private fun MinimalCapsuleProgressBar(
 @Composable
 private fun ImmersiveLyricsView(
     state: PlayerState,
+    activeIdx: Int,
     showTranslation: Boolean,
     onSeekTo: (Long) -> Unit,
     onTapEmpty: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val lines = state.lyrics.lines
-    val activeIdx = state.activeLyricIndex
     val listState = rememberLazyListState()
     val density = LocalDensity.current
+    val isDragged by listState.interactionSource.collectIsDraggedAsState()
+    var userScrollCooldown by remember { mutableStateOf(false) }
+
+    LaunchedEffect(state.currentTrack?.id) {
+        userScrollCooldown = false
+        listState.scrollToItem(0)
+    }
+
+    LaunchedEffect(isDragged) {
+        if (isDragged) {
+            userScrollCooldown = true
+        } else if (userScrollCooldown) {
+            delay(3_500L)
+            userScrollCooldown = false
+        }
+    }
 
     if (lines.isEmpty()) {
         Box(
@@ -773,7 +873,7 @@ private fun ImmersiveLyricsView(
             Text(
                 text = if (state.isLoadingLyrics) "正在加载歌词…" else "暂无歌词\n轻点返回封面",
                 style = MaterialTheme.typography.titleMedium,
-                color = Color.White.copy(alpha = 0.55f),
+                color = Color.White.copy(alpha = 0.62f),
                 textAlign = TextAlign.Center
             )
         }
@@ -784,12 +884,15 @@ private fun ImmersiveLyricsView(
         val viewportHeightPx = with(density) { maxHeight.toPx() }
         val anchorOffsetPx = -(viewportHeightPx * 0.34f).toInt()
 
-        LaunchedEffect(activeIdx, anchorOffsetPx) {
+        LaunchedEffect(activeIdx, anchorOffsetPx, isDragged, userScrollCooldown) {
+            if (isDragged || userScrollCooldown) return@LaunchedEffect
             if (activeIdx in lines.indices) {
                 listState.animateScrollToItem(
                     index = activeIdx,
                     scrollOffset = anchorOffsetPx
                 )
+            } else if (activeIdx < 0 && lines.isNotEmpty()) {
+                listState.animateScrollToItem(index = 0)
             }
         }
 
@@ -824,7 +927,10 @@ private fun ImmersiveLyricsView(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
-                        .clickable { onSeekTo(line.timeMs) }
+                        .clickable {
+                            userScrollCooldown = false
+                            onSeekTo(line.timeMs)
+                        }
                         .padding(start = 4.dp, end = 14.dp, top = 4.dp, bottom = 4.dp)
                         .graphicsLayer {
                             scaleX = scale
@@ -837,7 +943,7 @@ private fun ImmersiveLyricsView(
                         fontSize = if (isActive) 22.sp else 18.sp,
                         lineHeight = if (isActive) 30.sp else 25.sp,
                         fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
-                        color = if (isActive) Color.White else Color.White.copy(alpha = 0.36f)
+                        color = if (isActive) Color.White else Color.White.copy(alpha = 0.52f)
                     )
                     if (showTranslation && !line.translation.isNullOrBlank()) {
                         Spacer(Modifier.height(4.dp))
@@ -845,7 +951,7 @@ private fun ImmersiveLyricsView(
                             text = line.translation,
                             fontSize = if (isActive) 15.sp else 13.sp,
                             lineHeight = 20.sp,
-                            color = if (isActive) Color.White.copy(alpha = 0.80f) else Color.White.copy(alpha = 0.28f)
+                            color = if (isActive) Color.White.copy(alpha = 0.86f) else Color.White.copy(alpha = 0.40f)
                         )
                     }
                 }
@@ -863,6 +969,7 @@ fun QueueBottomSheet(
     onSelectIndex: (Int) -> Unit,
     onRemoveIndex: (Int) -> Unit,
     onClearQueue: () -> Unit,
+    onCycleRepeat: (() -> Unit)? = null,
     onOpenQueueSource: ((PlaybackQueueSource) -> Unit)? = null
 ) {
     val lxColors = LocalLxColors.current
@@ -873,7 +980,8 @@ fun QueueBottomSheet(
         queueSource.type != QueueSourceType.SEARCH
     val listState = rememberLazyListState()
 
-    LaunchedEffect(state.currentIndex, state.queue.size) {
+    // Auto-center only on initial open so removing rows never snaps the user away from their scroll position
+    LaunchedEffect(Unit) {
         if (state.currentIndex in state.queue.indices) {
             listState.scrollToItem((state.currentIndex - 2).coerceAtLeast(0))
         }
@@ -884,7 +992,10 @@ fun QueueBottomSheet(
         containerColor = lxColors.surfaceElevated,
         contentColor = lxColors.textPrimary
     ) {
-        SyncDialogSystemBars(useLightSystemBars = !lxColors.isDark && !forceDarkStatusBar)
+        SyncDialogSystemBars(
+            useLightStatusBars = !lxColors.isDark && !forceDarkStatusBar,
+            useLightNavigationBars = !lxColors.isDark
+        )
         Column(modifier = Modifier.padding(bottom = 24.dp)) {
             Row(
                 modifier = Modifier
@@ -906,7 +1017,12 @@ fun QueueBottomSheet(
                         style = MaterialTheme.typography.bodyMedium,
                         color = lxColors.textSecondary,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = if (onCycleRepeat != null) {
+                            Modifier.clickable { onCycleRepeat() }
+                        } else {
+                            Modifier
+                        }
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {

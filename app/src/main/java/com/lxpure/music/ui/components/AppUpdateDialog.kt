@@ -45,7 +45,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -94,17 +96,23 @@ fun AppUpdateDialog(
     ) {
         SyncDialogSystemBars(useLightSystemBars = !lxColors.isDark)
 
+        val maxDialogHeight = (LocalConfiguration.current.screenHeightDp * 0.88f).dp
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp)
-                .widthIn(max = 368.dp),
+                .padding(horizontal = 24.dp, vertical = 16.dp)
+                .widthIn(max = 368.dp)
+                .heightIn(max = maxDialogHeight),
             shape = RoundedCornerShape(28.dp),
             color = lxColors.surfaceElevated,
             border = BorderStroke(0.9.dp, lxColors.hairline),
             shadowElevation = 24.dp
         ) {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
                 // Soft ambient gradient header
                 Box(
                     modifier = Modifier
@@ -280,12 +288,15 @@ fun AppUpdateDialog(
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.SpaceBetween
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
                                         Text(
                                             text = "正在下载 · ${state.routeLabel}",
                                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
-                                            color = lxColors.textPrimary
+                                            color = lxColors.textPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
                                         )
                                         val progressText = if (state.totalBytes > 0L) {
                                             "${FormatUtils.formatSize(state.downloadedBytes)} / ${FormatUtils.formatSize(state.totalBytes)} (${(state.progress * 100).toInt()}%)"
@@ -294,8 +305,13 @@ fun AppUpdateDialog(
                                         }
                                         Text(
                                             text = progressText,
-                                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                            color = lxColors.accent
+                                            style = MaterialTheme.typography.labelMedium.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                fontFeatureSettings = "tnum"
+                                            ),
+                                            color = lxColors.accent,
+                                            maxLines = 1,
+                                            softWrap = false
                                         )
                                     }
                                     if (state.totalBytes > 0L && state.downloadedBytes > 0L) {
@@ -347,7 +363,11 @@ fun AppUpdateDialog(
                                         color = lxColors.accent
                                     )
                                     Text(
-                                        text = "正在校验安装包 SHA-256 完整性…",
+                                        text = if (!info.expectedSha256.isNullOrBlank()) {
+                                            "正在校验安装包 SHA-256 完整性…"
+                                        } else {
+                                            "正在校验安装包结构完整性…"
+                                        },
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = lxColors.textPrimary
                                     )

@@ -55,18 +55,18 @@ final class KuwoProvider: Sendable {
 
         return absList.compactMap { el in
             guard let obj = JsonSafe.asObject(el),
-                  let rawRid = JsonSafe.asString(obj["MUSICRID"]) else { return nil }
+                  let rawRid = JsonSafe.asNonBlankString(obj["MUSICRID"]) else { return nil }
             let rid = rawRid.hasPrefix("MUSIC_") ? String(rawRid.dropFirst(6)) : rawRid
-            let name = FormatUtils.decodeHtml(JsonSafe.asString(obj["SONGNAME"]) ?? JsonSafe.asString(obj["NAME"]))
+            let name = FormatUtils.decodeHtml(JsonSafe.asNonBlankString(obj["SONGNAME"]) ?? JsonSafe.asNonBlankString(obj["NAME"]))
             guard !name.isEmpty else { return nil }
 
             let artistRaw = FormatUtils.decodeHtml(JsonSafe.asString(obj["ARTIST"])).replacingOccurrences(of: "&", with: " / ")
             let artist = artistRaw.isEmpty ? "未知歌手" : artistRaw
             let album = FormatUtils.decodeHtml(JsonSafe.asString(obj["ALBUM"]))
             let durationSec = JsonSafe.asInt64(obj["DURATION"]) ?? 0
-            let rawPic = JsonSafe.asString(obj["hts_MVPIC"])
-                ?? JsonSafe.asString(obj["web_albumpic_short"])
-                ?? JsonSafe.asString(obj["albumpic"])
+            let rawPic = JsonSafe.asNonBlankString(obj["hts_MVPIC"])
+                ?? JsonSafe.asNonBlankString(obj["web_albumpic_short"])
+                ?? JsonSafe.asNonBlankString(obj["albumpic"])
 
             return Track(
                 id: "kw_\(rid)",
@@ -78,7 +78,7 @@ final class KuwoProvider: Sendable {
                 durationMs: durationSec * 1000,
                 coverUrl: Self.normalizeKuwoImageUrl(rawPic),
                 albumId: JsonSafe.asString(obj["ALBUMID"]),
-                qualities: parseMinfoQualities(JsonSafe.asString(obj["N_MINFO"]))
+                qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["N_MINFO"]) ?? JsonSafe.asNonBlankString(obj["n_minfo"]))
             )
         }
     }
@@ -109,7 +109,7 @@ final class KuwoProvider: Sendable {
     }
 
     func getPlaylistDetail(rawIdOrUrl: String) async -> Result<PlaylistDetailResult, Error> {
-        guard let id = extractPlaylistId(rawIdOrUrl) else {
+        guard let id = await extractPlaylistId(rawIdOrUrl) else {
             return .failure(LxRuntimeError.message("无法识别酷我歌单 ID"))
         }
 
@@ -121,14 +121,20 @@ final class KuwoProvider: Sendable {
         var totalExpected = Int.max
 
         for page in 0..<maxPages {
+            if Task.isCancelled { return .failure(CancellationError()) }
             if allRawTracks.count >= totalExpected { break }
             let url = "http://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid=\(id)&pn=\(page)&rn=\(pageSize)&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1"
             guard let body = await getString(url) else {
+                if Task.isCancelled { return .failure(CancellationError()) }
                 if page == 0 { return .failure(LxRuntimeError.message("获取酷我歌单失败，请检查网络连接")) }
                 break
             }
             guard let root = JsonSafe.parseObject(body) else {
                 if page == 0 { return .failure(LxRuntimeError.message("酷我歌单数据异常")) }
+                break
+            }
+            if JsonSafe.asString(root["result"])?.lowercased() == "fail" {
+                if page == 0 { return .failure(LxRuntimeError.message("酷我歌单不存在或暂无访问权限")) }
                 break
             }
             if firstRoot == nil {
@@ -144,18 +150,21 @@ final class KuwoProvider: Sendable {
             var added = 0
             for el in musicList {
                 guard let obj = JsonSafe.asObject(el),
-                      let rid = JsonSafe.asString(obj["id"]) else { continue }
+                      let rid = JsonSafe.asNonBlankString(obj["id"]) else { continue }
+                let title = FormatUtils.decodeHtml(JsonSafe.asNonBlankString(obj["name"]))
+                guard !title.isEmpty else { continue }
+                let artistRaw = FormatUtils.decodeHtml(JsonSafe.asString(obj["artist"])).replacingOccurrences(of: "&", with: " / ")
                 let track = Track(
                     id: "kw_\(rid)",
-                    title: FormatUtils.decodeHtml(JsonSafe.asString(obj["name"])),
-                    artist: FormatUtils.decodeHtml(JsonSafe.asString(obj["artist"])).replacingOccurrences(of: "&", with: " / "),
+                    title: title,
+                    artist: artistRaw.isEmpty ? "未知歌手" : artistRaw,
                     album: FormatUtils.decodeHtml(JsonSafe.asString(obj["album"])),
                     source: .kw,
                     songmid: rid,
                     durationMs: (JsonSafe.asInt64(obj["duration"]) ?? 0) * 1000,
                     coverUrl: extractInlineCover(obj),
                     albumId: JsonSafe.asString(obj["albumid"]),
-                    qualities: parseMinfoQualities(JsonSafe.asString(obj["N_MINFO"]) ?? JsonSafe.asString(obj["n_minfo"]))
+                    qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["N_MINFO"]) ?? JsonSafe.asNonBlankString(obj["n_minfo"]))
                 )
                 if seenIds.insert(track.id).inserted {
                     allRawTracks.append(track)
@@ -165,10 +174,15 @@ final class KuwoProvider: Sendable {
             if added == 0 || musicList.count < pageSize { break }
         }
 
+        let rootTitle = JsonSafe.asNonBlankString(firstRoot?["title"])
+        if allRawTracks.isEmpty && rootTitle == nil {
+            return .failure(LxRuntimeError.message("酷我歌单不存在或暂无访问权限"))
+        }
+
         let tracks = await hydrateMissingCovers(allRawTracks)
         let meta = OnlinePlaylist(
             id: id,
-            name: FormatUtils.decodeHtml(JsonSafe.asString(firstRoot?["title"]) ?? "酷我歌单"),
+            name: FormatUtils.decodeHtml(rootTitle ?? "酷我歌单"),
             coverUrl: Self.normalizeKuwoImageUrl(JsonSafe.asString(firstRoot?["pic"])) ?? "",
             author: FormatUtils.decodeHtml(JsonSafe.asString(firstRoot?["uname"])),
             playCount: FormatUtils.formatPlayCount(JsonSafe.asInt64(firstRoot?["playnum"]) ?? 0),
@@ -191,18 +205,21 @@ final class KuwoProvider: Sendable {
 
         let rawTracks: [Track] = list.compactMap { el in
             guard let obj = JsonSafe.asObject(el),
-                  let rid = JsonSafe.asString(obj["id"]) else { return nil }
+                  let rid = JsonSafe.asNonBlankString(obj["id"]) else { return nil }
+            let title = FormatUtils.decodeHtml(JsonSafe.asNonBlankString(obj["name"]))
+            guard !title.isEmpty else { return nil }
+            let artistRaw = FormatUtils.decodeHtml(JsonSafe.asString(obj["artist"])).replacingOccurrences(of: "&", with: " / ")
             return Track(
                 id: "kw_\(rid)",
-                title: FormatUtils.decodeHtml(JsonSafe.asString(obj["name"])),
-                artist: FormatUtils.decodeHtml(JsonSafe.asString(obj["artist"])).replacingOccurrences(of: "&", with: " / "),
+                title: title,
+                artist: artistRaw.isEmpty ? "未知歌手" : artistRaw,
                 album: FormatUtils.decodeHtml(JsonSafe.asString(obj["album"])),
                 source: .kw,
                 songmid: rid,
                 durationMs: (JsonSafe.asInt64(obj["duration"]) ?? 0) * 1000,
                 coverUrl: extractInlineCover(obj),
                 albumId: JsonSafe.asString(obj["albumid"]),
-                qualities: parseMinfoQualities(JsonSafe.asString(obj["n_minfo"]) ?? JsonSafe.asString(obj["N_MINFO"]))
+                qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["n_minfo"]) ?? JsonSafe.asNonBlankString(obj["N_MINFO"]))
             )
         }
 
@@ -234,16 +251,24 @@ final class KuwoProvider: Sendable {
             return ParsedLyrics()
         }
 
-        var lines: [String] = []
+        var rawLines: [(Int64, String)] = []
+        rawLines.reserveCapacity(lrcList.count)
         for el in lrcList {
             guard let obj = JsonSafe.asObject(el),
-                  let sec = JsonSafe.asDouble(obj["time"]) else { continue }
-            let text = JsonSafe.asString(obj["lineLyric"]) ?? ""
-            let minVal = Int(sec / 60.0)
-            let remSec = sec.truncatingRemainder(dividingBy: 60.0)
-            lines.append(String(format: "[%02d:%05.2f]%@", minVal, remSec, text))
+                  let sec = JsonSafe.asDouble(obj["time"]),
+                  sec.isFinite else { continue }
+            let text = FormatUtils.decodeHtml(JsonSafe.asString(obj["lineLyric"]))
+            if !text.isEmpty {
+                let timeMs = max(Int64((sec * 1000.0).rounded()), 0)
+                rawLines.append((timeMs, text))
+            }
         }
-        return LrcParser.parse(lines.joined(separator: "\n"))
+        guard !rawLines.isEmpty else { return ParsedLyrics() }
+        let sorted = rawLines.sorted { $0.0 < $1.0 }
+        let indexed = sorted.enumerated().map { idx, item in
+            LyricLine(timeMs: item.0, text: item.1, translation: nil, lineIndex: idx)
+        }
+        return ParsedLyrics(lines: indexed, hasTranslation: false)
     }
 
     func resolveCover(songmid: String) async -> String? {
@@ -310,11 +335,22 @@ final class KuwoProvider: Sendable {
         }
     }
 
-    private func extractPlaylistId(_ raw: String) -> String? {
+    func extractPlaylistId(_ raw: String) async -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty && trimmed.allSatisfy(\.isNumber) { return trimmed }
-        return firstRegexCapture(pattern: "/playlist(?:_detail)?/(\\d+)", in: trimmed)
-            ?? firstRegexCapture(pattern: "[?&]pid=(\\d+)", in: trimmed)
+
+        let pattern = "(?:/playlist(?:_detail)?/|[?&](?:pid|id)=)(\\d+)"
+        if let direct = firstRegexCapture(pattern: pattern, in: trimmed) {
+            return direct
+        }
+
+        guard let urlStr = extractFirstHttpUrl(from: trimmed),
+              let url = URL(string: urlStr) else { return nil }
+        var req = URLRequest(url: url)
+        req.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64)", forHTTPHeaderField: "User-Agent")
+        guard let (_, resp) = try? await session.data(for: req),
+              let finalUrl = resp.url?.absoluteString else { return nil }
+        return firstRegexCapture(pattern: pattern, in: finalUrl)
     }
 
     private func parseMinfoQualities(_ minfo: String?) -> [QualityInfo] {

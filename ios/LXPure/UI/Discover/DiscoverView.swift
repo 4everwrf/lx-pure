@@ -11,6 +11,7 @@ struct DiscoverView: View {
     @State private var selectedSource: MusicSource = .wy
     @State private var hotPlaylists: [OnlinePlaylist] = []
     @State private var isLoading = false
+    @State private var retryNonce = 0
 
     private var leaderboards: [LeaderboardItem] {
         aggregator.getLeaderboards(source: selectedSource)
@@ -52,7 +53,7 @@ struct DiscoverView: View {
                         .foregroundColor(lx.textPrimary)
                         .padding(.horizontal, 20)
 
-                    if isLoading && hotPlaylists.isEmpty {
+                    if isLoading {
                         HStack {
                             Spacer()
                             ProgressView().tint(lx.accent)
@@ -60,14 +61,31 @@ struct DiscoverView: View {
                         }
                         .frame(height: 170)
                     } else if hotPlaylists.isEmpty {
-                        Text("歌单加载中或网络不可达，可切换平台重试")
-                            .font(.system(size: 13))
-                            .foregroundColor(lx.textSecondary)
-                            .padding(.horizontal, 20)
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("歌单加载失败或网络不可达，可重试或切换平台")
+                                .font(.system(size: 13))
+                                .foregroundColor(lx.textSecondary)
+                            Button {
+                                retryNonce += 1
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "arrow.clockwise")
+                                    Text("重新加载")
+                                }
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(lx.accent)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
+                                .background(lx.accentSoft)
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 20)
                     } else {
                         ScrollView(.horizontal, showsIndicators: false) {
                             LazyHStack(alignment: .top, spacing: 14) {
-                                ForEach(hotPlaylists) { playlist in
+                                ForEach(Array(hotPlaylists.enumerated()), id: \.offset) { _, playlist in
                                     Button {
                                         onOpenPlaylist(playlist)
                                     } label: {
@@ -98,6 +116,7 @@ struct DiscoverView: View {
                             }
                             .padding(.horizontal, 18)
                         }
+                        .id(selectedSource)
                     }
                 }
 
@@ -148,9 +167,14 @@ struct DiscoverView: View {
             }
             .padding(.bottom, bottomInset)
         }
-        .task(id: selectedSource) {
+        .task(id: "\(selectedSource.rawValue)_\(retryNonce)") {
+            let targetSource = selectedSource
             isLoading = true
-            hotPlaylists = await aggregator.getHotPlaylists(source: selectedSource)
+            hotPlaylists = []
+            let fetched = await aggregator.getHotPlaylists(source: targetSource)
+            guard !Task.isCancelled, selectedSource == targetSource else { return }
+            var seen = Set<String>()
+            hotPlaylists = fetched.filter { seen.insert("\($0.source.code)_\($0.id)").inserted }
             isLoading = false
         }
     }

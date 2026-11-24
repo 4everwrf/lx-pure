@@ -13,6 +13,7 @@ import com.lxpure.music.domain.model.AudioQuality
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.domain.model.UserApiSource
 import com.whl.quickjs.android.QuickJSLoader
+import com.whl.quickjs.wrapper.JSFunction
 import com.whl.quickjs.wrapper.QuickJSContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -20,7 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -29,14 +30,20 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.CacheControl
 import okhttp3.Call
 import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.ResponseBody
+import java.io.ByteArrayOutputStream
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import java.util.Base64
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -58,12 +65,15 @@ class LxQuickJsRuntime(
 ) {
     companion object {
         private const val TAG = "LxQuickJsRuntime"
+        private const val MAX_ACTIVE_TIMERS = 256
+        private const val MAX_HTTP_RESPONSE_BYTES = 4 * 1024 * 1024 // 4 MB safety cap
         private val loaderLock = Any()
 
         @Volatile
         private var quickJsLoaded = false
 
         private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+        private val strictJson = Json { ignoreUnknownKeys = true; isLenient = false }
 
         /**
          * Guarantees QuickJS native `.so` library finishes loading synchronously exactly once
@@ -90,7 +100,7 @@ class LxQuickJsRuntime(
                 .orEmpty()
             if (cleaned.isEmpty()) return "音源暂时不可用"
 
-            val lower = cleaned.lowercase()
+            val lower = cleaned.lowercase(Locale.ROOT)
             return when {
                 lower.contains("the so library must be initialized") ||
                     lower.contains("no implementation found") ||
@@ -135,6 +145,26 @@ class LxQuickJsRuntime(
                 else -> cleaned.take(64)
             }
         }
+
+        private fun readBoundedBytes(body: ResponseBody?, maxBytes: Int): ByteArray {
+            if (body == null) return ByteArray(0)
+            body.byteStream().use { input ->
+                val out = ByteArrayOutputStream()
+                val buf = ByteArray(8192)
+                var total = 0
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    val remaining = maxBytes - total
+                    if (remaining <= 0) break
+                    val toWrite = minOf(n, remaining)
+                    out.write(buf, 0, toWrite)
+                    total += toWrite
+                    if (total >= maxBytes) break
+                }
+                return out.toByteArray()
+            }
+        }
     }
 
     private val secretKey = UUID.randomUUID().toString()
@@ -143,10 +173,16 @@ class LxQuickJsRuntime(
     private val networkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var jsContext: QuickJSContext? = null
+    private var nativeBridgeFn: JSFunction? = null
     private val destroyed = AtomicBoolean(false)
     private val initDeferred = CompletableDeferred<ScriptInitResult>()
     private val pendingActions = ConcurrentHashMap<String, CompletableDeferred<Result<JsonElement?>>>()
     private val activeHttpCalls = ConcurrentHashMap<String, Call>()
+    private val cancelledRequests = ConcurrentHashMap.newKeySet<String>()
+    private val activeTimers = ConcurrentHashMap<Long, Runnable>()
+
+    fun hasActiveRequests(): Boolean =
+        pendingActions.isNotEmpty() || activeHttpCalls.isNotEmpty() || (!destroyed.get() && !initDeferred.isCompleted)
 
     suspend fun initialize(timeoutMs: Long = 15_000L): ScriptInitResult {
         runCatching { ensureQuickJsLoaded() }.onFailure { t ->
@@ -199,16 +235,22 @@ class LxQuickJsRuntime(
                 )
                 ctx.evaluate(preloadScript, "user-api-preload.js")
                 val normalizedScript = LxScriptParser.normalizeScript(source.script)
-                ctx.globalObject.getJSFunction("lx_setup").call(
-                    secretKey,
-                    source.id,
-                    source.name,
-                    source.description,
-                    source.version,
-                    source.author,
-                    source.homepage,
-                    normalizedScript
-                )
+                val setupFn = ctx.globalObject.getJSFunction("lx_setup")
+                try {
+                    setupFn.call(
+                        secretKey,
+                        source.id,
+                        source.name,
+                        source.description,
+                        source.version,
+                        source.author,
+                        source.homepage,
+                        normalizedScript
+                    )
+                } finally {
+                    runCatching { setupFn.release() }
+                }
+                nativeBridgeFn = runCatching { ctx.globalObject.getJSFunction("__lx_native__") }.getOrNull()
                 ctx.evaluate(normalizedScript, "${source.name}.js")
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to initialize script ${source.name}", t)
@@ -223,11 +265,10 @@ class LxQuickJsRuntime(
             }
         }
 
-        return runCatching {
-            withTimeout(timeoutMs) { initDeferred.await() }
-        }.getOrElse {
-            ScriptInitResult(false, errorMessage = "脚本初始化超时 (${timeoutMs / 1000}s)")
-        }
+        // Uses withTimeoutOrNull so external CancellationException always propagates cleanly
+        return withTimeoutOrNull(timeoutMs) {
+            initDeferred.await()
+        } ?: ScriptInitResult(false, errorMessage = "脚本初始化超时 (${timeoutMs / 1000}s)")
     }
 
     private fun bindNativeBridge(ctx: QuickJSContext) {
@@ -247,13 +288,12 @@ class LxQuickJsRuntime(
         // Standard Web Base64 helpers (btoa / atob) for custom script compatibility
         global.setProperty("btoa") { args ->
             val raw = args.getOrNull(0)?.toString().orEmpty()
-            android.util.Base64.encodeToString(raw.toByteArray(Charsets.ISO_8859_1), android.util.Base64.NO_WRAP)
+            Base64.getEncoder().encodeToString(raw.toByteArray(Charsets.ISO_8859_1))
         }
         global.setProperty("atob") { args ->
             val raw = args.getOrNull(0)?.toString().orEmpty()
-            runCatching {
-                String(android.util.Base64.decode(raw, android.util.Base64.DEFAULT), Charsets.ISO_8859_1)
-            }.getOrDefault("")
+            val bytes = LxCrypto.decodeBase64Flexible(raw) ?: ByteArray(0)
+            String(bytes, Charsets.ISO_8859_1)
         }
 
         global.setProperty("__lx_native_call__utils_b642buf") { args ->
@@ -283,14 +323,36 @@ class LxQuickJsRuntime(
             )
         }
 
+        global.setProperty("__lx_native_call__utils_zlib_inflate") { args ->
+            LxCrypto.zlibInflateBase64(args.getOrNull(0)?.toString().orEmpty())
+        }
+
+        global.setProperty("__lx_native_call__utils_zlib_deflate") { args ->
+            LxCrypto.zlibDeflateBase64(args.getOrNull(0)?.toString().orEmpty())
+        }
+
         global.setProperty("__lx_native_call__set_timeout") { args ->
+            if (destroyed.get() || activeTimers.size >= MAX_ACTIVE_TIMERS) return@setProperty null
             val timerId = (args.getOrNull(0) as? Number)?.toLong() ?: args.getOrNull(0)?.toString()?.toLongOrNull() ?: 0L
             val delayMs = ((args.getOrNull(1) as? Number)?.toLong() ?: 0L).coerceIn(0L, 60_000L)
-            jsHandler.postDelayed({
+            val runnable = Runnable {
+                activeTimers.remove(timerId)
                 if (!destroyed.get()) {
                     callJs("__set_timeout__", timerId.toString())
                 }
-            }, delayMs)
+            }
+            activeTimers.put(timerId, runnable)?.let { old -> jsHandler.removeCallbacks(old) }
+            jsHandler.postDelayed(runnable, delayMs)
+            null
+        }
+
+        global.setProperty("__lx_native_call__clear_timeout") { args ->
+            val timerId = (args.getOrNull(0) as? Number)?.toLong() ?: args.getOrNull(0)?.toString()?.toLongOrNull()
+            if (timerId != null) {
+                activeTimers.remove(timerId)?.let { runnable ->
+                    jsHandler.removeCallbacks(runnable)
+                }
+            }
             null
         }
     }
@@ -312,11 +374,18 @@ class LxQuickJsRuntime(
                     }
                 }
                 if (!initDeferred.isCompleted) {
+                    val effectiveSuccess = ok && platforms.isNotEmpty()
+                    val effectiveErr = when {
+                        effectiveSuccess -> null
+                        !errMsg.isNullOrBlank() -> errMsg
+                        ok && platforms.isEmpty() -> "音源未声明可用音乐平台"
+                        else -> "初始化失败"
+                    }
                     initDeferred.complete(
                         ScriptInitResult(
-                            success = ok,
-                            supportedPlatforms = platforms,
-                            errorMessage = errMsg
+                            success = effectiveSuccess,
+                            supportedPlatforms = if (effectiveSuccess) platforms else emptyMap(),
+                            errorMessage = effectiveErr
                         )
                     )
                 }
@@ -325,7 +394,11 @@ class LxQuickJsRuntime(
             "request" -> {
                 val obj = runCatching { json.parseToJsonElement(dataJson).asJsonObjectOrNull() }.getOrNull() ?: return
                 val requestKey = obj["requestKey"].asStringOrNull() ?: return
-                val url = obj["url"].asStringOrNull() ?: return
+                val url = obj["url"].asStringOrNull()
+                if (url.isNullOrBlank()) {
+                    sendHttpErrorResponse(requestKey, "Invalid URL")
+                    return
+                }
                 val options = obj["options"].asJsonObjectOrNull()
                 executeHttpForScript(requestKey, url, options)
             }
@@ -333,6 +406,7 @@ class LxQuickJsRuntime(
             "cancelRequest" -> {
                 val requestKey = runCatching { json.parseToJsonElement(dataJson).asStringOrNull() }.getOrNull()
                 if (requestKey != null) {
+                    cancelledRequests.add(requestKey)
                     activeHttpCalls.remove(requestKey)?.cancel()
                 }
             }
@@ -356,14 +430,29 @@ class LxQuickJsRuntime(
         }
     }
 
+    private fun sendHttpErrorResponse(requestKey: String, errorMessage: String) {
+        val payload = buildJsonObject {
+            put("requestKey", requestKey)
+            put("error", errorMessage)
+            put("response", JsonNull)
+        }
+        postCallJs("response", payload.toString())
+    }
+
     private fun executeHttpForScript(requestKey: String, url: String, options: JsonObject?) {
         networkScope.launch {
+            var activeCall: Call? = null
             try {
-                val method = options?.get("method").asStringOrNull()?.uppercase() ?: "GET"
+                if (destroyed.get() || cancelledRequests.remove(requestKey)) return@launch
+
+                val method = options?.get("method").asStringOrNull()?.uppercase(Locale.ROOT) ?: "GET"
                 val timeoutMs = options?.get("timeout").asIntOrNull()?.toLong()?.coerceIn(1_000L, 12_000L) ?: 8_000L
                 val isBinary = options?.get("binary").asBooleanOrNull() == true
+                val followMax = options?.get("follow_max").asIntOrNull()
 
-                val reqBuilder = Request.Builder().url(url)
+                val reqBuilder = Request.Builder()
+                    .url(url)
+                    .cacheControl(CacheControl.FORCE_NETWORK)
                 var hasUserAgent = false
                 var explicitContentType: String? = null
 
@@ -382,12 +471,29 @@ class LxQuickJsRuntime(
 
                 if (method in setOf("POST", "PUT", "PATCH", "DELETE")) {
                     val formEl = options?.get("form")
+                    val formDataEl = options?.get("formData")
                     val bodyEl = options?.get("body")
                     val reqBody = when {
                         formEl is JsonObject -> {
                             FormBody.Builder().apply {
                                 formEl.forEach { (k, v) ->
-                                    add(k, v.asStringOrNull() ?: v.toString())
+                                    if (v !is JsonNull) {
+                                        add(k, v.asStringOrNull() ?: v.toString())
+                                    }
+                                }
+                            }.build()
+                        }
+                        formEl is JsonPrimitive && formEl !is JsonNull && formEl.isString -> {
+                            formEl.content.toRequestBody(
+                                (explicitContentType ?: "application/x-www-form-urlencoded; charset=utf-8").toMediaTypeOrNull()
+                            )
+                        }
+                        formDataEl is JsonObject -> {
+                            MultipartBody.Builder().setType(MultipartBody.FORM).apply {
+                                formDataEl.forEach { (k, v) ->
+                                    if (v !is JsonNull) {
+                                        addFormDataPart(k, v.asStringOrNull() ?: v.toString())
+                                    }
                                 }
                             }.build()
                         }
@@ -404,29 +510,56 @@ class LxQuickJsRuntime(
                     reqBuilder.method(method, null)
                 }
 
-                val client = httpClient.newBuilder()
+                val clientBuilder = httpClient.newBuilder()
+                    .cache(null)
                     .connectTimeout(timeoutMs.coerceAtMost(5_000L), TimeUnit.MILLISECONDS)
                     .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
                     .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                    .build()
+                if (followMax == 0) {
+                    clientBuilder.followRedirects(false).followSslRedirects(false)
+                }
 
-                val call = client.newCall(reqBuilder.build())
+                val call = clientBuilder.build().newCall(reqBuilder.build())
+                activeCall = call
                 activeHttpCalls[requestKey] = call
+                if (destroyed.get() || cancelledRequests.remove(requestKey)) {
+                    activeHttpCalls.remove(requestKey, call)
+                    runCatching { call.cancel() }
+                    return@launch
+                }
 
                 call.execute().use { resp ->
-                    activeHttpCalls.remove(requestKey)
+                    activeHttpCalls.remove(requestKey, call)
+                    if (destroyed.get() || cancelledRequests.remove(requestKey)) return@launch
+
                     val respHeaders = buildJsonObject {
                         resp.headers.names().forEach { name ->
-                            put(name.lowercase(), resp.headers[name].orEmpty())
+                            val lowerName = name.lowercase(Locale.ROOT)
+                            val values = resp.headers.values(name)
+                            if (lowerName == "set-cookie") {
+                                put(lowerName, JsonArray(values.map { JsonPrimitive(it) }))
+                            } else {
+                                put(lowerName, values.joinToString(", "))
+                            }
                         }
                     }
 
+                    val rawBytes = readBoundedBytes(resp.body, MAX_HTTP_RESPONSE_BYTES)
                     val bodyElement: JsonElement = if (isBinary) {
-                        val bytes = resp.body?.bytes() ?: ByteArray(0)
-                        JsonArray(bytes.map { JsonPrimitive(it.toInt() and 0xFF) })
+                        JsonPrimitive(Base64.getEncoder().encodeToString(rawBytes))
                     } else {
-                        val text = resp.body?.string().orEmpty()
-                        runCatching { json.parseToJsonElement(text) }.getOrElse { JsonPrimitive(text) }
+                        val charset = resp.body?.contentType()?.charset(StandardCharsets.UTF_8) ?: StandardCharsets.UTF_8
+                        val text = String(rawBytes, charset)
+                        val contentType = resp.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
+                        val trimmed = text.trimStart()
+                        val shouldParseJson = contentType.contains("json") ||
+                            trimmed.startsWith("{") ||
+                            trimmed.startsWith("[")
+                        if (shouldParseJson) {
+                            runCatching { strictJson.parseToJsonElement(text) }.getOrElse { JsonPrimitive(text) }
+                        } else {
+                            JsonPrimitive(text)
+                        }
                     }
 
                     val payload = buildJsonObject {
@@ -436,19 +569,20 @@ class LxQuickJsRuntime(
                             put("statusCode", resp.code)
                             put("statusMessage", resp.message)
                             put("headers", respHeaders)
+                            put("binary", isBinary)
                             put("body", bodyElement)
                         })
                     }
                     postCallJs("response", payload.toString())
                 }
             } catch (t: Throwable) {
-                activeHttpCalls.remove(requestKey)
-                val payload = buildJsonObject {
-                    put("requestKey", requestKey)
-                    put("error", t.message ?: "Network request error")
-                    put("response", JsonNull)
+                activeCall?.let { activeHttpCalls.remove(requestKey, it) }
+                if (!destroyed.get() && !cancelledRequests.remove(requestKey)) {
+                    sendHttpErrorResponse(requestKey, t.message ?: "Network request error")
                 }
-                postCallJs("response", payload.toString())
+            } finally {
+                activeCall?.let { activeHttpCalls.remove(requestKey, it) }
+                cancelledRequests.remove(requestKey)
             }
         }
     }
@@ -458,6 +592,11 @@ class LxQuickJsRuntime(
         val requestKey = "req_${UUID.randomUUID().toString().replace("-", "")}"
         val deferred = CompletableDeferred<Result<JsonElement?>>()
         pendingActions[requestKey] = deferred
+        // Re-check destroyed AFTER inserting into pendingActions to close TOCTOU window
+        if (destroyed.get()) {
+            pendingActions.remove(requestKey)
+            return Result.failure(IllegalStateException("音源已卸载"))
+        }
 
         val payload = buildJsonObject {
             put("requestKey", requestKey)
@@ -474,22 +613,21 @@ class LxQuickJsRuntime(
         postCallJs("request", payload.toString())
 
         return try {
-            val url = withTimeout(timeoutMs) {
-                val res = deferred.await().getOrThrow()
-                val extracted = res.asJsonObjectOrNull()
-                    ?.get("data").asJsonObjectOrNull()
-                    ?.get("url").asStringOrNull()
-                if (extracted.isNullOrBlank() || !extracted.startsWith("http")) {
-                    throw IllegalStateException("未返回有效音频直链")
-                }
-                extracted
+            val outcome = withTimeoutOrNull(timeoutMs) {
+                deferred.await()
+            } ?: return Result.failure(IllegalStateException("请求超时，请检查网络连接"))
+
+            val res = outcome.getOrElse { err ->
+                return Result.failure(IllegalStateException(formatFriendlyError(err.message)))
             }
-            Result.success(url)
-        } catch (t: Throwable) {
-            if (t is kotlinx.coroutines.CancellationException && t !is kotlinx.coroutines.TimeoutCancellationException) {
-                throw t
+            val extracted = res.asJsonObjectOrNull()
+                ?.get("data").asJsonObjectOrNull()
+                ?.get("url").asStringOrNull()
+            if (extracted.isNullOrBlank() || !extracted.startsWith("http")) {
+                Result.failure(IllegalStateException("未返回有效音频直链"))
+            } else {
+                Result.success(extracted)
             }
-            Result.failure(IllegalStateException(formatFriendlyError(t.message)))
         } finally {
             pendingActions.remove(requestKey)
         }
@@ -507,7 +645,9 @@ class LxQuickJsRuntime(
     private fun callJs(action: String, dataJson: String? = null) {
         val ctx = jsContext ?: return
         try {
-            val fn = ctx.globalObject.getJSFunction("__lx_native__")
+            val fn = nativeBridgeFn ?: ctx.globalObject.getJSFunction("__lx_native__").also {
+                nativeBridgeFn = it
+            }
             if (dataJson == null) {
                 fn.call(secretKey, action)
             } else {
@@ -520,14 +660,21 @@ class LxQuickJsRuntime(
 
     fun destroy() {
         if (!destroyed.compareAndSet(false, true)) return
+        initDeferred.complete(ScriptInitResult(false, errorMessage = "音源已停用"))
         activeHttpCalls.values.forEach { runCatching { it.cancel() } }
         activeHttpCalls.clear()
+        cancelledRequests.clear()
+        activeTimers.values.forEach { jsHandler.removeCallbacks(it) }
+        activeTimers.clear()
         pendingActions.values.forEach {
             it.complete(Result.failure(IllegalStateException("音源已切换或停止")))
         }
         pendingActions.clear()
         networkScope.cancel()
+        jsHandler.removeCallbacksAndMessages(null)
         jsHandler.post {
+            runCatching { nativeBridgeFn?.release() }
+            nativeBridgeFn = null
             runCatching { jsContext?.destroy() }
             jsContext = null
             thread.quitSafely()

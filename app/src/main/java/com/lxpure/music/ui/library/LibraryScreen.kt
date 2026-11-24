@@ -122,7 +122,10 @@ fun LibraryScreen(
                 }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    IconButton(onClick = { showImportDialog = true }) {
+                    IconButton(
+                        onClick = { if (!isImportingPlaylist) showImportDialog = true },
+                        enabled = !isImportingPlaylist
+                    ) {
                         if (isImportingPlaylist) {
                             CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                         } else {
@@ -327,8 +330,8 @@ fun LibraryScreen(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     SmallActionPill(
                         icon = Icons.Rounded.Link,
-                        label = "导入",
-                        onClick = { showImportDialog = true }
+                        label = if (isImportingPlaylist) "导入中" else "导入",
+                        onClick = { if (!isImportingPlaylist) showImportDialog = true }
                     )
                     SmallActionPill(
                         icon = Icons.Rounded.Add,
@@ -348,7 +351,7 @@ fun LibraryScreen(
         if (playlists.isEmpty()) {
             item {
                 Box(modifier = Modifier.padding(horizontal = 18.dp)) {
-                    GlassCard(onClick = { showImportDialog = true }) {
+                    GlassCard(onClick = { if (!isImportingPlaylist) showImportDialog = true }) {
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()

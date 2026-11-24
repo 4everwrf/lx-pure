@@ -26,12 +26,25 @@ enum AppUpdateState: Equatable {
     case available(AppUpdateInfo)
     case downloading(info: AppUpdateInfo, downloadedBytes: Int64, totalBytes: Int64, progress: Double, routeLabel: String)
     case verifying(AppUpdateInfo)
-    case readyToInstall(info: AppUpdateInfo, localFileURL: URL)
+    case readyToInstall(info: AppUpdateInfo, localFileURL: URL, resolvedDownloadUrl: String)
     case error(info: AppUpdateInfo?, message: String)
+}
+
+private final class NoRedirectSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
 }
 
 private final class IpaDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let destinationPartURL: URL
+    private let maxBytes: Int64
     private let onProgress: @Sendable (Int64, Int64) -> Void
     private let onComplete: @Sendable (Result<URL, Error>) -> Void
 
@@ -43,10 +56,12 @@ private final class IpaDownloadDelegate: NSObject, URLSessionDownloadDelegate, @
 
     init(
         destinationPartURL: URL,
+        maxBytes: Int64,
         onProgress: @escaping @Sendable (Int64, Int64) -> Void,
         onComplete: @escaping @Sendable (Result<URL, Error>) -> Void
     ) {
         self.destinationPartURL = destinationPartURL
+        self.maxBytes = maxBytes
         self.onProgress = onProgress
         self.onComplete = onComplete
     }
@@ -57,6 +72,15 @@ private final class IpaDownloadDelegate: NSObject, URLSessionDownloadDelegate, @
         return body()
     }
 
+    private func abortWithError(_ error: Error, task: URLSessionDownloadTask) {
+        withLock {
+            if moveError == nil {
+                moveError = error
+            }
+        }
+        task.cancel()
+    }
+
     func urlSession(
         _ session: URLSession,
         downloadTask: URLSessionDownloadTask,
@@ -64,8 +88,46 @@ private final class IpaDownloadDelegate: NSObject, URLSessionDownloadDelegate, @
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
+        if let http = downloadTask.response as? HTTPURLResponse {
+            if !(200..<300).contains(http.statusCode) {
+                abortWithError(
+                    NSError(
+                        domain: "LXPureUpdate",
+                        code: http.statusCode,
+                        userInfo: [NSLocalizedDescriptionKey: "下载失败（HTTP \(http.statusCode)）"]
+                    ),
+                    task: downloadTask
+                )
+                return
+            }
+            let contentType = http.value(forHTTPHeaderField: "Content-Type")
+            if AppUpdateManager.isDisallowedUpdateContentType(contentType) {
+                abortWithError(
+                    NSError(
+                        domain: "LXPureUpdate",
+                        code: -3,
+                        userInfo: [NSLocalizedDescriptionKey: "服务器返回了非安装包响应"]
+                    ),
+                    task: downloadTask
+                )
+                return
+            }
+        }
+        if totalBytesWritten > maxBytes || totalBytesExpectedToWrite > maxBytes {
+            abortWithError(
+                NSError(
+                    domain: "LXPureUpdate",
+                    code: -4,
+                    userInfo: [NSLocalizedDescriptionKey: "安装包体积超出安全限制"]
+                ),
+                task: downloadTask
+            )
+            return
+        }
+
         let now = ProcessInfo.processInfo.systemUptime
         let shouldEmit: Bool = withLock {
+            if moveError != nil { return false }
             if now - lastProgressEmitUptime < 0.10 && totalBytesWritten != totalBytesExpectedToWrite {
                 return false
             }
@@ -82,18 +144,57 @@ private final class IpaDownloadDelegate: NSObject, URLSessionDownloadDelegate, @
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        if let http = downloadTask.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            withLock {
-                moveError = NSError(
-                    domain: "LXPureUpdate",
-                    code: http.statusCode,
-                    userInfo: [NSLocalizedDescriptionKey: "下载失败（HTTP \(http.statusCode)）"]
-                )
+        if let http = downloadTask.response as? HTTPURLResponse {
+            if !(200..<300).contains(http.statusCode) {
+                withLock {
+                    if moveError == nil {
+                        moveError = NSError(
+                            domain: "LXPureUpdate",
+                            code: http.statusCode,
+                            userInfo: [NSLocalizedDescriptionKey: "下载失败（HTTP \(http.statusCode)）"]
+                        )
+                    }
+                }
+                return
             }
-            return
+            if AppUpdateManager.isDisallowedUpdateContentType(http.value(forHTTPHeaderField: "Content-Type")) {
+                withLock {
+                    if moveError == nil {
+                        moveError = NSError(
+                            domain: "LXPureUpdate",
+                            code: -3,
+                            userInfo: [NSLocalizedDescriptionKey: "服务器返回了非安装包响应"]
+                        )
+                    }
+                }
+                return
+            }
         }
         do {
             let fm = FileManager.default
+            let attrs = try fm.attributesOfItem(atPath: location.path)
+            let actualSize = (attrs[.size] as? Int64) ?? 0
+            let expectedLength = downloadTask.response?.expectedContentLength ?? -1
+            if expectedLength > 0 && actualSize != expectedLength {
+                withLock {
+                    moveError = NSError(
+                        domain: "LXPureUpdate",
+                        code: -5,
+                        userInfo: [NSLocalizedDescriptionKey: "安装包下载不完整（已接收 \(actualSize)/\(expectedLength) 字节）"]
+                    )
+                }
+                return
+            }
+            if actualSize > maxBytes {
+                withLock {
+                    moveError = NSError(
+                        domain: "LXPureUpdate",
+                        code: -4,
+                        userInfo: [NSLocalizedDescriptionKey: "安装包体积超出安全限制"]
+                    )
+                }
+                return
+            }
             try fm.createDirectory(at: destinationPartURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             if fm.fileExists(atPath: destinationPartURL.path) {
                 try fm.removeItem(at: destinationPartURL)
@@ -105,6 +206,17 @@ private final class IpaDownloadDelegate: NSObject, URLSessionDownloadDelegate, @
         }
     }
 
+    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
+        let shouldFire: Bool = withLock {
+            if didFinish { return false }
+            didFinish = true
+            return true
+        }
+        guard shouldFire else { return }
+        let mErr = withLock { moveError }
+        onComplete(.failure(mErr ?? error ?? CancellationError()))
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         let shouldFire: Bool = withLock {
             if didFinish { return false }
@@ -113,14 +225,17 @@ private final class IpaDownloadDelegate: NSObject, URLSessionDownloadDelegate, @
         }
         guard shouldFire else { return }
 
+        let (fileURL, mErr) = withLock { (movedFileURL, moveError) }
+        // Prefer recorded HTTP/content-type/size error over NSURLErrorCancelled triggered by our own abort
+        if let mErr {
+            onComplete(.failure(mErr))
+            return
+        }
         if let error {
             onComplete(.failure(error))
             return
         }
-        let (fileURL, mErr) = withLock { (movedFileURL, moveError) }
-        if let mErr {
-            onComplete(.failure(mErr))
-        } else if let fileURL {
+        if let fileURL {
             onComplete(.success(fileURL))
         } else {
             onComplete(.failure(NSError(
@@ -140,6 +255,7 @@ final class AppUpdateManager: ObservableObject {
     nonisolated static let latestReleaseWebUrl = "https://github.com/\(githubOwner)/\(githubRepo)/releases/latest"
 
     private nonisolated static let minValidIpaBytes: Int64 = 100 * 1024
+    private nonisolated static let maxValidIpaBytes: Int64 = 200 * 1024 * 1024
     private nonisolated static let githubMirrorPrefixes: [(String, String)] = [
         ("镜像加速 1", "https://gh-proxy.org/"),
         ("镜像加速 2", "https://ghfast.top/")
@@ -154,6 +270,7 @@ final class AppUpdateManager: ObservableObject {
     private var downloadSession: URLSession?
     private var downloadTask: URLSessionDownloadTask?
     private var activeDownloadToken = UUID()
+    private var activeRouteToken: UUID?
     private var hasAutoChecked = false
 
     init(session: URLSession = .shared) {
@@ -179,7 +296,7 @@ final class AppUpdateManager: ObservableObject {
 
     nonisolated static func trollStoreInstallURL(for downloadUrl: String) -> URL? {
         var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: "&=?+#")
+        allowed.remove(charactersIn: "&=?+#%")
         guard let encoded = downloadUrl.addingPercentEncoding(withAllowedCharacters: allowed) else {
             return nil
         }
@@ -252,6 +369,69 @@ final class AppUpdateManager: ObservableObject {
         return cleaned.lowercased()
     }
 
+    nonisolated static func extractSha256FromReleaseBody(_ body: String?, assetName: String) -> String? {
+        guard let body, !body.isEmpty, !assetName.isEmpty else { return nil }
+        guard let regex = try? NSRegularExpression(
+            pattern: "SHA-?256\\s*[:：]\\s*`?([0-9a-fA-F]{64})`?",
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+        let lines = body.components(separatedBy: .newlines)
+        for i in lines.indices {
+            if lines[i].range(of: assetName, options: .caseInsensitive) != nil {
+                let end = min(lines.count - 1, i + 3)
+                for j in i...end {
+                    let nsLine = lines[j] as NSString
+                    let range = NSRange(location: 0, length: nsLine.length)
+                    if let match = regex.firstMatch(in: lines[j], options: [], range: range),
+                       match.numberOfRanges > 1 {
+                        return extractSha256Digest(nsLine.substring(with: match.range(at: 1)))
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    nonisolated static func extractSha256FromSumsText(_ sumsText: String?, assetName: String) -> String? {
+        guard let sumsText, !sumsText.isEmpty, !assetName.isEmpty else { return nil }
+        guard let regex = try? NSRegularExpression(pattern: "^([0-9a-fA-F]{64})\\s+\\*?(.+)$", options: []) else {
+            return nil
+        }
+        for rawLine in sumsText.components(separatedBy: .newlines) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let nsLine = trimmed as NSString
+            let range = NSRange(location: 0, length: nsLine.length)
+            guard let match = regex.firstMatch(in: trimmed, options: [], range: range),
+                  match.numberOfRanges > 2 else {
+                continue
+            }
+            let filePath = nsLine.substring(with: match.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let fileName = (filePath as NSString).lastPathComponent
+            if fileName.caseInsensitiveCompare(assetName) == .orderedSame {
+                return extractSha256Digest(nsLine.substring(with: match.range(at: 1)))
+            }
+        }
+        return nil
+    }
+
+    nonisolated static func isDisallowedUpdateContentType(_ contentType: String?) -> Bool {
+        guard let contentType else { return false }
+        let normalized = contentType
+            .split(separator: ";", maxSplits: 1)
+            .first
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? ""
+        if normalized.isEmpty { return false }
+        return normalized.hasPrefix("text/") ||
+            normalized.hasPrefix("image/") ||
+            normalized == "application/json" ||
+            normalized == "application/xml" ||
+            normalized == "application/xhtml+xml" ||
+            normalized == "application/javascript"
+    }
+
     nonisolated static func isValidZipOrIpaMagic(_ data: Data) -> Bool {
         guard data.count >= 4 else { return false }
         return data[data.startIndex] == 0x50 &&
@@ -260,11 +440,11 @@ final class AppUpdateManager: ObservableObject {
             data[data.startIndex + 3] == 0x04
     }
 
-    nonisolated static func buildDownloadRoutes(originalUrl: String) -> [UpdateDownloadRoute] {
+    nonisolated static func buildDownloadRoutes(originalUrl: String, allowMirrors: Bool = true) -> [UpdateDownloadRoute] {
         let clean = originalUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return [] }
         var routes = [UpdateDownloadRoute(label: "GitHub 直连", url: clean)]
-        if clean.lowercased().hasPrefix("https://github.com/") {
+        if allowMirrors && clean.lowercased().hasPrefix("https://github.com/") {
             for (label, prefix) in githubMirrorPrefixes {
                 routes.append(UpdateDownloadRoute(label: label, url: "\(prefix)\(clean)"))
             }
@@ -288,8 +468,12 @@ final class AppUpdateManager: ObservableObject {
             code == NSURLErrorSecureConnectionFailed ||
             lower.contains("could not connect") ||
             lower.contains("offline")
+        let isMirrorPageError = lower.contains("非安装包响应")
         let isVerifyError = lower.contains("校验")
 
+        if isMirrorPageError {
+            return "下载通道返回了异常页面而非安装包，请重试或点击「浏览器下载」。"
+        }
         if isVerifyError {
             return "安装包校验未通过，请点击「重试下载」或通过「浏览器下载」手动安装。"
         }
@@ -405,7 +589,9 @@ final class AppUpdateManager: ObservableObject {
         }
 
         let sizeBytes = JsonSafe.asInt64(selected["size"]) ?? 0
+        let rawBody = JsonSafe.asString(root["body"])
         let expectedSha256 = extractSha256Digest(JsonSafe.asString(selected["digest"]))
+            ?? extractSha256FromReleaseBody(rawBody, assetName: assetName)
 
         return AppUpdateInfo(
             versionName: versionName,
@@ -447,7 +633,7 @@ final class AppUpdateManager: ObservableObject {
 
     func checkForUpdate(manual: Bool = false) {
         switch state {
-        case .downloading, .verifying:
+        case .downloading, .verifying, .readyToInstall:
             return
         default:
             break
@@ -457,16 +643,24 @@ final class AppUpdateManager: ObservableObject {
         let currentVer = currentAppVersion
         let updatesDir = updatesDirectory
         let sess = session
+        let shouldCleanParts = downloadFlowTask == nil
 
+        state = .checking(manual: manual)
         checkTask = Task { [weak self] in
             guard let self else { return }
-            self.state = .checking(manual: manual)
             await Task.detached(priority: .utility) {
-                Self.cleanupStaleCachedIpas(in: updatesDir, currentVersion: currentVer)
+                Self.cleanupStaleCachedIpas(in: updatesDir, currentVersion: currentVer, cleanPartFiles: shouldCleanParts)
             }.value
+            guard !Task.isCancelled else { return }
 
             let fetched = await Self.fetchLatestRelease(session: sess, currentVersion: currentVer)
             guard !Task.isCancelled else { return }
+            switch self.state {
+            case .downloading, .verifying, .readyToInstall:
+                return
+            default:
+                break
+            }
 
             guard let info = fetched else {
                 self.state = .idle
@@ -488,11 +682,14 @@ final class AppUpdateManager: ObservableObject {
     }
 
     func startDownload(info: AppUpdateInfo) {
+        checkTask?.cancel()
+        checkTask = nil
         downloadFlowTask?.cancel()
         cancelActiveDownloadSession()
 
         let token = UUID()
         activeDownloadToken = token
+        activeRouteToken = nil
 
         let safeName = info.assetName.replacingOccurrences(
             of: "[^A-Za-z0-9._-]",
@@ -500,28 +697,47 @@ final class AppUpdateManager: ObservableObject {
             options: .regularExpression
         )
         let finalURL = updatesDirectory.appendingPathComponent(safeName)
-        let partURL = updatesDirectory.appendingPathComponent("\(safeName).part")
+        let partURL = updatesDirectory.appendingPathComponent("\(safeName).\(token.uuidString).part")
 
-        // Reuse already downloaded and verified IPA if present
-        if FileManager.default.fileExists(atPath: finalURL.path),
-           Self.isValidIpaFile(at: finalURL, info: info) {
-            state = .readyToInstall(info: info, localFileURL: finalURL)
-            return
-        }
-
-        let routes = Self.buildDownloadRoutes(originalUrl: info.downloadUrl)
+        // Only permit third-party proxy mirrors when a trusted GitHub SHA-256 digest is present
+        // (unsigned IPAs have no Apple signature check against tampering).
+        let allowMirrors = !(info.expectedSha256?.isEmpty ?? true)
+        let routes = Self.buildDownloadRoutes(originalUrl: info.downloadUrl, allowMirrors: allowMirrors)
         guard !routes.isEmpty else {
             state = .error(info: info, message: "更新包下载地址无效，请通过浏览器下载")
             return
         }
 
+        // Reflect Downloading immediately so rapid double-taps cannot race
+        state = .downloading(
+            info: info,
+            downloadedBytes: 0,
+            totalBytes: info.assetSizeBytes,
+            progress: 0,
+            routeLabel: routes[0].label
+        )
+
         let userAgent = "LXPure/\(Self.normalizeVersion(currentAppVersion))"
         downloadFlowTask = Task { [weak self] in
             guard let self else { return }
+
+            // Fast-path: validate cached IPA off @MainActor so SHA-256 never freezes the UI
+            let cachedValid = await Task.detached(priority: .utility) {
+                FileManager.default.fileExists(atPath: finalURL.path) && Self.isValidIpaFile(at: finalURL, info: info)
+            }.value
+            guard self.activeDownloadToken == token, !Task.isCancelled else { return }
+            if cachedValid {
+                self.state = .readyToInstall(info: info, localFileURL: finalURL, resolvedDownloadUrl: info.downloadUrl)
+                return
+            }
+
             var lastError: Error?
 
             for route in routes {
-                guard self.activeDownloadToken == token, !Task.isCancelled else { return }
+                guard self.activeDownloadToken == token, !Task.isCancelled else {
+                    try? FileManager.default.removeItem(at: partURL)
+                    return
+                }
                 guard let remoteURL = URL(string: route.url) else { continue }
 
                 self.state = .downloading(
@@ -550,7 +766,10 @@ final class AppUpdateManager: ObservableObject {
                     let valid = await Task.detached(priority: .utility) {
                         Self.isValidIpaFile(at: downloadedPartURL, info: info)
                     }.value
-                    guard self.activeDownloadToken == token, !Task.isCancelled else { return }
+                    guard self.activeDownloadToken == token, !Task.isCancelled else {
+                        try? FileManager.default.removeItem(at: downloadedPartURL)
+                        return
+                    }
 
                     if !valid {
                         try? FileManager.default.removeItem(at: downloadedPartURL)
@@ -567,21 +786,19 @@ final class AppUpdateManager: ObservableObject {
                         try fm.removeItem(at: finalURL)
                     }
                     try fm.moveItem(at: downloadedPartURL, to: finalURL)
-                    self.state = .readyToInstall(info: info, localFileURL: finalURL)
+                    guard self.activeDownloadToken == token, !Task.isCancelled else { return }
+                    self.state = .readyToInstall(info: info, localFileURL: finalURL, resolvedDownloadUrl: route.url)
                     return
                 } catch {
                     try? FileManager.default.removeItem(at: partURL)
                     if (error as NSError).code == NSURLErrorCancelled || Task.isCancelled || self.activeDownloadToken != token {
-                        if self.activeDownloadToken == token {
-                            self.state = .available(info)
-                        }
                         return
                     }
                     lastError = error
                 }
             }
 
-            guard self.activeDownloadToken == token else { return }
+            guard self.activeDownloadToken == token, !Task.isCancelled else { return }
             self.state = .error(
                 info: info,
                 message: Self.formatDownloadError(lastError, triedMirrors: routes.count > 1)
@@ -597,10 +814,18 @@ final class AppUpdateManager: ObservableObject {
         userAgent: String,
         token: UUID
     ) async throws -> URL {
+        let routeToken = UUID()
+        activeRouteToken = routeToken
+        var localSession: URLSession?
         defer {
-            self.downloadSession?.finishTasksAndInvalidate()
-            self.downloadSession = nil
-            self.downloadTask = nil
+            if self.activeRouteToken == routeToken {
+                self.activeRouteToken = nil
+            }
+            localSession?.finishTasksAndInvalidate()
+            if self.downloadSession === localSession {
+                self.downloadSession = nil
+                self.downloadTask = nil
+            }
         }
         return try await withCheckedThrowingContinuation { continuation in
             var req = URLRequest(url: remoteURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
@@ -608,11 +833,17 @@ final class AppUpdateManager: ObservableObject {
 
             let delegate = IpaDownloadDelegate(
                 destinationPartURL: partURL,
+                maxBytes: Self.maxValidIpaBytes,
                 onProgress: { [weak self] written, expected in
                     let total = expected > 0 ? expected : info.assetSizeBytes
                     let progress = total > 0 ? min(max(Double(written) / Double(total), 0), 1) : 0
                     Task { @MainActor [weak self] in
-                        guard let self, self.activeDownloadToken == token else { return }
+                        guard let self,
+                              self.activeDownloadToken == token,
+                              self.activeRouteToken == routeToken,
+                              case .downloading = self.state else {
+                            return
+                        }
                         self.state = .downloading(
                             info: info,
                             downloadedBytes: written,
@@ -631,6 +862,7 @@ final class AppUpdateManager: ObservableObject {
             config.timeoutIntervalForRequest = 15
             config.timeoutIntervalForResource = 180
             let dlSession = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+            localSession = dlSession
             let task = dlSession.downloadTask(with: req)
             self.downloadSession = dlSession
             self.downloadTask = task
@@ -641,16 +873,25 @@ final class AppUpdateManager: ObservableObject {
     func cancelDownload() {
         let cur = state
         activeDownloadToken = UUID()
+        activeRouteToken = nil
         downloadFlowTask?.cancel()
         downloadFlowTask = nil
         cancelActiveDownloadSession()
-        if case .downloading(let info, _, _, _, _) = cur {
+        switch cur {
+        case .downloading(let info, _, _, _, _):
             state = .available(info)
+        case .verifying(let info):
+            state = .available(info)
+        default:
+            break
         }
     }
 
     func dismiss() {
+        checkTask?.cancel()
+        checkTask = nil
         activeDownloadToken = UUID()
+        activeRouteToken = nil
         downloadFlowTask?.cancel()
         downloadFlowTask = nil
         cancelActiveDownloadSession()
@@ -666,6 +907,25 @@ final class AppUpdateManager: ObservableObject {
 
     // MARK: - Network & Verification Helpers
 
+    private nonisolated static func fetchDirectSha256ForAsset(
+        session: URLSession,
+        tagName: String,
+        assetName: String,
+        currentVersion: String
+    ) async -> String? {
+        let sumsUrlStr = "https://github.com/\(githubOwner)/\(githubRepo)/releases/download/\(tagName)/SHA256SUMS.txt"
+        guard let sumsUrl = URL(string: sumsUrlStr) else { return nil }
+        var req = URLRequest(url: sumsUrl, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
+        req.setValue("LXPure/\(normalizeVersion(currentVersion))", forHTTPHeaderField: "User-Agent")
+        if let (data, resp) = try? await session.data(for: req),
+           let http = resp as? HTTPURLResponse,
+           (200..<300).contains(http.statusCode),
+           let text = String(data: data, encoding: .utf8) {
+            return extractSha256FromSumsText(text, assetName: assetName)
+        }
+        return nil
+    }
+
     private nonisolated static func fetchLatestRelease(session: URLSession, currentVersion: String) async -> AppUpdateInfo? {
         if let apiURL = URL(string: latestReleaseApiUrl) {
             var apiReq = URLRequest(url: apiURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
@@ -677,37 +937,119 @@ final class AppUpdateManager: ObservableObject {
                (200..<300).contains(http.statusCode),
                let text = String(data: data, encoding: .utf8),
                let parsed = parseGithubReleaseJson(text) {
+                if parsed.expectedSha256 == nil {
+                    let sha = await fetchDirectSha256ForAsset(
+                        session: session,
+                        tagName: parsed.tagName,
+                        assetName: parsed.assetName,
+                        currentVersion: currentVersion
+                    )
+                    return AppUpdateInfo(
+                        versionName: parsed.versionName,
+                        tagName: parsed.tagName,
+                        releaseTitle: parsed.releaseTitle,
+                        releaseNotes: parsed.releaseNotes,
+                        htmlUrl: parsed.htmlUrl,
+                        assetName: parsed.assetName,
+                        downloadUrl: parsed.downloadUrl,
+                        assetSizeBytes: parsed.assetSizeBytes,
+                        expectedSha256: sha
+                    )
+                }
                 return parsed
             }
         }
 
-        // Fallback via direct or mirror release redirect when GitHub API is blocked/rate-limited
+        // Fallback via direct or mirror release redirect using a non-redirecting delegate so
+        // 302 Location headers from China-mainland mirrors don't follow directly to blocked github.com.
         let redirectCandidates = [
             latestReleaseWebUrl,
             "https://ghfast.top/\(latestReleaseWebUrl)",
             "https://gh-proxy.org/\(latestReleaseWebUrl)"
         ]
+        let noRedirectDelegate = NoRedirectSessionDelegate()
         for candidate in redirectCandidates {
-            guard let webURL = URL(string: candidate) else { continue }
+            guard !Task.isCancelled, let webURL = URL(string: candidate) else { continue }
             var webReq = URLRequest(url: webURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
             webReq.httpMethod = "HEAD"
             webReq.setValue("LXPure/\(normalizeVersion(currentVersion))", forHTTPHeaderField: "User-Agent")
-            if let (_, resp) = try? await session.data(for: webReq) {
+            if let (_, resp) = try? await session.data(for: webReq, delegate: noRedirectDelegate) {
                 let locationHeader = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Location")
                 let candidateUrl = locationHeader ?? resp.url?.absoluteString
                 if let tag = extractTagFromReleaseUrl(candidateUrl) {
-                    return buildFallbackReleaseInfo(tagName: tag)
+                    let fallback = buildFallbackReleaseInfo(tagName: tag)
+                    let directSha = await fetchDirectSha256ForAsset(
+                        session: session,
+                        tagName: fallback.tagName,
+                        assetName: fallback.assetName,
+                        currentVersion: currentVersion
+                    )
+                    return AppUpdateInfo(
+                        versionName: fallback.versionName,
+                        tagName: fallback.tagName,
+                        releaseTitle: fallback.releaseTitle,
+                        releaseNotes: fallback.releaseNotes,
+                        htmlUrl: fallback.htmlUrl,
+                        assetName: fallback.assetName,
+                        downloadUrl: fallback.downloadUrl,
+                        assetSizeBytes: fallback.assetSizeBytes,
+                        expectedSha256: directSha
+                    )
                 }
             }
         }
         return nil
     }
 
+    private nonisolated static func readUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
+        let b0 = UInt32(data[data.startIndex + offset])
+        let b1 = UInt32(data[data.startIndex + offset + 1]) << 8
+        let b2 = UInt32(data[data.startIndex + offset + 2]) << 16
+        let b3 = UInt32(data[data.startIndex + offset + 3]) << 24
+        return b0 | b1 | b2 | b3
+    }
+
+    nonisolated static func hasValidIpaZipStructure(handle: FileHandle, fileSize: Int64) -> Bool {
+        guard fileSize >= 22 else { return false }
+        let tailLen = Int(min(fileSize, 65_557))
+        let tailStart = UInt64(fileSize - Int64(tailLen))
+        do {
+            try handle.seek(toOffset: tailStart)
+            guard let tail = try handle.read(upToCount: tailLen), tail.count >= 22 else { return false }
+
+            // Scan backwards for ZIP End-of-Central-Directory (PK\x05\x06)
+            var eocdLocalIdx: Int?
+            for idx in stride(from: tail.count - 22, through: 0, by: -1) {
+                if tail[tail.startIndex + idx] == 0x50 &&
+                    tail[tail.startIndex + idx + 1] == 0x4B &&
+                    tail[tail.startIndex + idx + 2] == 0x05 &&
+                    tail[tail.startIndex + idx + 3] == 0x06 {
+                    eocdLocalIdx = idx
+                    break
+                }
+            }
+            guard let eocdIdx = eocdLocalIdx else { return false }
+            let cdSize = UInt64(readUInt32LE(tail, at: eocdIdx + 12))
+            let cdOffset = UInt64(readUInt32LE(tail, at: eocdIdx + 16))
+            let eocdAbsOffset = tailStart + UInt64(eocdIdx)
+            guard cdSize > 0, cdOffset + cdSize <= eocdAbsOffset else { return false }
+
+            try handle.seek(toOffset: cdOffset)
+            let inspectLen = Int(min(cdSize, 256 * 1024))
+            guard let cdData = try handle.read(upToCount: inspectLen), !cdData.isEmpty else { return false }
+            let payloadMarker = Data("Payload/".utf8)
+            return cdData.range(of: payloadMarker) != nil
+        } catch {
+            return false
+        }
+    }
+
     private nonisolated static func isValidIpaFile(at url: URL, info: AppUpdateInfo) -> Bool {
         let fm = FileManager.default
         guard let attrs = try? fm.attributesOfItem(atPath: url.path),
               let fileSize = attrs[.size] as? Int64,
-              fileSize >= minValidIpaBytes else {
+              fileSize >= minValidIpaBytes,
+              fileSize <= maxValidIpaBytes else {
             return false
         }
         if info.assetSizeBytes > 0 && fileSize != info.assetSizeBytes {
@@ -716,6 +1058,9 @@ final class AppUpdateManager: ObservableObject {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
         guard let magic = try? handle.read(upToCount: 4), isValidZipOrIpaMagic(magic) else {
+            return false
+        }
+        guard hasValidIpaZipStructure(handle: handle, fileSize: fileSize) else {
             return false
         }
 
@@ -734,7 +1079,7 @@ final class AppUpdateManager: ObservableObject {
         return true
     }
 
-    private nonisolated static func cleanupStaleCachedIpas(in dir: URL, currentVersion: String) {
+    private nonisolated static func cleanupStaleCachedIpas(in dir: URL, currentVersion: String, cleanPartFiles: Bool = true) {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
         let currentNorm = normalizeVersion(currentVersion)
@@ -742,7 +1087,7 @@ final class AppUpdateManager: ObservableObject {
 
         for file in files {
             let name = file.lastPathComponent
-            if name.hasSuffix(".part") {
+            if cleanPartFiles && name.hasSuffix(".part") {
                 try? fm.removeItem(at: file)
             } else if name.lowercased().hasSuffix(".ipa") {
                 let nsName = name as NSString

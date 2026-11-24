@@ -11,13 +11,39 @@ struct ActivityShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
+private struct IndeterminateLinearBar: View {
+    let tint: Color
+    let track: Color
+    @State private var phase: CGFloat = -0.35
+
+    var body: some View {
+        GeometryReader { geo in
+            let barWidth = max(geo.size.width * 0.35, 36)
+            ZStack(alignment: .leading) {
+                Capsule().fill(track)
+                Capsule()
+                    .fill(tint)
+                    .frame(width: barWidth)
+                    .offset(x: phase * (geo.size.width + barWidth) - barWidth * 0.5)
+            }
+            .clipped()
+            .onAppear {
+                withAnimation(.easeInOut(duration: 1.15).repeatForever(autoreverses: false)) {
+                    phase = 1.15
+                }
+            }
+        }
+        .frame(height: 5)
+    }
+}
+
 struct AppUpdateSheetView: View {
     let state: AppUpdateState
     let currentVersion: String
     let isTrollStoreAvailable: Bool
     let onStartDownload: (AppUpdateInfo) -> Void
     let onCancelDownload: () -> Void
-    let onInstallViaTrollStore: (AppUpdateInfo) -> Void
+    let onInstallViaTrollStore: (String, AppUpdateInfo) -> Void
     let onOpenShareInstaller: (URL) -> Void
     let onOpenInBrowser: (String) -> Void
     let onDismiss: () -> Void
@@ -29,7 +55,7 @@ struct AppUpdateSheetView: View {
         case .available(let info): return info
         case .downloading(let info, _, _, _, _): return info
         case .verifying(let info): return info
-        case .readyToInstall(let info, _): return info
+        case .readyToInstall(let info, _, _): return info
         case .error(let info, _): return info
         default: return nil
         }
@@ -47,7 +73,8 @@ struct AppUpdateSheetView: View {
     var body: some View {
         if let info {
             let noteItems = AppUpdateManager.parseReleaseNoteItems(info.releaseNotes)
-            VStack(spacing: 0) {
+            ScrollView {
+                VStack(spacing: 0) {
                 // Soft ambient gradient header
                 HStack(alignment: .center, spacing: 14) {
                     ZStack {
@@ -105,9 +132,9 @@ struct AppUpdateSheetView: View {
                         Button(action: onDismiss) {
                             Image(systemName: "xmark")
                                 .font(.system(size: 13, weight: .semibold))
-                                .foregroundColor(lx.textTertiary)
+                                .foregroundColor(lx.textSecondary)
                                 .frame(width: 30, height: 30)
-                                .background(lx.surfaceElevated)
+                                .background(lx.hairline)
                                 .clipShape(Circle())
                         }
                         .buttonStyle(.plain)
@@ -162,8 +189,10 @@ struct AppUpdateSheetView: View {
                 }
                 .padding(.horizontal, 22)
                 .padding(.bottom, 22)
+                }
             }
-            .background(lx.surface)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(lx.surface.ignoresSafeArea())
         }
     }
 
@@ -172,25 +201,29 @@ struct AppUpdateSheetView: View {
         switch state {
         case .downloading(_, let downloaded, let total, let progress, let routeLabel):
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
+                HStack(spacing: 8) {
                     Text("正在下载 · \(routeLabel)")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(lx.textPrimary)
-                    Spacer()
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    let downloadedLabel = downloaded > 0 ? FormatUtils.formatSize(downloaded) : "0 KB"
                     let text = total > 0
-                        ? "\(FormatUtils.formatSize(downloaded)) / \(FormatUtils.formatSize(total)) (\(Int(progress * 100))%)"
-                        : FormatUtils.formatSize(downloaded)
+                        ? "\(downloadedLabel) / \(FormatUtils.formatSize(total)) (\(Int(progress * 100))%)"
+                        : downloadedLabel
                     Text(text)
                         .font(.system(size: 12, weight: .bold).monospacedDigit())
                         .foregroundColor(lx.accent)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(1)
                 }
                 if total > 0 && downloaded > 0 {
                     ProgressView(value: progress, total: 1.0)
                         .tint(lx.accent)
                 } else {
-                    ProgressView()
-                        .progressViewStyle(.linear)
-                        .tint(lx.accent)
+                    IndeterminateLinearBar(tint: lx.accent, track: lx.hairline)
                 }
                 if downloaded == 0 {
                     Text("连接中，若直连超时将自动切换国内镜像通道…")
@@ -209,7 +242,7 @@ struct AppUpdateSheetView: View {
         case .verifying:
             HStack(spacing: 10) {
                 ProgressView().tint(lx.accent)
-                Text("正在校验安装包 SHA-256 完整性…")
+                Text((info.expectedSha256?.isEmpty == false) ? "正在校验安装包 SHA-256 完整性…" : "正在校验安装包结构完整性…")
                     .font(.system(size: 13))
                     .foregroundColor(lx.textPrimary)
                 Spacer()
@@ -324,11 +357,11 @@ struct AppUpdateSheetView: View {
             }
             .buttonStyle(.plain)
 
-        case .readyToInstall(_, let localURL):
+        case .readyToInstall(_, let localURL, let resolvedUrl):
             VStack(spacing: 10) {
                 if isTrollStoreAvailable {
                     Button {
-                        onInstallViaTrollStore(info)
+                        onInstallViaTrollStore(resolvedUrl, info)
                     } label: {
                         Text("通过巨魔商店直接安装")
                             .font(.system(size: 15, weight: .semibold))

@@ -20,6 +20,7 @@ final class AppContainer: ObservableObject {
     private var memoryWarningObserver: NSObjectProtocol?
     private var willResignActiveObserver: NSObjectProtocol?
     private var willTerminateObserver: NSObjectProtocol?
+    private var backgroundFlushTaskId: UIBackgroundTaskIdentifier = .invalid
 
     init() {
         let config = URLSessionConfiguration.default
@@ -80,8 +81,9 @@ final class AppContainer: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in
-                self?.playerController.persistSnapshotNow(synchronous: true)
+            MainActor.assumeIsolated {
+                // Lightweight async snapshot on resign-active avoids blocking MainActor during Control Center / FaceID
+                self?.playerController.persistSnapshotNow(synchronous: false)
             }
         }
 
@@ -90,8 +92,9 @@ final class AppContainer: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 self?.playerController.persistSnapshotNow(synchronous: true)
+                self?.libraryStore.flushPendingWrites()
             }
         }
     }
@@ -105,13 +108,39 @@ final class AppContainer: ObservableObject {
     }
 
     func handleBackgroundTransition() {
-        playerController.persistSnapshotNow(synchronous: true)
+        playerController.persistSnapshotNow(synchronous: false)
         userApiManager.trimIdleRuntimes(keepTopCount: 2)
         libraryStore.evictTrackCaches()
+
+        endBackgroundFlushTaskIfNeeded()
+        backgroundFlushTaskId = UIApplication.shared.beginBackgroundTask(withName: "LXPureBackgroundFlush") { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.endBackgroundFlushTaskIfNeeded()
+            }
+        }
+        let sessionStore = playbackSessionStore
+        let libStore = libraryStore
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            sessionStore.flush()
+            libStore.flushPendingWritesAsync {
+                Task { @MainActor [weak self] in
+                    self?.endBackgroundFlushTaskIfNeeded()
+                }
+            }
+        }
+    }
+
+    private func endBackgroundFlushTaskIfNeeded() {
+        if backgroundFlushTaskId != .invalid {
+            let taskId = backgroundFlushTaskId
+            backgroundFlushTaskId = .invalid
+            UIApplication.shared.endBackgroundTask(taskId)
+        }
     }
 
     func handleMemoryPressure() {
-        ImageMemoryCache.shared.clear()
+        ImageMemoryCache.shared.clearMemory()
+        playerController.clearCachedArtwork()
         userApiManager.trimIdleRuntimes(keepTopCount: 1)
         libraryStore.evictTrackCaches()
     }

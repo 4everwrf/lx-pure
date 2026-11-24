@@ -41,34 +41,48 @@ enum LxScriptParser {
         let nsScript = normalized as NSString
         let fullRange = NSRange(location: 0, length: nsScript.length)
 
-        if let match = headerBlockRegex.firstMatch(in: normalized, options: [], range: fullRange),
-           match.numberOfRanges > 1 {
+        let matches = headerBlockRegex.matches(in: normalized, options: [], range: fullRange)
+        for match in matches where match.numberOfRanges > 1 {
             let headerRange = match.range(at: 1)
-            if headerRange.location != NSNotFound {
-                let header = nsScript.substring(with: headerRange)
-                for rawLine in header.components(separatedBy: .newlines) {
-                    var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if line.hasPrefix("*") {
-                        line = String(line.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-                    let nsLine = line as NSString
-                    let lineRange = NSRange(location: 0, length: nsLine.length)
-                    if let tagMatch = tagRegex.firstMatch(in: line, options: [], range: lineRange),
-                       tagMatch.numberOfRanges > 2 {
-                        let key = nsLine.substring(with: tagMatch.range(at: 1)).lowercased()
-                        let value = nsLine.substring(with: tagMatch.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !value.isEmpty && tags[key] == nil {
-                            tags[key] = value
-                        }
+            guard headerRange.location != NSNotFound else { continue }
+            let header = nsScript.substring(with: headerRange)
+            var blockTags: [String: String] = [:]
+            for rawLine in header.components(separatedBy: .newlines) {
+                var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                if line.hasPrefix("*") {
+                    line = String(line.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                let nsLine = line as NSString
+                let lineRange = NSRange(location: 0, length: nsLine.length)
+                if let tagMatch = tagRegex.firstMatch(in: line, options: [], range: lineRange),
+                   tagMatch.numberOfRanges > 2 {
+                    let key = nsLine.substring(with: tagMatch.range(at: 1)).lowercased()
+                    let value = nsLine.substring(with: tagMatch.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !value.isEmpty && blockTags[key] == nil {
+                        blockTags[key] = value
                     }
                 }
             }
+            if blockTags["name"] != nil {
+                tags = blockTags
+                break
+            }
+            if tags.isEmpty && !blockTags.isEmpty {
+                tags = blockTags
+            }
         }
 
+        let hasDeclaredMeta = tags["name"] != nil || tags["author"] != nil || tags["homepage"] != nil
         let name = String((tags["name"] ?? fallbackName).prefix(60))
         let authorRaw = tags["author"] ?? ""
         let homepageRaw = tags["homepage"] ?? ""
-        let idSeed = "\(name)_\(authorRaw)_\(homepageRaw)"
+        let idSeed: String
+        if hasDeclaredMeta {
+            idSeed = "\(name)_\(authorRaw)_\(homepageRaw)"
+        } else {
+            let contentHash = String(LxCrypto.md5Hex(normalized.trimmingCharacters(in: .whitespacesAndNewlines)).prefix(16))
+            idSeed = "\(name)_\(contentHash)"
+        }
         let md5Prefix = String(LxCrypto.md5Hex(idSeed).prefix(12))
         let stableId = "user_api_" + (md5Prefix.isEmpty ? String(UUID().uuidString.prefix(8)) : md5Prefix)
 

@@ -25,16 +25,15 @@ final class KugouProvider: Sendable {
 
         return list.compactMap { el in
             guard let obj = JsonSafe.asObject(el),
-                  let hash = JsonSafe.asString(obj["FileHash"]),
-                  !hash.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-            let audioId = JsonSafe.asString(obj["Audioid"]) ?? hash
-            let baseName = FormatUtils.decodeHtml(JsonSafe.asString(obj["OriSongName"]) ?? JsonSafe.asString(obj["SongName"]))
+                  let hash = JsonSafe.asNonBlankString(obj["FileHash"]) else { return nil }
+            let audioId = JsonSafe.asNonBlankString(obj["Audioid"]) ?? hash
+            let baseName = FormatUtils.decodeHtml(JsonSafe.asNonBlankString(obj["OriSongName"]) ?? JsonSafe.asNonBlankString(obj["SongName"]))
             guard !baseName.isEmpty else { return nil }
             let suffix = FormatUtils.decodeHtml(JsonSafe.asString(obj["Suffix"]))
             let title = suffix.isEmpty ? baseName : "\(baseName) \(suffix)"
 
             let singersList = (JsonSafe.asArray(obj["Singers"]) ?? []).compactMap {
-                JsonSafe.asString(JsonSafe.asObject($0)?["name"])
+                JsonSafe.asNonBlankString(JsonSafe.asObject($0)?["name"]).map { FormatUtils.decodeHtml($0) }
             }
             var artist = singersList.joined(separator: " / ")
             if artist.isEmpty { artist = FormatUtils.decodeHtml(JsonSafe.asString(obj["SingerName"])) }
@@ -45,13 +44,16 @@ final class KugouProvider: Sendable {
             let hqSize = JsonSafe.asInt64(obj["HQFileSize"]) ?? 0
             let sqSize = JsonSafe.asInt64(obj["SQFileSize"]) ?? 0
             let resSize = JsonSafe.asInt64(obj["ResFileSize"]) ?? 0
+            let hqHash = JsonSafe.asNonBlankString(obj["HQFileHash"])
+            let sqHash = JsonSafe.asNonBlankString(obj["SQFileHash"])
+            let resHash = JsonSafe.asNonBlankString(obj["ResFileHash"])
             if fSize > 0 { qualities.append(QualityInfo(type: "128k", size: FormatUtils.formatSize(fSize), hash: hash)) }
-            if hqSize > 0 { qualities.append(QualityInfo(type: "320k", size: FormatUtils.formatSize(hqSize), hash: JsonSafe.asString(obj["HQFileHash"]))) }
-            if sqSize > 0 { qualities.append(QualityInfo(type: "flac", size: FormatUtils.formatSize(sqSize), hash: JsonSafe.asString(obj["SQFileHash"]))) }
-            if resSize > 0 { qualities.append(QualityInfo(type: "flac24bit", size: FormatUtils.formatSize(resSize), hash: JsonSafe.asString(obj["ResFileHash"]))) }
+            if hqSize > 0, let hqHash { qualities.append(QualityInfo(type: "320k", size: FormatUtils.formatSize(hqSize), hash: hqHash)) }
+            if sqSize > 0, let sqHash { qualities.append(QualityInfo(type: "flac", size: FormatUtils.formatSize(sqSize), hash: sqHash)) }
+            if resSize > 0, let resHash { qualities.append(QualityInfo(type: "flac24bit", size: FormatUtils.formatSize(resSize), hash: resHash)) }
             if qualities.isEmpty { qualities.append(QualityInfo(type: "128k", size: "", hash: hash)) }
 
-            let img = JsonSafe.asString(obj["Image"])?
+            let img = JsonSafe.asNonBlankString(obj["Image"])?
                 .replacingOccurrences(of: "{size}", with: "400")
                 .replacingOccurrences(of: "http://", with: "https://")
 

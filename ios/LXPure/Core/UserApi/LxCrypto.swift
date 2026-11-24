@@ -34,7 +34,15 @@ enum LxCrypto {
               let key = decodeBase64Flexible(keyB64) else {
             return ""
         }
-        let iv: Data? = ivB64.isEmpty ? nil : decodeBase64Flexible(ivB64)
+        let upperMode = mode.uppercased()
+        let isExplicitCBC = upperMode.contains("CBC")
+        let iv: Data?
+        if ivB64.isEmpty {
+            iv = isExplicitCBC ? Data(repeating: 0, count: kCCBlockSizeAES128) : nil
+        } else {
+            guard let decodedIv = decodeBase64Flexible(ivB64) else { return "" }
+            iv = decodedIv
+        }
         guard let encrypted = aesEncryptBytes(data: data, key: key, iv: iv, mode: mode) else {
             return ""
         }
@@ -43,7 +51,8 @@ enum LxCrypto {
 
     static func aesEncryptBytes(data: Data, key: Data, iv: Data?, mode: String) -> Data? {
         let upperMode = mode.uppercased()
-        let isECB = iv == nil || upperMode.contains("ECB") || upperMode == "AES"
+        let isExplicitCBC = upperMode.contains("CBC")
+        let isECB = upperMode.contains("ECB") || upperMode == "AES" || (!isExplicitCBC && iv == nil)
         let noPadding = upperMode.contains("NOPADDING")
 
         var options: CCOptions = 0
@@ -130,9 +139,62 @@ enum LxCrypto {
         guard SecKeyIsAlgorithmSupported(secKey, .encrypt, algorithm) else { return nil }
         var error: Unmanaged<CFError>?
         guard let encrypted = SecKeyCreateEncryptedData(secKey, algorithm, payload as CFData, &error) as Data? else {
+            error?.release()
             return nil
         }
         return encrypted
+    }
+
+    /// Standard RFC 1950 zlib inflate (accepts standard zlib wrapper or raw deflate).
+    static func zlibInflateBase64(_ dataB64: String) -> String {
+        guard let input = decodeBase64Flexible(dataB64), !input.isEmpty else { return "" }
+        let rawPayload: Data
+        if input.count >= 6 {
+            let cmf = input[input.startIndex]
+            let flg = input[input.index(after: input.startIndex)]
+            let headerCheck = ((Int(cmf) << 8) | Int(flg)) % 31 == 0
+            if (cmf & 0x0F) == 8 && headerCheck {
+                let headerLen = (flg & 0x20) != 0 ? 6 : 2
+                if input.count > headerLen + 4 {
+                    rawPayload = input.subdata(in: headerLen..<(input.count - 4))
+                } else {
+                    rawPayload = input
+                }
+            } else {
+                rawPayload = input
+            }
+        } else {
+            rawPayload = input
+        }
+        if let decompressed = try? (rawPayload as NSData).decompressed(using: .zlib) as Data {
+            return decompressed.base64EncodedString()
+        }
+        return ""
+    }
+
+    /// Standard RFC 1950 zlib deflate (2-byte header + raw deflate + 4-byte Adler-32 checksum).
+    static func zlibDeflateBase64(_ dataB64: String) -> String {
+        guard let input = decodeBase64Flexible(dataB64), !input.isEmpty else { return "" }
+        guard let rawCompressed = try? (input as NSData).compressed(using: .zlib) as Data else { return "" }
+        let adler = adler32(input)
+        var out = Data(capacity: 2 + rawCompressed.count + 4)
+        out.append(contentsOf: [0x78, 0x9C])
+        out.append(rawCompressed)
+        out.append(UInt8((adler >> 24) & 0xFF))
+        out.append(UInt8((adler >> 16) & 0xFF))
+        out.append(UInt8((adler >> 8) & 0xFF))
+        out.append(UInt8(adler & 0xFF))
+        return out.base64EncodedString()
+    }
+
+    private static func adler32(_ data: Data) -> UInt32 {
+        var s1: UInt32 = 1
+        var s2: UInt32 = 0
+        for byte in data {
+            s1 = (s1 + UInt32(byte)) % 65521
+            s2 = (s2 + s1) % 65521
+        }
+        return (s2 << 16) | s1
     }
 
     private static func createRSAPublicKey(fromPEMBody pemBody: String) -> SecKey? {
@@ -154,9 +216,13 @@ enum LxCrypto {
         if let key = SecKeyCreateWithData(der as CFData, attributes as CFDictionary, &error) {
             return key
         }
-        if let pkcs1 = stripX509SubjectPublicKeyInfoHeader(der),
-           let key = SecKeyCreateWithData(pkcs1 as CFData, attributes as CFDictionary, &error) {
-            return key
+        error?.release()
+        error = nil
+        if let pkcs1 = stripX509SubjectPublicKeyInfoHeader(der) {
+            if let key = SecKeyCreateWithData(pkcs1 as CFData, attributes as CFDictionary, &error) {
+                return key
+            }
+            error?.release()
         }
         return nil
     }
@@ -196,19 +262,29 @@ enum LxCrypto {
     }
 
     static func decodeBase64Flexible(_ raw: String) -> Data? {
-        let stripped = raw
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\r", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-        if let d = Data(base64Encoded: stripped, options: .ignoreUnknownCharacters) {
-            return d
+        var stripped = ""
+        stripped.reserveCapacity(raw.count)
+        for ch in raw {
+            switch ch {
+            case "-": stripped.append("+")
+            case "_": stripped.append("/")
+            case " ", "\t", "\r", "\n": continue
+            default: stripped.append(ch)
+            }
         }
+        if stripped.isEmpty { return Data() }
         let remainder = stripped.count % 4
-        if remainder > 0 {
-            let padded = stripped + String(repeating: "=", count: 4 - remainder)
-            return Data(base64Encoded: padded, options: .ignoreUnknownCharacters)
+        let padded: String
+        if remainder == 2 {
+            padded = stripped + "=="
+        } else if remainder == 3 {
+            padded = stripped + "="
+        } else if remainder == 1 {
+            return nil
+        } else {
+            padded = stripped
         }
-        return nil
+        return Data(base64Encoded: padded)
     }
 }
 

@@ -111,18 +111,52 @@ enum FormatUtils {
         }
     }
 
+    private static let emTagRegex = try! NSRegularExpression(pattern: "</?em>", options: [.caseInsensitive])
+    private static let brTagRegex = try! NSRegularExpression(pattern: "<br\\s*/?>", options: [.caseInsensitive])
+    private static let numericEntityRegex = try! NSRegularExpression(pattern: "&#(?:x([0-9a-fA-F]+)|(\\d+));", options: [])
+
     static func decodeHtml(_ input: String?) -> String {
         guard let input, !input.isEmpty else { return "" }
-        return input
-            .replacingOccurrences(of: "&amp;", with: "&")
+        var text = emTagRegex.stringByReplacingMatches(
+            in: input,
+            options: [],
+            range: NSRange(location: 0, length: (input as NSString).length),
+            withTemplate: ""
+        )
+        text = brTagRegex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: NSRange(location: 0, length: (text as NSString).length),
+            withTemplate: "\n"
+        )
+
+        let nsText = text as NSString
+        let matches = numericEntityRegex.matches(in: text, options: [], range: NSRange(location: 0, length: nsText.length))
+        if !matches.isEmpty {
+            let mutable = NSMutableString(string: text)
+            for match in matches.reversed() {
+                let hexRange = match.range(at: 1)
+                let decRange = match.range(at: 2)
+                var codePoint: UInt32?
+                if hexRange.location != NSNotFound {
+                    codePoint = UInt32(nsText.substring(with: hexRange), radix: 16)
+                } else if decRange.location != NSNotFound {
+                    codePoint = UInt32(nsText.substring(with: decRange), radix: 10)
+                }
+                if let cp = codePoint, let scalar = UnicodeScalar(cp) {
+                    mutable.replaceCharacters(in: match.range, with: String(scalar))
+                }
+            }
+            text = mutable as String
+        }
+
+        return text
             .replacingOccurrences(of: "&lt;", with: "<")
             .replacingOccurrences(of: "&gt;", with: ">")
             .replacingOccurrences(of: "&quot;", with: "\"")
             .replacingOccurrences(of: "&apos;", with: "'")
-            .replacingOccurrences(of: "&#39;", with: "'")
             .replacingOccurrences(of: "&nbsp;", with: " ")
-            .replacingOccurrences(of: "<br>", with: "\n")
-            .replacingOccurrences(of: "<br/>", with: "\n")
+            .replacingOccurrences(of: "&amp;", with: "&")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

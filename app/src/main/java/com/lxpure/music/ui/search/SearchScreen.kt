@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -20,22 +21,27 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -55,6 +61,8 @@ import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.ui.components.TrackListItem
 import com.lxpure.music.ui.theme.LocalLxColors
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 private enum class SearchScope(val label: String, val source: MusicSource?) {
@@ -87,23 +95,40 @@ fun SearchScreen(
     var results by remember { mutableStateOf<List<Track>>(emptyList()) }
     var isSearching by remember { mutableStateOf(false) }
     var hasSearched by remember { mutableStateOf(false) }
+    var searchError by remember { mutableStateOf<String?>(null) }
+    var searchJob by remember { mutableStateOf<Job?>(null) }
+    var searchGen by remember { mutableLongStateOf(0L) }
 
     fun executeSearch(keyword: String = query, targetScope: SearchScope = selectedScope) {
         val trimmed = keyword.trim()
         if (trimmed.isEmpty()) return
         focusManager.clearFocus()
         onSaveSearchQuery(trimmed)
-        scope.launch {
-            isSearching = true
-            hasSearched = true
-            results = runCatching {
-                if (targetScope.source == null) {
+        searchJob?.cancel()
+        val gen = ++searchGen
+        isSearching = true
+        hasSearched = true
+        searchError = null
+        searchJob = scope.launch {
+            try {
+                val found = if (targetScope.source == null) {
                     aggregator.searchAggregated(trimmed)
                 } else {
                     aggregator.searchSinglePlatform(targetScope.source, trimmed, 1, 30)
                 }
-            }.getOrDefault(emptyList())
-            isSearching = false
+                if (searchGen == gen) {
+                    results = found
+                    isSearching = false
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                if (searchGen == gen) {
+                    results = emptyList()
+                    searchError = "搜索失败，请检查网络连接后重试"
+                    isSearching = false
+                }
+            }
         }
     }
 
@@ -173,9 +198,14 @@ fun SearchScreen(
                             modifier = Modifier
                                 .size(20.dp)
                                 .clickable {
+                                    searchGen++
+                                    searchJob?.cancel()
+                                    searchJob = null
                                     query = ""
                                     results = emptyList()
                                     hasSearched = false
+                                    isSearching = false
+                                    searchError = null
                                 }
                         )
                     }
@@ -217,7 +247,9 @@ fun SearchScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(horizontal = 20.dp, vertical = 8.dp),
+                        .verticalScroll(rememberScrollState())
+                        .imePadding()
+                        .padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = bottomPadding),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
                     if (searchHistory.isNotEmpty()) {
@@ -265,14 +297,49 @@ fun SearchScreen(
                 }
             }
 
+            searchError != null -> {
+                Box(Modifier.fillMaxSize().padding(horizontal = 24.dp), contentAlignment = Alignment.Center) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(searchError ?: "搜索失败", color = lxColors.textSecondary)
+                        OutlinedButton(
+                            onClick = { executeSearch(query, selectedScope) },
+                            shape = RoundedCornerShape(50)
+                        ) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("重试")
+                        }
+                    }
+                }
+            }
+
             results.isEmpty() -> {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("没有找到相关歌曲，换个关键词或平台试试", color = lxColors.textSecondary)
+                Box(Modifier.fillMaxSize().padding(horizontal = 24.dp), contentAlignment = Alignment.Center) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text("没有找到相关歌曲，换个关键词或平台试试", color = lxColors.textSecondary)
+                        OutlinedButton(
+                            onClick = { executeSearch(query, selectedScope) },
+                            shape = RoundedCornerShape(50)
+                        ) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("重新搜索")
+                        }
+                    }
                 }
             }
 
             else -> {
-                LazyColumn(contentPadding = PaddingValues(bottom = bottomPadding)) {
+                LazyColumn(
+                    modifier = Modifier.imePadding(),
+                    contentPadding = PaddingValues(bottom = bottomPadding)
+                ) {
                     itemsIndexed(results, key = { idx, t -> "${t.id}_$idx" }) { index, track ->
                         TrackListItem(
                             track = track,

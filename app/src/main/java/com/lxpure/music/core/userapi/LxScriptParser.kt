@@ -33,22 +33,35 @@ object LxScriptParser {
     fun parse(script: String, fallbackName: String = "自定义音源"): ParsedScriptMeta {
         val normalized = normalizeScript(script)
         val tags = mutableMapOf<String, String>()
-        val header = headerBlockRegex.find(normalized)?.groupValues?.getOrNull(1)
-        if (header != null) {
+        for (blockMatch in headerBlockRegex.findAll(normalized)) {
+            val header = blockMatch.groupValues.getOrNull(1) ?: continue
+            val blockTags = mutableMapOf<String, String>()
             header.lines().forEach { rawLine ->
                 val line = rawLine.trim().removePrefix("*").trim()
                 val match = tagRegex.find(line)
                 if (match != null) {
                     val key = match.groupValues[1].lowercase()
                     val value = match.groupValues[2].trim()
-                    if (value.isNotEmpty() && !tags.containsKey(key)) {
-                        tags[key] = value
+                    if (value.isNotEmpty() && !blockTags.containsKey(key)) {
+                        blockTags[key] = value
                     }
                 }
             }
+            if (blockTags.containsKey("name")) {
+                tags.putAll(blockTags)
+                break
+            }
+            if (tags.isEmpty() && blockTags.isNotEmpty()) {
+                tags.putAll(blockTags)
+            }
         }
+        val hasDeclaredMeta = tags.containsKey("name") || tags.containsKey("author") || tags.containsKey("homepage")
         val name = tags["name"]?.take(60) ?: fallbackName
-        val idSeed = "${name}_${tags["author"].orEmpty()}_${tags["homepage"].orEmpty()}"
+        val idSeed = if (hasDeclaredMeta) {
+            "${name}_${tags["author"].orEmpty()}_${tags["homepage"].orEmpty()}"
+        } else {
+            "${name}_${LxCrypto.md5Hex(normalized.trim()).take(16)}"
+        }
         val stableId = "user_api_" + LxCrypto.md5Hex(idSeed).take(12).ifEmpty { UUID.randomUUID().toString().take(8) }
         return ParsedScriptMeta(
             id = stableId,

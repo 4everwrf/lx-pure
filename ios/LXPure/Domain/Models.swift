@@ -349,8 +349,9 @@ struct LyricLine: Identifiable, Hashable, Sendable {
     let timeMs: Int64
     let text: String
     var translation: String?
+    var lineIndex: Int = 0
 
-    var id: String { "\(timeMs)_\(text.hashValue)" }
+    var id: String { "\(lineIndex)_\(timeMs)_\(text.hashValue)" }
 }
 
 struct ParsedLyrics: Hashable, Sendable {
@@ -366,17 +367,21 @@ struct ParsedLyrics: Hashable, Sendable {
 
     func activeIndex(at positionMs: Int64) -> Int {
         guard !lines.isEmpty else { return -1 }
+        let targetMs = positionMs > Int64.max - 120 ? Int64.max : positionMs + 120
         var low = 0
         var high = lines.count - 1
         var result = -1
         while low <= high {
             let mid = (low + high) >> 1
-            if lines[mid].timeMs <= positionMs + 120 {
+            if lines[mid].timeMs <= targetMs {
                 result = mid
                 low = mid + 1
             } else {
                 high = mid - 1
             }
+        }
+        while result > 0 && lines[result - 1].timeMs == lines[result].timeMs {
+            result -= 1
         }
         return result
     }
@@ -542,6 +547,46 @@ struct AppSettings: Codable, Equatable, Sendable {
     var fluidAmbientBackground: Bool = true
     var showTranslationLyrics: Bool = true
     var wifiOnlyHighQuality: Bool = true
+
+    enum CodingKeys: String, CodingKey {
+        case preferredQuality, autoFallbackSource, themeMode
+        case fluidAmbientBackground, showTranslationLyrics, wifiOnlyHighQuality
+    }
+
+    init(
+        preferredQuality: AudioQuality = .flac,
+        autoFallbackSource: Bool = true,
+        themeMode: ThemeMode = .dark,
+        fluidAmbientBackground: Bool = true,
+        showTranslationLyrics: Bool = true,
+        wifiOnlyHighQuality: Bool = true
+    ) {
+        self.preferredQuality = preferredQuality
+        self.autoFallbackSource = autoFallbackSource
+        self.themeMode = themeMode
+        self.fluidAmbientBackground = fluidAmbientBackground
+        self.showTranslationLyrics = showTranslationLyrics
+        self.wifiOnlyHighQuality = wifiOnlyHighQuality
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let rawQuality = try? c.decodeIfPresent(String.self, forKey: .preferredQuality) {
+            self.preferredQuality = AudioQuality.fromLxType(rawQuality)
+        } else {
+            self.preferredQuality = .flac
+        }
+        self.autoFallbackSource = (try? c.decodeIfPresent(Bool.self, forKey: .autoFallbackSource)) ?? true
+        if let rawTheme = try? c.decodeIfPresent(String.self, forKey: .themeMode),
+           let parsedTheme = ThemeMode(rawValue: rawTheme) {
+            self.themeMode = parsedTheme
+        } else {
+            self.themeMode = .dark
+        }
+        self.fluidAmbientBackground = (try? c.decodeIfPresent(Bool.self, forKey: .fluidAmbientBackground)) ?? true
+        self.showTranslationLyrics = (try? c.decodeIfPresent(Bool.self, forKey: .showTranslationLyrics)) ?? true
+        self.wifiOnlyHighQuality = (try? c.decodeIfPresent(Bool.self, forKey: .wifiOnlyHighQuality)) ?? true
+    }
 }
 
 enum QueueSourceType: String, Codable, Equatable, Hashable, Sendable {

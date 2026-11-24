@@ -762,4 +762,281 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertEqual(TrackListScrollHelper.targetIndex(forFraction: 0.5, trackCount: 501), 250)
         XCTAssertEqual(TrackListScrollHelper.targetIndex(forFraction: 0.8, trackCount: 1), 0)
     }
+
+    func testRound1PlaybackFixesUnderlyingErrorExtensionAndSessionMismatch() async {
+        // 1. AVFoundationErrorDomain wrapping NSURLErrorNotConnectedToInternet with Chinese description
+        let innerNetErr = NSError(
+            domain: NSURLErrorDomain,
+            code: NSURLErrorNotConnectedToInternet,
+            userInfo: [NSLocalizedDescriptionKey: "似乎已断开与互联网的连接。"]
+        )
+        let outerAvErr = NSError(
+            domain: "AVFoundationErrorDomain",
+            code: -11800,
+            userInfo: [
+                NSLocalizedDescriptionKey: "这项操作无法完成",
+                NSUnderlyingErrorKey: innerNetErr
+            ]
+        )
+        XCTAssertEqual(PlaybackRecoveryPolicy.classify(error: outerAvErr), .transientNetwork)
+
+        // 2. AudioCacheManager.inferExtension prioritizes URL extension > Content-Type > requested quality
+        XCTAssertEqual(
+            AudioCacheManager.inferExtension(
+                urlString: "https://cdn.example.com/stream/abc.mp3?token=123",
+                contentType: "audio/mpeg",
+                quality: .flac
+            ),
+            "mp3"
+        )
+        XCTAssertEqual(
+            AudioCacheManager.inferExtension(
+                urlString: "https://cdn.example.com/stream/opaque-id?sig=1",
+                contentType: "audio/mp4",
+                quality: .flac
+            ),
+            "m4a"
+        )
+        XCTAssertEqual(
+            AudioCacheManager.inferExtension(
+                urlString: "https://cdn.example.com/stream/opaque-id",
+                contentType: nil,
+                quality: .flac
+            ),
+            "flac"
+        )
+
+        // 3. Mismatched currentTrackId resets positionMs & provider instead of applying deleted track's timestamp
+        let t1 = Track(id: "wy_1", title: "Song 1", artist: "A", durationMs: 180_000)
+        let t2 = Track(id: "wy_2", title: "Song 2", artist: "B", durationMs: 240_000)
+        let mismatched = PlaybackSessionStore.resolveRestoredSession(
+            queueSnapshot: PlaybackQueueSnapshot(queue: [t1, t2]),
+            cursorSnapshot: PlaybackCursorSnapshot(
+                currentIndex: 1,
+                currentTrackId: "deleted_track",
+                positionMs: 135_000,
+                durationMs: 310_000,
+                activeQualityBadge: "HR",
+                activeProviderName: "OldSource"
+            )
+        )
+        XCTAssertNotNil(mismatched)
+        XCTAssertEqual(mismatched?.currentIndex, 1)
+        XCTAssertEqual(mismatched?.positionMs, 0)
+        XCTAssertEqual(mismatched?.durationMs, 240_000)
+        XCTAssertNil(mismatched?.activeProviderName)
+
+        // 4. Async load + flush round-trip
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxpure_r1_session_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let store = PlaybackSessionStore(baseDirectory: tempDir)
+        store.saveQueueAndCursor(
+            queue: [t1, t2],
+            queueSource: nil,
+            currentIndex: 1,
+            positionMs: 42_000,
+            durationMs: 240_000,
+            repeatMode: .listLoop,
+            activeQualityBadge: "SQ",
+            activeProviderName: "Mock",
+            synchronous: false
+        )
+        store.flush()
+        let asyncLoaded = await store.loadSessionAsync()
+        XCTAssertEqual(asyncLoaded?.currentIndex, 1)
+        XCTAssertEqual(asyncLoaded?.positionMs, 42_000)
+    }
+
+    func testRound2SdkCryptoLyricsAndUserApiRegressionSuite() async {
+        // 1. LxCrypto: URL-safe Base64, CBC empty IV -> zero IV (deterministic), zlib round-trip
+        let raw = "LX Pure Round 2 音频沙箱 🎵"
+        let b64 = LxCrypto.str2b64(raw)
+        let compressed = LxCrypto.zlibDeflateBase64(b64)
+        XCTAssertFalse(compressed.isEmpty)
+        XCTAssertEqual(LxCrypto.zlibInflateBase64(compressed), b64)
+
+        let keyB64 = LxCrypto.str2b64("0123456789abcdef")
+        let cbc1 = LxCrypto.aesEncryptBase64(dataB64: b64, keyB64: keyB64, ivB64: "", mode: "AES/CBC/PKCS7Padding")
+        let cbc2 = LxCrypto.aesEncryptBase64(dataB64: b64, keyB64: keyB64, ivB64: "", mode: "AES/CBC/PKCS7Padding")
+        XCTAssertFalse(cbc1.isEmpty)
+        XCTAssertEqual(cbc1, cbc2)
+
+        // 2. Binary-safe bufToString(..., 'base64') & zlib in JavaScriptCore sandbox
+        let binaryScript = """
+        /**
+         * @name Binary Buffer & Zlib Test Source
+         * @version 1.0.0
+         */
+        const { EVENT_NAMES, on, send, utils } = globalThis.lx
+        on(EVENT_NAMES.request, async () => {
+          const b64 = utils.buffer.bufToString(new Uint8Array([0x80, 0xFF]), 'base64')
+          const zipped = await utils.zlib.deflate('hello-lx-pure')
+          const unzipped = await utils.zlib.inflate(zipped)
+          const text = utils.buffer.bufToString(unzipped, 'utf8')
+          return `https://cdn.example.com/${b64}/${text}`
+        })
+        send(EVENT_NAMES.inited, {
+          sources: { wy: { type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } }
+        })
+        """
+        let meta = LxScriptParser.parse(binaryScript)
+        let src = UserApiSource(
+            id: meta.id, name: meta.name, description: meta.description, version: meta.version,
+            author: meta.author, homepage: meta.homepage, script: binaryScript,
+            sourceUrl: nil, enabled: true, priority: 0
+        )
+        let rt = LxJsRuntime(session: .shared, source: src)
+        defer { rt.destroy() }
+        let initRes = await rt.initialize(timeoutSeconds: 5.0)
+        XCTAssertTrue(initRes.success)
+        let track = Track(id: "wy_99", title: "Test", artist: "Artist", source: .wy, songmid: "99")
+        let urlRes = await rt.requestMusicUrl(track: track, quality: .q128k, timeoutSeconds: 5.0)
+        if case .success(let resolvedUrl) = urlRes {
+            XCTAssertEqual(resolvedUrl, "https://cdn.example.com/gP8=/hello-lx-pure")
+        } else {
+            XCTFail("Expected binary Base64 + zlib round-trip to succeed")
+        }
+
+        // 3. BOM HTML rejection, lenient URL parser, and transport vs track error classification
+        XCTAssertFalse(UserApiManager.isValidDownloadedScript("\u{FEFF}<!DOCTYPE html><html>lx</html>" + String(repeating: " ", count: 200)))
+        XCTAssertNotNil(LxJsRuntime.parseLenientURL("https://example.com/music?q=周杰伦 晴天&ext={\"a\":1}"))
+        XCTAssertTrue(UserApiManager.isTransportOrRuntimeFailure("请求超时，请检查网络连接"))
+        XCTAssertFalse(UserApiManager.isTransportOrRuntimeFailure("音源暂不支持解析当前曲目"))
+
+        // 4. LrcParser: BOM, [offset:], colon/4-digit ms, "//" filter, 1-to-1 trans, unique IDs
+        let lrc = "\u{FEFF}[offset:-500]\n[00:01.0000]Line One\n[00:01:20]Line Two\n[00:05.00]Dup A\n[00:05.00]Dup A"
+        let trans = "[00:01.00]第一句\n[00:05.00]//"
+        let parsed = LrcParser.parse(lrc, translation: trans)
+        XCTAssertEqual(parsed.lines.count, 4)
+        XCTAssertEqual(parsed.lines[0].timeMs, 1_500)
+        XCTAssertEqual(parsed.lines[0].translation, "第一句")
+        XCTAssertNil(parsed.lines[1].translation)
+        XCTAssertNil(parsed.lines[2].translation)
+        XCTAssertNotEqual(parsed.lines[2].id, parsed.lines[3].id)
+        XCTAssertEqual(parsed.activeIndex(at: 5_600), 2)
+
+        // 5. FormatUtils.decodeHtml, CJK share URL extraction, and track matching
+        XCTAssertEqual(
+            FormatUtils.decodeHtml("<em>Rock</em> &#38; Roll &#x27;99 &amp;lt;Live&gt;"),
+            "Rock & Roll '99 &lt;Live>"
+        )
+        XCTAssertEqual(
+            extractFirstHttpUrl(from: "分享歌单 http://163cn.tv/abc123（来自@网易云音乐）"),
+            "http://163cn.tv/abc123"
+        )
+        let original = Track(id: "wy_1", title: "千里之外", artist: "周杰伦 / 费玉清", durationMs: 256_000)
+        let karaoke = Track(id: "tx_2", title: "千里之外 (伴奏)", artist: "周杰伦 / 费玉清", durationMs: 256_000)
+        let reversedArtist = Track(id: "kw_3", title: "千里之外", artist: "费玉清 / 周杰伦", durationMs: 257_000)
+        XCTAssertFalse(MusicAggregator.isTrackMatch(original, karaoke))
+        XCTAssertTrue(MusicAggregator.isTrackMatch(original, reversedArtist))
+    }
+
+    @MainActor
+    func testRound3DataDownloadLocalAndUpdaterSecurityRegressionSuite() {
+        // 1. AppSettings forward-compatible decoding (partial JSON & unknown enum values do not wipe settings)
+        let partialJson = #"{"preferredQuality":"unknown_future","autoFallbackSource":false,"themeMode":"light"}"#
+        let decodedSettings = try? JSONDecoder().decode(AppSettings.self, from: Data(partialJson.utf8))
+        XCTAssertNotNil(decodedSettings)
+        XCTAssertEqual(decodedSettings?.preferredQuality, .q320k)
+        XCTAssertEqual(decodedSettings?.autoFallbackSource, false)
+        XCTAssertEqual(decodedSettings?.themeMode, .light)
+        XCTAssertEqual(decodedSettings?.wifiOnlyHighQuality, true)
+
+        // 2. DownloadManager MIME filter, filename sanitization, and LocalMusicManager subdirectory path distinctness
+        XCTAssertTrue(DownloadManager.isDisallowedAudioContentType("text/html; charset=utf-8"))
+        XCTAssertFalse(DownloadManager.isDisallowedAudioContentType("audio/flac"))
+        XCTAssertEqual(DownloadManager.sanitizeFileName("...secret/track\n"), "secret_track")
+
+        let root = URL(fileURLWithPath: "/tmp/LocalMusic", isDirectory: true)
+        let a = root.appendingPathComponent("AlbumA/01.flac")
+        let b = root.appendingPathComponent("AlbumB/01.flac")
+        XCTAssertNotEqual(
+            LocalMusicManager.relativeSubpath(of: a, under: root),
+            LocalMusicManager.relativeSubpath(of: b, under: root)
+        )
+
+        // 3. AppUpdateManager SHA-256 extraction, mirror gating, and TrollStore % percent encoding
+        let digestHex = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        let body = """
+        ### 校验信息
+        - **iOS IPA**: `lx-pure-ios-v1.1.4-unsigned.ipa`
+          - SHA-256: `\(digestHex)`
+        """
+        XCTAssertEqual(
+            AppUpdateManager.extractSha256FromReleaseBody(body, assetName: "lx-pure-ios-v1.1.4-unsigned.ipa"),
+            digestHex
+        )
+        XCTAssertEqual(
+            AppUpdateManager.extractSha256FromSumsText("\(digestHex)  lx-pure-ios-v1.1.4-unsigned.ipa", assetName: "lx-pure-ios-v1.1.4-unsigned.ipa"),
+            digestHex
+        )
+        let unverifiedRoutes = AppUpdateManager.buildDownloadRoutes(
+            originalUrl: "https://github.com/4everwrf/lx-pure/releases/download/v1.1.4/lx-pure-ios-v1.1.4-unsigned.ipa",
+            allowMirrors: false
+        )
+        XCTAssertEqual(unverifiedRoutes.count, 1)
+        let tsUrl = AppUpdateManager.trollStoreInstallURL(for: "https://example.com/a%20b.ipa?x=1&y=2")
+        XCTAssertTrue(tsUrl?.absoluteString.contains("%2520") == true)
+
+        // 4. LibraryStore orphan protection, empty cover fallback, and interrupted download recovery
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxpure_r3_lib_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let store = LibraryStore(baseDirectory: tempDir)
+        let track = Track(id: "wy_r3", title: "Cover Song", artist: "Singer", coverUrl: "https://img.example.com/c.jpg")
+        let addToMissing = store.addTracks([track], toPlaylistId: 999_999)
+        XCTAssertEqual(addToMissing.addedCount, 0)
+        _ = store.createPlaylist(name: "EmptyCover", coverUrl: "", tracks: [track])
+        XCTAssertEqual(store.userPlaylists.first?.coverUrl, "https://img.example.com/c.jpg")
+
+        store.upsertDownload(DownloadRecord(
+            trackId: "wy_r3",
+            track: track,
+            quality: .flac,
+            status: .downloading,
+            progress: 0.4,
+            filePath: "partial.flac",
+            totalBytes: 1000,
+            errorMessage: nil,
+            updatedAt: 100
+        ))
+        let orphans = store.reconcileInterruptedDownloads()
+        XCTAssertEqual(orphans, ["partial.flac"])
+        XCTAssertEqual(store.downloadRecord(for: "wy_r3")?.status, .failed)
+        XCTAssertNil(store.downloadRecord(for: "wy_r3")?.filePath)
+    }
+
+    @MainActor
+    func testRound5JsonOverflowSafetyAndAsyncPlaylistLoadingRegression() async {
+        // 1. IEEE-754 2^63 boundary must safely return nil instead of trapping Int64(d)
+        XCTAssertNil(JsonSafe.asInt("9223372036854775808"))
+        XCTAssertNil(JsonSafe.asInt64("9223372036854775808"))
+        XCTAssertNil(JsonSafe.asInt64("9223372036854775807.0"))
+        XCTAssertEqual(JsonSafe.asInt("42.0"), 42)
+        XCTAssertEqual(JsonSafe.asInt64("123456.0"), 123456)
+
+        // 2. Async playlist loading & membership lookup after cache eviction
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxpure_r5_lib_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let store = LibraryStore(baseDirectory: tempDir)
+        let t1 = Track(id: "wy_r5_a", title: "Alpha", artist: "A")
+        let t2 = Track(id: "wy_r5_b", title: "Beta", artist: "B")
+        guard case .created(let plId) = store.createPlaylist(name: "AsyncTest", tracks: [t1]) else {
+            XCTFail("Expected playlist creation to succeed")
+            return
+        }
+        store.addTracks([t2], toPlaylistId: plId, prepend: true)
+        store.flushPendingWrites()
+        store.evictTrackCaches()
+
+        XCTAssertNil(store.cachedTracksIfLoaded(forPlaylistId: plId))
+        let loaded = await store.loadTracksAsync(forPlaylistId: plId)
+        XCTAssertEqual(loaded.map(\.id), ["wy_r5_b", "wy_r5_a"])
+
+        store.evictTrackCaches()
+        let containing = await store.playlistIdsContainingAsync(trackId: "wy_r5_b")
+        XCTAssertEqual(containing, [plId])
+    }
 }

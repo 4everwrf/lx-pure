@@ -75,13 +75,24 @@ class MediaCacheManager(
         audioBytes + imageBytes + httpBytes
     }
 
+    @kotlin.OptIn(coil.annotation.ExperimentalCoilApi::class)
     suspend fun clearAllCaches(imageLoader: ImageLoader): Unit = withContext(Dispatchers.IO) {
-        // Clear audio stream LRU entries safely without releasing the live SimpleCache instance
+        // Clear audio stream LRU entries safely without instantiating SimpleCache if not yet opened
         runCatching {
-            val cache = getAudioCache()
-            val keys = cache.keys.toList()
-            keys.forEach { key ->
-                runCatching { cache.removeResource(key) }
+            var activeCache: SimpleCache? = null
+            synchronized(cacheLock) {
+                activeCache = simpleCache
+                if (activeCache == null && audioCacheDir.exists()) {
+                    audioCacheDir.listFiles()?.forEach { child ->
+                        runCatching { child.deleteRecursively() }
+                    }
+                }
+            }
+            activeCache?.let { cache ->
+                val keys = cache.keys.toList()
+                keys.forEach { key ->
+                    runCatching { cache.removeResource(key) }
+                }
             }
         }
         // Clear Coil memory + disk cache

@@ -217,17 +217,21 @@ data class ParsedLyrics(
 
     fun activeIndexAt(positionMs: Long): Int {
         if (lines.isEmpty()) return -1
+        val targetMs = if (positionMs > Long.MAX_VALUE - 120L) Long.MAX_VALUE else positionMs + 120L
         var low = 0
         var high = lines.lastIndex
         var result = -1
         while (low <= high) {
             val mid = (low + high) ushr 1
-            if (lines[mid].timeMs <= positionMs + 120L) {
+            if (lines[mid].timeMs <= targetMs) {
                 result = mid
                 low = mid + 1
             } else {
                 high = mid - 1
             }
+        }
+        while (result > 0 && lines[result - 1].timeMs == lines[result].timeMs) {
+            result--
         }
         return result
     }

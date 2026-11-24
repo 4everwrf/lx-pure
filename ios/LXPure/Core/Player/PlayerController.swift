@@ -1000,6 +1000,7 @@ final class PlayerController: ObservableObject {
         preloadTask = Task { [weak self] in
             guard let self else { return }
 
+            @MainActor
             func commitIfStillValid(_ item: PreloadedNextItem) {
                 guard !Task.isCancelled,
                       self.state.currentTrack?.id == forTrackId,

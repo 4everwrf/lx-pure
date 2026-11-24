@@ -482,6 +482,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             case updated(live: UserApiSource, oldVersion: String)
         }
 
+        let resolvedUsedUrl = usedUrl
         let outcome: MergeOutcome = await MainActor.run {
             var saved = libraryStore.loadSavedUserApis()
             guard let idx = saved.firstIndex(where: { $0.id == id }) else {
@@ -501,7 +502,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             merged.author = parsed.author
             merged.homepage = parsed.homepage.isEmpty ? live.homepage : parsed.homepage
             merged.script = fetchedScript
-            merged.sourceUrl = usedUrl ?? live.sourceUrl
+            merged.sourceUrl = resolvedUsedUrl ?? live.sourceUrl
             saved[idx] = merged
             libraryStore.saveUserApis(saved)
             return .updated(live: merged, oldVersion: live.version)

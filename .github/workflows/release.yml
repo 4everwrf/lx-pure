@@ -329,6 +329,17 @@ jobs:
           fi
           if [ -z "$CHANGES" ]; then
             CHANGES="- 常规维护与稳定性优化"
+          else
+            # Wrap bare @annotations (e.g. @MainActor, @OptIn) in backticks so GitHub does not
+            # misinterpret them as @user mentions and pull unrelated accounts into Release Contributors.
+            CHANGES=$(printf '%s\n' "$CHANGES" | python3 -c '
+          import re, sys
+          text = sys.stdin.read()
+          parts = re.split(r"(`[^`]*`)", text)
+          for i in range(0, len(parts), 2):
+              parts[i] = re.sub(r"(?<![A-Za-z0-9_./`])(@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)", r"`\1`", parts[i])
+          sys.stdout.write("".join(parts))
+          ')
           fi
 
           cat > release_out/release_notes.md <<EOF

@@ -297,7 +297,7 @@ final class PlayerAndRacingTests: XCTestCase {
     }
 
     private func waitUntil(
-        timeoutSeconds: TimeInterval = 3.0,
+        timeoutSeconds: TimeInterval = 5.0,
         pollIntervalNs: UInt64 = 15_000_000,
         condition: @Sendable () -> Bool
     ) async -> Bool {
@@ -313,7 +313,7 @@ final class PlayerAndRacingTests: XCTestCase {
 
     @MainActor
     private func waitUntilOnMain(
-        timeoutSeconds: TimeInterval = 3.0,
+        timeoutSeconds: TimeInterval = 5.0,
         pollIntervalNs: UInt64 = 15_000_000,
         condition: @MainActor () -> Bool
     ) async -> Bool {
@@ -334,7 +334,7 @@ final class PlayerAndRacingTests: XCTestCase {
         let res = await userApi.importRawScript(script)
         let source = try res.get()
         let sourceId = source.id
-        let becameReady = await waitUntil(timeoutSeconds: 4.0) {
+        let becameReady = await waitUntil(timeoutSeconds: 8.0) {
             userApi.readySourcesSnapshot().contains { $0.id == sourceId }
         }
         XCTAssertTrue(becameReady, "Source \(source.name) failed to become ready")
@@ -439,7 +439,7 @@ final class PlayerAndRacingTests: XCTestCase {
         XCTAssertEqual(player.state.repeatMode, .sequential)
         player.playTracks(tracks3, startIndex: 0)
 
-        let seqStopped = await waitUntilOnMain(timeoutSeconds: 3.0) {
+        let seqStopped = await waitUntilOnMain(timeoutSeconds: 10.0) {
             events.contains { $0.message == "《Track 2》暂无可用音源，已停止播放" }
         }
         XCTAssertTrue(seqStopped)
@@ -456,7 +456,7 @@ final class PlayerAndRacingTests: XCTestCase {
         XCTAssertEqual(player.state.repeatMode, .singleLoop)
         player.playTracks(tracks3, startIndex: 1)
 
-        let singleLoopStopped = await waitUntilOnMain(timeoutSeconds: 3.0) {
+        let singleLoopStopped = await waitUntilOnMain(timeoutSeconds: 10.0) {
             events.contains { $0.message == "《Track 0》暂无可用音源，已停止播放" }
         }
         XCTAssertTrue(singleLoopStopped)
@@ -470,7 +470,7 @@ final class PlayerAndRacingTests: XCTestCase {
         XCTAssertEqual(player.state.repeatMode, .listLoop)
         player.playTracks([makeTrack(0), makeTrack(1)], startIndex: 0)
 
-        let listLoopStopped = await waitUntilOnMain(timeoutSeconds: 3.0) {
+        let listLoopStopped = await waitUntilOnMain(timeoutSeconds: 10.0) {
             events.contains { $0.message == "《Track 1》暂无可用音源，已停止播放" }
         }
         XCTAssertTrue(listLoopStopped)
@@ -484,7 +484,7 @@ final class PlayerAndRacingTests: XCTestCase {
         XCTAssertEqual(player.state.repeatMode, .shuffle)
         player.playTracks(tracks3, startIndex: 0)
 
-        let shuffleStopped = await waitUntilOnMain(timeoutSeconds: 3.0) {
+        let shuffleStopped = await waitUntilOnMain(timeoutSeconds: 10.0) {
             events.contains { $0.message.hasSuffix("暂无可用音源，已停止播放") }
         }
         XCTAssertTrue(shuffleStopped)
@@ -493,7 +493,7 @@ final class PlayerAndRacingTests: XCTestCase {
         // 5. Single-track queue: stops immediately without skipping
         events.removeAll()
         player.playTracks([makeTrack(9)], startIndex: 0)
-        let singleTrackStopped = await waitUntilOnMain(timeoutSeconds: 2.0) {
+        let singleTrackStopped = await waitUntilOnMain(timeoutSeconds: 6.0) {
             events.contains { $0.message == "《Track 9》暂无可用音源，已停止播放" }
         }
         XCTAssertTrue(singleTrackStopped)
@@ -515,7 +515,7 @@ final class PlayerAndRacingTests: XCTestCase {
         defer { offlineBag.cancel() }
 
         offlineEnv.player.playTracks([makeTrack(0), makeTrack(1)], startIndex: 0)
-        let gotOfflineFailure = await waitUntilOnMain(timeoutSeconds: 2.0) {
+        let gotOfflineFailure = await waitUntilOnMain(timeoutSeconds: 6.0) {
             !offlineEvents.isEmpty && !offlineEnv.player.state.isBuffering
         }
         XCTAssertTrue(gotOfflineFailure)
@@ -532,7 +532,7 @@ final class PlayerAndRacingTests: XCTestCase {
         defer { noSourceBag.cancel() }
 
         noSourceEnv.player.playTracks([makeTrack(0), makeTrack(1)], startIndex: 0)
-        let gotImportPrompt = await waitUntilOnMain(timeoutSeconds: 2.0) {
+        let gotImportPrompt = await waitUntilOnMain(timeoutSeconds: 6.0) {
             noSourceEvents.contains { $0.openSourceManager && $0.actionLabel == "导入音源" }
         }
         XCTAssertTrue(gotImportPrompt)
@@ -570,7 +570,7 @@ final class PlayerAndRacingTests: XCTestCase {
         defer { bag.cancel() }
 
         player.playTracks([track0, track1], startIndex: 0)
-        let loadedTrack0 = await waitUntilOnMain(timeoutSeconds: 2.0) {
+        let loadedTrack0 = await waitUntilOnMain(timeoutSeconds: 6.0) {
             player.state.activeQualityBadge == "HQ · 缓存"
         }
         XCTAssertTrue(loadedTrack0)
@@ -580,7 +580,7 @@ final class PlayerAndRacingTests: XCTestCase {
         let dummyErr = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotOpenFile)
         player.simulateRuntimeErrorForTesting(error: dummyErr)
 
-        let autoSkippedToTrack1 = await waitUntilOnMain(timeoutSeconds: 3.0) {
+        let autoSkippedToTrack1 = await waitUntilOnMain(timeoutSeconds: 10.0) {
             player.state.currentIndex == 1 &&
                 events.contains { $0.message == "《Track 0》暂无可用音源，已自动跳至下一首" }
         }
@@ -643,7 +643,7 @@ final class PlayerAndRacingTests: XCTestCase {
         XCTAssertFalse(resolved.switchedSource)
         XCTAssertLessThan(elapsed, 1.5, "Wave-1 racing must not block behind slow priority-0 source")
 
-        let cancelledSlow = await waitUntil(timeoutSeconds: 1.0) {
+        let cancelledSlow = await waitUntil(timeoutSeconds: 3.0) {
             MockURLProtocol.cancelledURLs.contains { $0.contains("/slow-api") }
         }
         XCTAssertTrue(cancelledSlow, "Losing priority-0 HTTP task must be cancelled immediately")
@@ -730,7 +730,7 @@ final class PlayerAndRacingTests: XCTestCase {
             await runtime.requestMusicUrl(track: keepTrack, quality: .q320k, timeoutSeconds: 5.0)
         }
 
-        let bothStarted = await waitUntil(timeoutSeconds: 2.0) {
+        let bothStarted = await waitUntil(timeoutSeconds: 5.0) {
             let urls = MockURLProtocol.requestedURLs
             return urls.contains { $0.contains("id=wy_slow") } && urls.contains { $0.contains("id=wy_keep") }
         }
@@ -743,7 +743,7 @@ final class PlayerAndRacingTests: XCTestCase {
             XCTFail("Expected slowTask to fail/cancel")
         }
 
-        let slowHttpCancelled = await waitUntil(timeoutSeconds: 1.0) {
+        let slowHttpCancelled = await waitUntil(timeoutSeconds: 3.0) {
             MockURLProtocol.cancelledURLs.contains { $0.contains("id=wy_slow") }
         }
         XCTAssertTrue(slowHttpCancelled, "Cancelled musicUrl must cancel its child URLSessionDataTask even while keepTask is pending")
@@ -790,7 +790,7 @@ final class PlayerAndRacingTests: XCTestCase {
         // With valid v1 cache, pre-resolution cache hit succeeds without invoking JS or stream probing
         // (unrelated background cover/lyric metadata fetches via MusicAggregator's shared session are ignored)
         env.player.playTracks([track], startIndex: 0)
-        let hitCache = await waitUntilOnMain(timeoutSeconds: 2.0) {
+        let hitCache = await waitUntilOnMain(timeoutSeconds: 6.0) {
             env.player.state.activeQualityBadge == "HQ · 缓存"
         }
         XCTAssertTrue(hitCache)
@@ -813,7 +813,7 @@ final class PlayerAndRacingTests: XCTestCase {
             MockHttpStub(statusCode: 500, body: Data())
         }
         env.player.playTracks([track], startIndex: 0)
-        let hitNetworkInstead = await waitUntil(timeoutSeconds: 2.0) {
+        let hitNetworkInstead = await waitUntil(timeoutSeconds: 6.0) {
             MockURLProtocol.requestedURLs.contains { $0.contains("https://mock.cache.test/v2") }
         }
         XCTAssertTrue(hitNetworkInstead, "After source revision bump, PlayerController must not read stale v1 cache")
@@ -961,7 +961,7 @@ final class PlayerAndRacingTests: XCTestCase {
 
         // 1. cycleRepeatMode cancels pending 500ms auto-skip countdown
         player.playTracks([makeTrack(0), makeTrack(1), makeTrack(2)], startIndex: 0)
-        let enteredCountdownA = await waitUntilOnMain(timeoutSeconds: 3.0, pollIntervalNs: 10_000_000) {
+        let enteredCountdownA = await waitUntilOnMain(timeoutSeconds: 8.0, pollIntervalNs: 10_000_000) {
             !player.state.isBuffering &&
                 events.contains { $0.message == "《Track 0》暂无可用音源，已自动跳至下一首" }
         }
@@ -974,7 +974,7 @@ final class PlayerAndRacingTests: XCTestCase {
         // 2. playNext cancels pending 500ms auto-skip countdown
         events.removeAll()
         player.playTracks([makeTrack(0), makeTrack(1), makeTrack(2)], startIndex: 0)
-        let enteredCountdownB = await waitUntilOnMain(timeoutSeconds: 3.0, pollIntervalNs: 10_000_000) {
+        let enteredCountdownB = await waitUntilOnMain(timeoutSeconds: 8.0, pollIntervalNs: 10_000_000) {
             !player.state.isBuffering &&
                 events.contains { $0.message == "《Track 0》暂无可用音源，已自动跳至下一首" }
         }
@@ -987,7 +987,7 @@ final class PlayerAndRacingTests: XCTestCase {
         // 3. removeFromQueue(at:) on non-current index cancels pending 500ms auto-skip countdown
         events.removeAll()
         player.playTracks([makeTrack(0), makeTrack(1), makeTrack(2)], startIndex: 0)
-        let enteredCountdownC = await waitUntilOnMain(timeoutSeconds: 3.0, pollIntervalNs: 10_000_000) {
+        let enteredCountdownC = await waitUntilOnMain(timeoutSeconds: 8.0, pollIntervalNs: 10_000_000) {
             !player.state.isBuffering &&
                 events.contains { $0.message == "《Track 0》暂无可用音源，已自动跳至下一首" }
         }

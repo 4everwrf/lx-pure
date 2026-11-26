@@ -54,9 +54,10 @@ struct BatchUpdateSummary: Sendable {
 final class UserApiManager: ObservableObject, @unchecked Sendable {
     @MainActor @Published private(set) var sources: [UserApiSource] = []
 
-    private static let scriptUrlTimeoutSec: Double = 5.5
-    private static let streamProbeTimeoutSec: Double = 3.0
-    private static let resolveTotalBudgetSec: TimeInterval = 18.0
+    private static let scriptUrlTimeoutSec: Double = 4.0
+    private static let streamProbeTimeoutSec: Double = 2.2
+    private static let resolveTotalBudgetSec: TimeInterval = 16.0
+    private static let initialReadyGraceSec: TimeInterval = 0.6
     private static let cooldownDurationSec: TimeInterval = 45.0
     private static let maxScriptDownloadBytes: Int = 2 * 1024 * 1024
     private static let chromeUserAgent =
@@ -132,6 +133,9 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         let probeConfig = URLSessionConfiguration.ephemeral
         probeConfig.timeoutIntervalForRequest = Self.streamProbeTimeoutSec
         probeConfig.timeoutIntervalForResource = Self.streamProbeTimeoutSec + 0.5
+        if let protocolClasses = session.configuration.protocolClasses, !protocolClasses.isEmpty {
+            probeConfig.protocolClasses = protocolClasses
+        }
         self.probeSession = URLSession(configuration: probeConfig)
 
         Task {
@@ -141,9 +145,15 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     }
 
     /// Waits briefly on cold launch so tapping Play on a restored track immediately after
-    /// opening the app lets custom JS source runtimes finish initializing.
-    func awaitInitialLoadIfNeeded(timeoutSec: Double = 4.5, preferredSourceId: String? = nil) async {
+    /// opening the app lets custom JS source runtimes finish initializing, capping primary
+    /// wait once at least one enabled source is already `.ready`.
+    func awaitInitialLoadIfNeeded(
+        timeoutSec: Double = 4.5,
+        preferredSourceId: String? = nil,
+        primaryGraceSec: TimeInterval = initialReadyGraceSec
+    ) async {
         let deadline = Date().addingTimeInterval(timeoutSec)
+        var readyObservedAt: Date?
         while Date() < deadline && !Task.isCancelled {
             let (loaded, list) = withLock { (hasCompletedInitialStoreLoad, sourcesSnapshot) }
             if loaded {
@@ -153,7 +163,13 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                 let primarySettled = primary.status != .initializing
                 let hasReady = enabled.contains { $0.status == .ready }
                 let hasInitializing = enabled.contains { $0.status == .initializing }
-                if (primarySettled && hasReady) || !hasInitializing {
+                if hasReady && preferredSourceId == nil {
+                    let firstReadyAt = readyObservedAt ?? Date()
+                    readyObservedAt = firstReadyAt
+                    if primarySettled || !hasInitializing || Date().timeIntervalSince(firstReadyAt) >= primaryGraceSec {
+                        break
+                    }
+                } else if (primarySettled && hasReady) || !hasInitializing {
                     break
                 }
             }
@@ -1046,31 +1062,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             )
             if candidates.isEmpty { continue }
 
-            if tracks.count == 1 && candidates.count > 1 {
-                let primary = candidates[0]
-                let backups = Array(candidates.dropFirst())
-                if let winner = await raceFirstValid(
-                    candidates: [primary],
-                    prunedPlatformsBox: prunedPlatformsBox,
-                    prunedTracksBox: prunedTracksBox,
-                    missCounterBox: missCounterBox,
-                    switchedSourceOnWin: initialSwitched,
-                    deadline: deadline
-                ) {
-                    return winner
-                }
-                if Task.isCancelled || Date() >= deadline { return nil }
-                if let winner = await raceInBalancedWaves(
-                    candidates: backups,
-                    prunedPlatformsBox: prunedPlatformsBox,
-                    prunedTracksBox: prunedTracksBox,
-                    missCounterBox: missCounterBox,
-                    initialSwitched: true,
-                    deadline: deadline
-                ) {
-                    return winner
-                }
-            } else if let winner = await raceInBalancedWaves(
+            if let winner = await raceInBalancedWaves(
                 candidates: candidates,
                 prunedPlatformsBox: prunedPlatformsBox,
                 prunedTracksBox: prunedTracksBox,
@@ -1353,6 +1345,17 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         currentSources().contains { $0.enabled && $0.status == .ready }
     }
 
+    func readySourcesSnapshot(preferredSourceId: String? = nil) -> [UserApiSource] {
+        currentSources()
+            .filter { $0.enabled && $0.status == .ready }
+            .sorted { lhs, rhs in
+                let lp = (lhs.id == preferredSourceId) ? 0 : 1
+                let rp = (rhs.id == preferredSourceId) ? 0 : 1
+                if lp != rp { return lp < rp }
+                return lhs.priority < rhs.priority
+            }
+    }
+
     private func ensureRuntimeReady(for source: UserApiSource) async -> LxJsRuntime? {
         if let existing = withLock({ runtimes[source.id] }) {
             return existing
@@ -1385,7 +1388,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             return runtime
         }
 
-        let initRes = await runtime.initialize(timeoutSeconds: 5.0)
+        let initRes = await runtime.initialize(timeoutSeconds: 4.0)
         if Task.isCancelled {
             let orphaned: LxJsRuntime? = withLock {
                 guard inFlightRuntimes[source.id] === runtime else { return nil }

@@ -50,6 +50,115 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
+internal class ParentChildHttpCallTracker {
+    private val destroyed = AtomicBoolean(false)
+    private val activeHttpCalls = ConcurrentHashMap<String, Call>()
+    private val cancelledChildren = ConcurrentHashMap.newKeySet<String>()
+    private val childToParent = ConcurrentHashMap<String, String>()
+    private val parentToChildren = ConcurrentHashMap<String, MutableSet<String>>()
+    private val cancelledParentsLock = Any()
+    private val cancelledParents = LinkedHashSet<String>()
+
+    fun hasActiveCalls(): Boolean = activeHttpCalls.isNotEmpty()
+
+    fun isParentCancelled(parentKey: String): Boolean =
+        synchronized(cancelledParentsLock) { parentKey in cancelledParents }
+
+    fun registerChild(childKey: String, parentKey: String?): Boolean {
+        if (destroyed.get()) return false
+        if (parentKey != null) {
+            if (isParentCancelled(parentKey)) return false
+            childToParent[childKey] = parentKey
+            parentToChildren.computeIfAbsent(parentKey) { ConcurrentHashMap.newKeySet() }.add(childKey)
+            if (isParentCancelled(parentKey) || destroyed.get()) {
+                cleanupChildMapping(childKey)
+                return false
+            }
+        }
+        return !destroyed.get() && childKey !in cancelledChildren
+    }
+
+    fun attachCall(childKey: String, call: Call): Boolean {
+        activeHttpCalls[childKey] = call
+        if (isCancelled(childKey)) {
+            activeHttpCalls.remove(childKey, call)
+            runCatching { call.cancel() }
+            return false
+        }
+        return true
+    }
+
+    fun isCancelled(childKey: String): Boolean {
+        if (destroyed.get() || childKey in cancelledChildren) return true
+        val parentKey = childToParent[childKey]
+        return parentKey != null && isParentCancelled(parentKey)
+    }
+
+    fun completeChild(childKey: String, call: Call? = null) {
+        if (call != null) {
+            activeHttpCalls.remove(childKey, call)
+        } else {
+            activeHttpCalls.remove(childKey)
+        }
+        cancelledChildren.remove(childKey)
+        cleanupChildMapping(childKey)
+    }
+
+    fun cancelChild(childKey: String) {
+        cancelledChildren.add(childKey)
+        activeHttpCalls.remove(childKey)?.let { runCatching { it.cancel() } }
+        cleanupChildMapping(childKey)
+    }
+
+    fun cancelParent(parentKey: String) {
+        synchronized(cancelledParentsLock) {
+            cancelledParents.add(parentKey)
+            if (cancelledParents.size > 256) {
+                val it = cancelledParents.iterator()
+                if (it.hasNext()) {
+                    it.next()
+                    it.remove()
+                }
+            }
+        }
+        val children = parentToChildren.remove(parentKey)?.toList().orEmpty()
+        for (childKey in children) {
+            cancelledChildren.add(childKey)
+            activeHttpCalls.remove(childKey)?.let { runCatching { it.cancel() } }
+            childToParent.remove(childKey, parentKey)
+        }
+        childToParent.entries.toList().forEach { (childKey, pKey) ->
+            if (pKey == parentKey) {
+                cancelledChildren.add(childKey)
+                activeHttpCalls.remove(childKey)?.let { runCatching { it.cancel() } }
+                childToParent.remove(childKey, parentKey)
+            }
+        }
+    }
+
+    fun destroy() {
+        if (!destroyed.compareAndSet(false, true)) return
+        activeHttpCalls.values.forEach { runCatching { it.cancel() } }
+        activeHttpCalls.clear()
+        cancelledChildren.clear()
+        childToParent.clear()
+        parentToChildren.clear()
+        synchronized(cancelledParentsLock) {
+            cancelledParents.clear()
+        }
+    }
+
+    private fun cleanupChildMapping(childKey: String) {
+        val parentKey = childToParent.remove(childKey) ?: return
+        parentToChildren[parentKey]?.let { set ->
+            set.remove(childKey)
+            if (set.isEmpty()) {
+                parentToChildren.remove(parentKey, set)
+            }
+        }
+    }
+}
+
 data class ScriptInitResult(
     val success: Boolean,
     val supportedPlatforms: Map<String, List<String>> = emptyMap(),
@@ -196,12 +305,13 @@ class LxQuickJsRuntime(
     private val destroyed = AtomicBoolean(false)
     private val initDeferred = CompletableDeferred<ScriptInitResult>()
     private val pendingActions = ConcurrentHashMap<String, CompletableDeferred<Result<JsonElement?>>>()
-    private val activeHttpCalls = ConcurrentHashMap<String, Call>()
-    private val cancelledRequests = ConcurrentHashMap.newKeySet<String>()
+    private val httpCallTracker = ParentChildHttpCallTracker()
     private val activeTimers = ConcurrentHashMap<Long, Runnable>()
+    private val timerParents = ConcurrentHashMap<Long, String>()
+    private var currentDispatchingParentKey: String? = null
 
     fun hasActiveRequests(): Boolean =
-        pendingActions.isNotEmpty() || activeHttpCalls.isNotEmpty() || (!destroyed.get() && !initDeferred.isCompleted)
+        pendingActions.isNotEmpty() || httpCallTracker.hasActiveCalls() || (!destroyed.get() && !initDeferred.isCompleted)
 
     suspend fun initialize(timeoutMs: Long = 15_000L): ScriptInitResult {
         runCatching { ensureQuickJsLoaded() }.onFailure { t ->
@@ -352,12 +462,26 @@ class LxQuickJsRuntime(
 
         global.setProperty("__lx_native_call__set_timeout") { args ->
             if (destroyed.get() || activeTimers.size >= MAX_ACTIVE_TIMERS) return@setProperty null
+            val parentKey = currentDispatchingParentKey
+            if (parentKey != null && httpCallTracker.isParentCancelled(parentKey)) return@setProperty null
             val timerId = (args.getOrNull(0) as? Number)?.toLong() ?: args.getOrNull(0)?.toString()?.toLongOrNull() ?: 0L
             val delayMs = ((args.getOrNull(1) as? Number)?.toLong() ?: 0L).coerceIn(0L, 60_000L)
+            if (parentKey != null) {
+                timerParents[timerId] = parentKey
+            } else {
+                timerParents.remove(timerId)
+            }
             val runnable = Runnable {
                 activeTimers.remove(timerId)
-                if (!destroyed.get()) {
-                    callJs("__set_timeout__", timerId.toString())
+                val timerParent = timerParents.remove(timerId)
+                if (!destroyed.get() && (timerParent == null || !httpCallTracker.isParentCancelled(timerParent))) {
+                    val prevParent = currentDispatchingParentKey
+                    currentDispatchingParentKey = timerParent
+                    try {
+                        callJs("__set_timeout__", timerId.toString())
+                    } finally {
+                        currentDispatchingParentKey = prevParent
+                    }
                 }
             }
             activeTimers.put(timerId, runnable)?.let { old -> jsHandler.removeCallbacks(old) }
@@ -368,6 +492,7 @@ class LxQuickJsRuntime(
         global.setProperty("__lx_native_call__clear_timeout") { args ->
             val timerId = (args.getOrNull(0) as? Number)?.toLong() ?: args.getOrNull(0)?.toString()?.toLongOrNull()
             if (timerId != null) {
+                timerParents.remove(timerId)
                 activeTimers.remove(timerId)?.let { runnable ->
                     jsHandler.removeCallbacks(runnable)
                 }
@@ -413,20 +538,22 @@ class LxQuickJsRuntime(
             "request" -> {
                 val obj = runCatching { json.parseToJsonElement(dataJson).asJsonObjectOrNull() }.getOrNull() ?: return
                 val requestKey = obj["requestKey"].asStringOrNull() ?: return
+                val parentRequestKey = currentDispatchingParentKey
                 val url = obj["url"].asStringOrNull()
                 if (url.isNullOrBlank()) {
-                    sendHttpErrorResponse(requestKey, "Invalid URL")
+                    if (parentRequestKey == null || !httpCallTracker.isParentCancelled(parentRequestKey)) {
+                        sendHttpErrorResponse(requestKey, "Invalid URL", parentRequestKey)
+                    }
                     return
                 }
                 val options = obj["options"].asJsonObjectOrNull()
-                executeHttpForScript(requestKey, url, options)
+                executeHttpForScript(requestKey, parentRequestKey, url, options)
             }
 
             "cancelRequest" -> {
                 val requestKey = runCatching { json.parseToJsonElement(dataJson).asStringOrNull() }.getOrNull()
                 if (requestKey != null) {
-                    cancelledRequests.add(requestKey)
-                    activeHttpCalls.remove(requestKey)?.cancel()
+                    httpCallTracker.cancelChild(requestKey)
                 }
             }
 
@@ -449,20 +576,30 @@ class LxQuickJsRuntime(
         }
     }
 
-    private fun sendHttpErrorResponse(requestKey: String, errorMessage: String) {
+    private fun sendHttpErrorResponse(
+        requestKey: String,
+        errorMessage: String,
+        parentRequestKey: String? = null
+    ) {
         val payload = buildJsonObject {
             put("requestKey", requestKey)
             put("error", errorMessage)
             put("response", JsonNull)
         }
-        postCallJs("response", payload.toString())
+        postCallJs("response", payload.toString(), parentRequestKey)
     }
 
-    private fun executeHttpForScript(requestKey: String, url: String, options: JsonObject?) {
+    private fun executeHttpForScript(
+        requestKey: String,
+        parentRequestKey: String?,
+        url: String,
+        options: JsonObject?
+    ) {
+        if (!httpCallTracker.registerChild(requestKey, parentRequestKey)) return
         networkScope.launch {
             var activeCall: Call? = null
             try {
-                if (destroyed.get() || cancelledRequests.remove(requestKey)) return@launch
+                if (destroyed.get() || httpCallTracker.isCancelled(requestKey)) return@launch
 
                 val method = options?.get("method").asStringOrNull()?.uppercase(Locale.ROOT) ?: "GET"
                 val timeoutMs = options?.get("timeout").asIntOrNull()?.toLong()?.coerceIn(1_000L, 10_000L) ?: 6_500L
@@ -545,16 +682,12 @@ class LxQuickJsRuntime(
 
                 val call = clientBuilder.build().newCall(reqBuilder.build())
                 activeCall = call
-                activeHttpCalls[requestKey] = call
-                if (destroyed.get() || cancelledRequests.remove(requestKey)) {
-                    activeHttpCalls.remove(requestKey, call)
-                    runCatching { call.cancel() }
+                if (!httpCallTracker.attachCall(requestKey, call)) {
                     return@launch
                 }
 
                 call.execute().use { resp ->
-                    activeHttpCalls.remove(requestKey, call)
-                    if (destroyed.get() || cancelledRequests.remove(requestKey)) return@launch
+                    if (destroyed.get() || httpCallTracker.isCancelled(requestKey)) return@launch
 
                     val respHeaders = buildJsonObject {
                         resp.headers.names().forEach { name ->
@@ -597,16 +730,14 @@ class LxQuickJsRuntime(
                             put("body", bodyElement)
                         })
                     }
-                    postCallJs("response", payload.toString())
+                    postCallJs("response", payload.toString(), parentRequestKey)
                 }
             } catch (t: Throwable) {
-                activeCall?.let { activeHttpCalls.remove(requestKey, it) }
-                if (!destroyed.get() && !cancelledRequests.remove(requestKey)) {
-                    sendHttpErrorResponse(requestKey, t.message ?: "Network request error")
+                if (!destroyed.get() && !httpCallTracker.isCancelled(requestKey)) {
+                    sendHttpErrorResponse(requestKey, t.message ?: "Network request error", parentRequestKey)
                 }
             } finally {
-                activeCall?.let { activeHttpCalls.remove(requestKey, it) }
-                cancelledRequests.remove(requestKey)
+                httpCallTracker.completeChild(requestKey, activeCall)
             }
         }
     }
@@ -634,7 +765,7 @@ class LxQuickJsRuntime(
             })
         }
 
-        postCallJs("request", payload.toString())
+        postCallJs("request", payload.toString(), parentRequestKey = requestKey)
 
         var completedNormally = false
         return try {
@@ -659,24 +790,30 @@ class LxQuickJsRuntime(
             }
         } finally {
             pendingActions.remove(requestKey)
-            // If this request timed out or was cancelled and no other script requests are awaiting a result,
-            // cancel orphaned child HTTP calls so OkHttp slots are freed immediately.
-            if (!completedNormally && pendingActions.isEmpty() && initDeferred.isCompleted) {
-                activeHttpCalls.entries.toList().forEach { (key, call) ->
-                    if (activeHttpCalls.remove(key, call)) {
-                        cancelledRequests.add(key)
-                        runCatching { call.cancel() }
+            // Immediately cancel child OkHttp calls and timers belonging to this specific musicUrl request
+            // without disrupting other concurrent musicUrl/init actions on this runtime.
+            if (!completedNormally) {
+                httpCallTracker.cancelParent(requestKey)
+                timerParents.entries.toList().forEach { (tid, pKey) ->
+                    if (pKey == requestKey && timerParents.remove(tid, pKey)) {
+                        activeTimers.remove(tid)?.let { jsHandler.removeCallbacks(it) }
                     }
                 }
             }
         }
     }
 
-    private fun postCallJs(action: String, dataJson: String) {
+    private fun postCallJs(action: String, dataJson: String, parentRequestKey: String? = null) {
         if (destroyed.get()) return
         jsHandler.post {
-            if (!destroyed.get()) {
-                callJs(action, dataJson)
+            if (!destroyed.get() && (parentRequestKey == null || !httpCallTracker.isParentCancelled(parentRequestKey))) {
+                val prevParent = currentDispatchingParentKey
+                currentDispatchingParentKey = parentRequestKey
+                try {
+                    callJs(action, dataJson)
+                } finally {
+                    currentDispatchingParentKey = prevParent
+                }
             }
         }
     }
@@ -700,9 +837,8 @@ class LxQuickJsRuntime(
     fun destroy() {
         if (!destroyed.compareAndSet(false, true)) return
         initDeferred.complete(ScriptInitResult(false, errorMessage = "音源已停用"))
-        activeHttpCalls.values.forEach { runCatching { it.cancel() } }
-        activeHttpCalls.clear()
-        cancelledRequests.clear()
+        httpCallTracker.destroy()
+        timerParents.clear()
         activeTimers.values.forEach { jsHandler.removeCallbacks(it) }
         activeTimers.clear()
         pendingActions.values.forEach {

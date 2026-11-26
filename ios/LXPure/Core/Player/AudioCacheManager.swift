@@ -65,6 +65,21 @@ final class AudioCacheManager: @unchecked Sendable {
         }
     }
 
+    func firstCachedFileAsync(for keys: [String]) async -> (index: Int, url: URL)? {
+        guard !keys.isEmpty else { return nil }
+        return await withCheckedContinuation { continuation in
+            ioQueue.async {
+                for (index, key) in keys.enumerated() {
+                    if let url = self.findCachedFileOnIOQueue(for: key) {
+                        continuation.resume(returning: (index, url))
+                        return
+                    }
+                }
+                continuation.resume(returning: nil)
+            }
+        }
+    }
+
     private func findCachedFileOnIOQueue(for cacheKey: String) -> URL? {
         for ext in Self.supportedExtensions {
             let url = cacheDir.appendingPathComponent("\(cacheKey).\(ext)")

@@ -18,7 +18,11 @@ struct PlaybackRecoveryPlan: Equatable, Sendable {
 
 enum PlaybackRecoveryPolicy {
     static let maxRuntimeRetries = 4
-    static let maxConsecutiveAutoSkips = 3
+    static let maxAutoSkipTracksCap = 10
+
+    static func maxAutoSkipCount(queueSize: Int) -> Int {
+        min(max(queueSize, 0), maxAutoSkipTracksCap)
+    }
 
     private static let transientUrlErrorCodes: Set<Int> = [
         NSURLErrorTimedOut,

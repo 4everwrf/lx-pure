@@ -121,43 +121,37 @@ class PlaybackNavigationAdversarialTest {
                 for (cur in 0 until queueSize) {
                     val ctx = "mode=$mode, N=$queueSize, cur=$cur"
 
-                    // A. Test previous across every position threshold on a fresh navigator at (queueSize, cur)
+                    // A. Test previous across every position on a fresh navigator at (queueSize, cur)
                     for (pos in thresholdPositions) {
                         val nav = QueueNavigator(Random(1000 + queueSize * 31 + cur))
                         nav.onQueueReplaced(queueSize, cur, mode)
 
                         val canPrev = nav.canSkipPrevious(queueSize, cur, mode)
-                        val cursorBefore = nav.inspectShuffleCursor()
                         val outcome = nav.navigatePrevious(queueSize, cur, mode, pos)
 
-                        if (pos > QueueNavigator.PREVIOUS_RESTART_THRESHOLD_MS) {
-                            assertEquals("$ctx pos=$pos must silently restart", QueueNavigationOutcome.RestartCurrent(null), outcome)
-                            assertEquals("$ctx pos=$pos must NOT mutate shuffleCursor", cursorBefore, nav.inspectShuffleCursor())
-                        } else {
-                            // Verify canSkipPrevious accurately predicts SwitchTo(target != cur) vs RestartCurrent
-                            if (canPrev) {
-                                assertTrue("$ctx pos=$pos canPrev=true must SwitchTo, got $outcome", outcome is QueueNavigationOutcome.SwitchTo)
-                                val target = (outcome as QueueNavigationOutcome.SwitchTo).targetIndex
-                                assertTrue("$ctx target $target in bounds", target in 0 until queueSize)
-                                assertNotEquals("$ctx target must differ from cur", cur, target)
-                                val expectedPrev = when (mode) {
-                                    RepeatMode.SEQUENTIAL -> cur - 1
-                                    RepeatMode.LIST_LOOP, RepeatMode.SINGLE_LOOP -> if (cur == 0) queueSize - 1 else cur - 1
-                                    RepeatMode.SHUFFLE -> error("Fresh shuffle at cursor 0 must not report canSkipPrevious=true")
-                                }
-                                assertEquals("$ctx unexpected previous target", expectedPrev, target)
-                            } else {
-                                assertTrue("$ctx pos=$pos canPrev=false must RestartCurrent, got $outcome", outcome is QueueNavigationOutcome.RestartCurrent)
-                                val msg = (outcome as QueueNavigationOutcome.RestartCurrent).message
-                                val expectedMsg = when {
-                                    queueSize == 1 && mode == RepeatMode.SEQUENTIAL -> "已是第一首，已重新播放"
-                                    queueSize == 1 -> "当前队列仅 1 首，已重新播放"
-                                    mode == RepeatMode.SEQUENTIAL -> "已是第一首，已重新播放"
-                                    mode == RepeatMode.SHUFFLE -> "已回到随机播放起点，已重新播放"
-                                    else -> error("Unexpected canPrev=false for $ctx")
-                                }
-                                assertEquals("$ctx boundary toast mismatch", expectedMsg, msg)
+                        // R2: Previous always jumps directly regardless of playback progress (never restarts >5s)
+                        if (canPrev) {
+                            assertTrue("$ctx pos=$pos canPrev=true must SwitchTo, got $outcome", outcome is QueueNavigationOutcome.SwitchTo)
+                            val target = (outcome as QueueNavigationOutcome.SwitchTo).targetIndex
+                            assertTrue("$ctx target $target in bounds", target in 0 until queueSize)
+                            assertNotEquals("$ctx target must differ from cur", cur, target)
+                            val expectedPrev = when (mode) {
+                                RepeatMode.SEQUENTIAL -> cur - 1
+                                RepeatMode.LIST_LOOP, RepeatMode.SINGLE_LOOP -> if (cur == 0) queueSize - 1 else cur - 1
+                                RepeatMode.SHUFFLE -> error("Fresh shuffle at cursor 0 must not report canSkipPrevious=true")
                             }
+                            assertEquals("$ctx unexpected previous target", expectedPrev, target)
+                        } else {
+                            assertTrue("$ctx pos=$pos canPrev=false must RestartCurrent, got $outcome", outcome is QueueNavigationOutcome.RestartCurrent)
+                            val msg = (outcome as QueueNavigationOutcome.RestartCurrent).message
+                            val expectedMsg = when {
+                                queueSize == 1 && mode == RepeatMode.SEQUENTIAL -> "已是第一首，已重新播放"
+                                queueSize == 1 -> "当前队列仅 1 首，已重新播放"
+                                mode == RepeatMode.SEQUENTIAL -> "已是第一首，已重新播放"
+                                mode == RepeatMode.SHUFFLE -> "已回到随机播放起点，已重新播放"
+                                else -> error("Unexpected canPrev=false for $ctx")
+                            }
+                            assertEquals("$ctx boundary toast mismatch", expectedMsg, msg)
                         }
                     }
 
@@ -228,14 +222,9 @@ class PlaybackNavigationAdversarialTest {
                             assertTrue("$ctx after 1 step canSkipPrevious must be true", nav.canSkipPrevious(queueSize, nextIdx, RepeatMode.SHUFFLE))
 
                             val prevOut = nav.navigatePrevious(queueSize, nextIdx, RepeatMode.SHUFFLE, pos)
-                            if (pos > QueueNavigator.PREVIOUS_RESTART_THRESHOLD_MS) {
-                                assertEquals(QueueNavigationOutcome.RestartCurrent(null), prevOut)
-                                assertEquals(1, nav.inspectShuffleCursor())
-                            } else {
-                                assertEquals(QueueNavigationOutcome.SwitchTo(cur), prevOut)
-                                assertEquals(0, nav.inspectShuffleCursor())
-                                assertFalse(nav.canSkipPrevious(queueSize, cur, RepeatMode.SHUFFLE))
-                            }
+                            assertEquals(QueueNavigationOutcome.SwitchTo(cur), prevOut)
+                            assertEquals(0, nav.inspectShuffleCursor())
+                            assertFalse(nav.canSkipPrevious(queueSize, cur, RepeatMode.SHUFFLE))
                         }
                     }
                 }
@@ -333,20 +322,23 @@ class PlaybackNavigationAdversarialTest {
         assertNotEquals(t0, t2)
         cur = t2
 
-        // prev > 5s must NOT change cursor or track
-        assertEquals(
-            QueueNavigationOutcome.RestartCurrent(null),
-            nav.navigatePrevious(queueSize, cur, RepeatMode.SHUFFLE, positionMs = 5_001L)
-        )
-        assertEquals(2, nav.shuffleHistoryDepth)
-
-        // prev -> t1
-        assertEquals(QueueNavigationOutcome.SwitchTo(t1), nav.navigatePrevious(queueSize, cur, RepeatMode.SHUFFLE, 5_000L))
+        // prev even at > 5s (5_001L) MUST directly switch back to t1
+        assertEquals(QueueNavigationOutcome.SwitchTo(t1), nav.navigatePrevious(queueSize, cur, RepeatMode.SHUFFLE, positionMs = 5_001L))
         cur = t1
         assertEquals(1, nav.shuffleHistoryDepth)
 
         // next -> MUST deterministically replay t2 (not draw a random new track!)
         assertEquals(t2, nav.peekNextIndexForAutoAdvance(queueSize, cur, RepeatMode.SHUFFLE))
+        assertEquals(QueueNavigationOutcome.SwitchTo(t2), nav.navigateNext(queueSize, cur, RepeatMode.SHUFFLE, false))
+        cur = t2
+        assertEquals(2, nav.shuffleHistoryDepth)
+
+        // prev -> t1 (also verify >= 5s direct jump)
+        assertEquals(QueueNavigationOutcome.SwitchTo(t1), nav.navigatePrevious(queueSize, cur, RepeatMode.SHUFFLE, 10_000L))
+        cur = t1
+        assertEquals(1, nav.shuffleHistoryDepth)
+
+        // next -> replay t2 again
         assertEquals(QueueNavigationOutcome.SwitchTo(t2), nav.navigateNext(queueSize, cur, RepeatMode.SHUFFLE, false))
         cur = t2
         assertEquals(2, nav.shuffleHistoryDepth)
@@ -1081,21 +1073,17 @@ class PlaybackNavigationAdversarialTest {
                         else -> 25_000L
                     }
                     val canPrevBefore = nav.canSkipPrevious(queue.size, cur, mode)
-                    val cursorBefore = nav.inspectShuffleCursor()
                     val out = nav.navigatePrevious(queue.size, cur, mode, positionMs = pos)
                     if (queue.isEmpty()) {
                         assertEquals(QueueNavigationOutcome.NoOp, out)
-                    } else if (pos > QueueNavigator.PREVIOUS_RESTART_THRESHOLD_MS) {
-                        assertEquals("$tag pos=$pos silent restart", QueueNavigationOutcome.RestartCurrent(null), out)
-                        assertEquals("$tag pos=$pos must not move shuffleCursor", cursorBefore, nav.inspectShuffleCursor())
                     } else if (canPrevBefore) {
-                        assertTrue("$tag canPrev=true must SwitchTo, got $out", out is QueueNavigationOutcome.SwitchTo)
+                        assertTrue("$tag pos=$pos canPrev=true must SwitchTo, got $out", out is QueueNavigationOutcome.SwitchTo)
                         val target = (out as QueueNavigationOutcome.SwitchTo).targetIndex
                         assertTrue("$tag prev target OOB", target in queue.indices)
                         assertNotEquals("$tag prev target must differ from cur", cur, target)
                         cur = target
                     } else {
-                        assertTrue("$tag canPrev=false must RestartCurrent, got $out", out is QueueNavigationOutcome.RestartCurrent)
+                        assertTrue("$tag pos=$pos canPrev=false must RestartCurrent, got $out", out is QueueNavigationOutcome.RestartCurrent)
                         assertNotNull("$tag boundary restart must have message", (out as QueueNavigationOutcome.RestartCurrent).message)
                     }
                 }

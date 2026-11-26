@@ -23,7 +23,6 @@ private struct BoxedRandomNumberGenerator: RandomNumberGenerator {
 /// Pure playback queue navigation state machine shared by FloatingMiniPlayer, FullPlayerView,
 /// lock-screen remote commands, and gapless preloading.
 final class QueueNavigator {
-    static let previousRestartThresholdMs: Int64 = 5_000
     static let maxShuffleHistoryBehind = 200
 
     private var shuffleTimeline: [Int] = []
@@ -299,6 +298,42 @@ final class QueueNavigator {
         }
     }
 
+    func peekNextIndexForFailureAutoSkip(queueSize: Int, currentIndex: Int, mode: RepeatMode) -> Int? {
+        guard queueSize > 1 && currentIndex >= 0 && currentIndex < queueSize else { return nil }
+        switch mode {
+        case .sequential:
+            return (currentIndex + 1 < queueSize) ? (currentIndex + 1) : nil
+        case .listLoop, .singleLoop:
+            return (currentIndex + 1) % queueSize
+        case .shuffle:
+            return peekNextIndexForAutoAdvance(queueSize: queueSize, currentIndex: currentIndex, mode: .shuffle)
+        }
+    }
+
+    func navigateNextOnFailure(queueSize: Int, currentIndex: Int, mode: RepeatMode) -> QueueNavigationOutcome {
+        guard queueSize > 1 && currentIndex >= 0 && currentIndex < queueSize else {
+            return .stopAtEnd(message: nil)
+        }
+        switch mode {
+        case .sequential:
+            if currentIndex + 1 < queueSize {
+                return .switchTo(currentIndex + 1)
+            }
+            return .stopAtEnd(message: nil)
+        case .listLoop, .singleLoop:
+            return .switchTo((currentIndex + 1) % queueSize)
+        case .shuffle:
+            ensureUpcomingShuffleItem(queueSize: queueSize, currentIndex: currentIndex)
+            if shuffleCursor + 1 < shuffleTimeline.count {
+                shuffleCursor += 1
+                let target = shuffleTimeline[shuffleCursor]
+                trimHistoryIfNeeded()
+                return .switchTo(target)
+            }
+            return .stopAtEnd(message: nil)
+        }
+    }
+
     func navigateNext(
         queueSize: Int,
         currentIndex: Int,
@@ -354,14 +389,11 @@ final class QueueNavigator {
         queueSize: Int,
         currentIndex: Int,
         mode: RepeatMode,
-        positionMs: Int64
+        positionMs: Int64 = 0
     ) -> QueueNavigationOutcome {
+        _ = positionMs
         guard queueSize > 0 && currentIndex >= 0 && currentIndex < queueSize else {
             return .noOp
-        }
-
-        if positionMs > Self.previousRestartThresholdMs {
-            return .restartCurrent(message: nil)
         }
 
         if queueSize == 1 {

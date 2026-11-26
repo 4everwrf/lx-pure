@@ -14,7 +14,13 @@ final class NetworkQualityAdvisor: @unchecked Sendable {
     private var _isConnected = true
     private var _isMetered = false
 
-    init(startMonitoring: Bool = true) {
+    init(
+        startMonitoring: Bool = true,
+        initialConnected: Bool = true,
+        initialMetered: Bool = false
+    ) {
+        self._isConnected = initialConnected
+        self._isMetered = initialMetered
         if startMonitoring {
             let pathMonitor = NWPathMonitor()
             pathMonitor.pathUpdateHandler = { [weak self] path in

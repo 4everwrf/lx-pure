@@ -42,9 +42,9 @@ class QueueNavigationTest {
         assertTrue(nav.willAutoAdvanceOnEnd(3, 0, RepeatMode.SEQUENTIAL))
         assertEquals(1, nav.peekNextIndexForAutoAdvance(3, 0, RepeatMode.SEQUENTIAL))
 
-        // Previous at index 0: >5s rewinds silently, <=5s restarts with boundary toast
+        // Previous at index 0: always restarts with boundary toast regardless of playback progress
         assertEquals(
-            QueueNavigationOutcome.RestartCurrent(null),
+            QueueNavigationOutcome.RestartCurrent("已是第一首，已重新播放"),
             nav.navigatePrevious(3, 0, RepeatMode.SEQUENTIAL, positionMs = 5_001L)
         )
         assertEquals(
@@ -66,6 +66,10 @@ class QueueNavigationTest {
         assertEquals(
             QueueNavigationOutcome.SwitchTo(0),
             nav.navigatePrevious(3, 1, RepeatMode.SEQUENTIAL, positionMs = 1_500L)
+        )
+        assertEquals(
+            QueueNavigationOutcome.SwitchTo(0),
+            nav.navigatePrevious(3, 1, RepeatMode.SEQUENTIAL, positionMs = 15_000L)
         )
         assertEquals(
             QueueNavigationOutcome.SwitchTo(2),
@@ -148,11 +152,10 @@ class QueueNavigationTest {
             assertNull("peek for $mode", nav.peekNextIndexForAutoAdvance(1, 0, mode))
             assertEquals(mode != RepeatMode.SEQUENTIAL, nav.willAutoAdvanceOnEnd(1, 0, mode))
 
-            // Previous >5s rewinds silently; <=5s restarts with message
-            assertEquals(
-                QueueNavigationOutcome.RestartCurrent(null),
-                nav.navigatePrevious(1, 0, mode, positionMs = 12_000L)
-            )
+            // Previous always restarts with boundary message when queue has 1 track, regardless of position
+            val prevOutcomeOver5s = nav.navigatePrevious(1, 0, mode, positionMs = 12_000L)
+            assertTrue(prevOutcomeOver5s is QueueNavigationOutcome.RestartCurrent)
+            assertTrue((prevOutcomeOver5s as QueueNavigationOutcome.RestartCurrent).message != null)
             val prevOutcome = nav.navigatePrevious(1, 0, mode, positionMs = 1_000L)
             assertTrue(prevOutcome is QueueNavigationOutcome.RestartCurrent)
             assertTrue((prevOutcome as QueueNavigationOutcome.RestartCurrent).message != null)

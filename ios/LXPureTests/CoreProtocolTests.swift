@@ -1188,18 +1188,26 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertEqual(RepeatMode.singleLoop.next(), .listLoop)
         XCTAssertEqual(RepeatMode.sequential.label, "顺序播放")
 
-        // Sequential boundaries
+        // Sequential boundaries (Previous always navigates directly regardless of positionMs)
         let nav = QueueNavigator(rng: SeededRNG(seed: 42))
         nav.onQueueReplaced(queueSize: 3, startIndex: 0, mode: .sequential)
         XCTAssertFalse(nav.canSkipPrevious(queueSize: 3, currentIndex: 0, mode: .sequential))
         XCTAssertTrue(nav.canSkipNext(queueSize: 3, currentIndex: 0, mode: .sequential))
         XCTAssertEqual(
             nav.navigatePrevious(queueSize: 3, currentIndex: 0, mode: .sequential, positionMs: 5_001),
-            .restartCurrent(message: nil)
+            .restartCurrent(message: "已是第一首，已重新播放")
         )
         XCTAssertEqual(
             nav.navigatePrevious(queueSize: 3, currentIndex: 0, mode: .sequential, positionMs: 5_000),
             .restartCurrent(message: "已是第一首，已重新播放")
+        )
+        XCTAssertEqual(
+            nav.navigatePrevious(queueSize: 3, currentIndex: 2, mode: .sequential, positionMs: 12_000),
+            .switchTo(1)
+        )
+        XCTAssertEqual(
+            nav.navigatePrevious(queueSize: 3, currentIndex: 2, mode: .sequential, positionMs: 1_500),
+            .switchTo(1)
         )
         XCTAssertEqual(
             nav.navigateNext(queueSize: 3, currentIndex: 2, mode: .sequential, isAutoAdvance: false),

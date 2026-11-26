@@ -119,7 +119,8 @@ class AppContainer(application: Application) {
         dao = database.userApiDao(),
         httpClient = httpClient,
         aggregator = musicAggregator,
-        networkAdvisor = networkQualityAdvisor
+        networkAdvisor = networkQualityAdvisor,
+        streamHttpClient = streamHttpClient
     )
     val localMusicScanner: LocalMusicScanner = LocalMusicScanner(application)
     val downloadManager: DownloadManager = DownloadManager(

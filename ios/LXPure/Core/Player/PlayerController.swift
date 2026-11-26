@@ -53,6 +53,7 @@ private struct PreloadedNextItem {
     let track: Track
     let playbackURL: URL
     let isRemote: Bool
+    let prebuiltAsset: AVURLAsset?
     let quality: AudioQuality?
     let qualityBadge: String
     let providerName: String
@@ -103,6 +104,7 @@ final class PlayerController: ObservableObject {
     private let userApiManager: UserApiManager
     private let musicAggregator: MusicAggregator
     private let downloadManager: DownloadManager
+    private let autoSkipDelayNs: UInt64
 
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
@@ -141,7 +143,8 @@ final class PlayerController: ObservableObject {
     private var failedSourceTracksForCurrentTrack = Set<String>()
     private var failedTrackIdsForCurrentTrack = Set<String>()
     private var runtimeRetryCount = 0
-    private var consecutiveAutoSkipCount = 0
+    private var autoSkippedTrackIndices = Set<Int>()
+    private var allowAutoSkipForCurrentLoad = true
     private var isRecoveringError = false
     private var resumeAfterInterruption = false
     private var hasUserInitiatedPlayback = false
@@ -167,7 +170,8 @@ final class PlayerController: ObservableObject {
         playbackSessionStore: PlaybackSessionStore,
         userApiManager: UserApiManager,
         musicAggregator: MusicAggregator,
-        downloadManager: DownloadManager
+        downloadManager: DownloadManager,
+        autoSkipDelayNs: UInt64 = 1_200_000_000
     ) {
         self.networkAdvisor = networkAdvisor
         self.audioCacheManager = audioCacheManager
@@ -177,6 +181,7 @@ final class PlayerController: ObservableObject {
         self.userApiManager = userApiManager
         self.musicAggregator = musicAggregator
         self.downloadManager = downloadManager
+        self.autoSkipDelayNs = autoSkipDelayNs
 
         player.automaticallyWaitsToMinimizeStalling = true
         configureAudioSession()
@@ -438,7 +443,7 @@ final class PlayerController: ObservableObject {
             // Avoid cancelling and restarting an identical in-flight stream resolution on rapid double-taps
             return
         }
-        consecutiveAutoSkipCount = 0
+        autoSkippedTrackIndices.removeAll()
         pendingQualityOverride = nil
         clearPreloadedNext()
         queueNavigator.onQueueReplaced(queueSize: tracks.count, startIndex: safeIndex, mode: state.repeatMode)
@@ -457,7 +462,7 @@ final class PlayerController: ObservableObject {
     func selectQueueIndex(_ index: Int) {
         guard index >= 0 && index < state.queue.count else { return }
         hasUserInitiatedPlayback = true
-        consecutiveAutoSkipCount = 0
+        autoSkippedTrackIndices.removeAll()
         pendingQualityOverride = nil
         clearPreloadedNext()
         queueNavigator.onManualSelectIndex(
@@ -481,6 +486,7 @@ final class PlayerController: ObservableObject {
             playTracks([track], startIndex: 0)
             return
         }
+        cancelPendingAutoSkipCountdown()
         var updated = state.queue
         let existingIdx = updated.firstIndex(where: { $0.id == track.id })
         if existingIdx == state.currentIndex {
@@ -495,6 +501,7 @@ final class PlayerController: ObservableObject {
         }
         let insertIdx = min(state.currentIndex + 1, updated.count)
         updated.insert(track, at: insertIdx)
+        autoSkippedTrackIndices.removeAll()
         state.queue = updated
         queueNavigator.onTrackInsertedAsPlayNext(
             oldRemovedIndex: existingIdx,
@@ -538,6 +545,8 @@ final class PlayerController: ObservableObject {
     func removeFromQueue(at index: Int) {
         hasUserInitiatedPlayback = true
         guard index >= 0 && index < state.queue.count else { return }
+        cancelPendingAutoSkipCountdown()
+        autoSkippedTrackIndices.removeAll()
         let removingCurrent = (index == state.currentIndex)
         state.queue.remove(at: index)
         clearPreloadedNext()
@@ -597,12 +606,14 @@ final class PlayerController: ObservableObject {
         if recoveryTask != nil && resolveTask == nil && !isRecoveringError && !state.isPlaying && !state.isBuffering {
             recoveryTask?.cancel()
             recoveryTask = nil
+            autoSkippedTrackIndices.removeAll()
             let resumeMs = max(progress.positionMs, pendingResumePositionMs)
             loadAndPlayCurrent(resetRecoveryState: true, seekToMs: resumeMs)
             return
         }
         if resolveTask != nil || recoveryTask != nil || isRecoveringError {
             wantsPlayback = false
+            autoSkippedTrackIndices.removeAll()
             resolveTask?.cancel()
             resolveTask = nil
             recoveryTask?.cancel()
@@ -716,7 +727,7 @@ final class PlayerController: ObservableObject {
     func next(isAutoAdvance: Bool = false) {
         guard !state.queue.isEmpty else { return }
         hasUserInitiatedPlayback = true
-        if !isAutoAdvance { consecutiveAutoSkipCount = 0 }
+        if !isAutoAdvance { autoSkippedTrackIndices.removeAll() }
 
         // Check preloaded next first only if it matches QueueNavigator's exact peeked next index
         let expectedPeek: Int? = (preloadedNext != nil && state.repeatMode != .singleLoop)
@@ -733,6 +744,7 @@ final class PlayerController: ObservableObject {
            preloaded.nextIndex < state.queue.count,
            preloaded.track.id == state.queue[preloaded.nextIndex].id,
            (!preloaded.isRemote || Date().timeIntervalSince(preloaded.createdAt) <= Self.preloadMaxAgeSec) {
+            let preloadedAsset = preloaded.prebuiltAsset
             queueNavigator.onPromotedPreloadedNext(
                 queueSize: state.queue.count,
                 promotedIndex: preloaded.nextIndex,
@@ -742,12 +754,13 @@ final class PlayerController: ObservableObject {
             resolveTask = nil
             recoveryTask?.cancel()
             recoveryTask = nil
-            clearPreloadedNext()
+            clearPreloadedNext(cancelAssetLoading: false)
             activeLoadToken = UUID()
             failedSourcePlatformsForCurrentTrack.removeAll()
             failedSourceTracksForCurrentTrack.removeAll()
             failedTrackIdsForCurrentTrack.removeAll()
             runtimeRetryCount = 0
+            allowAutoSkipForCurrentLoad = true
             isRecoveringError = false
             lastRecoveryStartPositionMs = 0
             pendingResumePositionMs = 0
@@ -765,6 +778,7 @@ final class PlayerController: ObservableObject {
                 track: preloaded.track,
                 url: preloaded.playbackURL,
                 isRemote: preloaded.isRemote,
+                prebuiltAsset: preloadedAsset,
                 quality: preloaded.quality,
                 qualityBadge: preloaded.qualityBadge,
                 providerName: preloaded.providerName,
@@ -815,7 +829,7 @@ final class PlayerController: ObservableObject {
         )
         switch outcome {
         case .switchTo(let prevIdx):
-            consecutiveAutoSkipCount = 0
+            autoSkippedTrackIndices.removeAll()
             pendingQualityOverride = nil
             state.currentIndex = prevIdx
             state.positionMs = 0
@@ -825,7 +839,7 @@ final class PlayerController: ObservableObject {
             persistCursor(force: true)
             loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
         case .restartCurrent(let msg):
-            consecutiveAutoSkipCount = 0
+            autoSkippedTrackIndices.removeAll()
             restartCurrentTrack(forcePlay: msg != nil, message: msg)
         case .stayAtBoundary(let msg):
             events.send(PlayerUiEvent(message: msg))
@@ -951,7 +965,7 @@ final class PlayerController: ObservableObject {
         pendingInitialSeekMs = nil
         pendingResumePositionMs = 0
         lastRecoveryStartPositionMs = 0
-        consecutiveAutoSkipCount = 0
+        autoSkippedTrackIndices.removeAll()
 
         // Detach the ended item cleanly instead of issuing an unguarded async seek(to: .zero),
         // eliminating timeObserver/timeControl races and expired-URL auto-recovery.
@@ -970,6 +984,7 @@ final class PlayerController: ObservableObject {
     }
 
     func cycleRepeatMode() {
+        cancelPendingAutoSkipCountdown()
         let nextMode = state.repeatMode.next()
         state.repeatMode = nextMode
         queueNavigator.onModeChanged(
@@ -984,6 +999,7 @@ final class PlayerController: ObservableObject {
     }
 
     func changePreferredQuality(_ quality: AudioQuality) {
+        autoSkippedTrackIndices.removeAll()
         settingsStore.update { $0.preferredQuality = quality }
         clearPreloadedNext()
         guard let track = state.currentTrack, !track.isLocal else { return }
@@ -1016,6 +1032,7 @@ final class PlayerController: ObservableObject {
             events.send(PlayerUiEvent(message: "当前播放本地音频，无需切换在线音源"))
             return
         }
+        autoSkippedTrackIndices.removeAll()
         let sourceName = userApiManager.sources.first(where: { $0.id == sourceId })?.name ?? "指定音源"
         userApiManager.clearCooldowns(forSourceId: sourceId)
         let resumePos = max(progress.positionMs, pendingResumePositionMs)
@@ -1024,7 +1041,8 @@ final class PlayerController: ObservableObject {
             resetRecoveryState: true,
             seekToMs: resumePos,
             preferredSourceId: sourceId,
-            bypassOfflineCache: true
+            bypassOfflineCache: true,
+            allowAutoSkipOnFailure: false
         )
     }
 
@@ -1034,6 +1052,7 @@ final class PlayerController: ObservableObject {
             events.send(PlayerUiEvent(message: "当前播放本地音频，无需换源"))
             return
         }
+        autoSkippedTrackIndices.removeAll()
         let curSid = activeStreamSourceId ?? state.activeStreamSourceId
         let curPlat = activeResolvedPlatformCode ?? track.source.code
         let curResolvedId = activeResolvedTrackId ?? track.id
@@ -1115,13 +1134,17 @@ final class PlayerController: ObservableObject {
         preferredSourceId: String? = nil,
         qualityOverride: AudioQuality? = nil,
         preserveExclusions: Bool = false,
-        bypassOfflineCache: Bool = false
+        bypassOfflineCache: Bool = false,
+        allowAutoSkipOnFailure: Bool = true
     ) {
         guard let track = state.currentTrack else { return }
 
         let effectiveQualityOverride = qualityOverride ?? pendingQualityOverride
         pendingQualityOverride = nil
         let previousActiveSourceId = activeStreamSourceId
+        if resetRecoveryState {
+            allowAutoSkipForCurrentLoad = !preserveExclusions && allowAutoSkipOnFailure
+        }
 
         resolveTask?.cancel()
         resolveTask = nil
@@ -1236,7 +1259,36 @@ final class PlayerController: ObservableObject {
             }
             let targetQuality = qualityDecision.quality
 
-            // 4. Resolve online stream via UserApiManager (priority-aware + scoped cache lookup after resolution)
+            // 4. Fast pre-resolution scoped disk cache lookup for active/ready sources
+            if resetRecoveryState && !preserveExclusions && !bypassOfflineCache {
+                if let cacheHit = await self.findPreResolutionCacheHit(
+                    track: track,
+                    targetQuality: targetQuality,
+                    preferredSourceId: preferredSourceId
+                ) {
+                    guard self.activeLoadToken == loadToken else { return }
+                    if qualityDecision.downgradedForCellular {
+                        self.events.send(PlayerUiEvent(message: "当前为移动网络，已智能省流切换 \(cacheHit.quality.badge)"))
+                    }
+                    self.playPreparedTrack(
+                        track: track,
+                        url: cacheHit.url,
+                        isRemote: false,
+                        quality: cacheHit.quality,
+                        qualityBadge: "\(cacheHit.quality.badge) · 缓存",
+                        providerName: cacheHit.source.name,
+                        sourceId: cacheHit.source.id,
+                        resolvedTrackId: track.id,
+                        resolvedPlatformCode: track.source.code,
+                        cacheKey: cacheHit.cacheKey,
+                        seekToMs: self.pendingResumePositionMs
+                    )
+                    return
+                }
+                guard self.activeLoadToken == loadToken else { return }
+            }
+
+            // 5. Resolve online stream via UserApiManager (racing + scoped cache lookup after resolution)
             let result = await self.userApiManager.resolveStream(
                 track: track,
                 preferredQuality: targetQuality,
@@ -1319,16 +1371,61 @@ final class PlayerController: ObservableObject {
                     track: track,
                     message: msg,
                     openSourceManager: noSource,
-                    allowAutoSkip: !preserveExclusions
+                    allowAutoSkip: self.allowAutoSkipForCurrentLoad
                 )
             }
         }
+    }
+
+    private func findPreResolutionCacheHit(
+        track: Track,
+        targetQuality: AudioQuality,
+        preferredSourceId: String?
+    ) async -> (url: URL, source: UserApiSource, quality: AudioQuality, cacheKey: String)? {
+        guard !track.isLocal, !failedTrackIdsForCurrentTrack.contains(track.id) else { return nil }
+        let readySources = userApiManager.readySourcesSnapshot(preferredSourceId: preferredSourceId)
+        guard !readySources.isEmpty else { return nil }
+
+        let qualityChain = AudioQuality.fallbackChain(preferred: targetQuality)
+        let platformCode = track.source.code.lowercased()
+        var candidates: [(source: UserApiSource, quality: AudioQuality, cacheKey: String)] = []
+
+        for quality in qualityChain {
+            for source in readySources {
+                guard let supported = source.supportedPlatforms[platformCode] else { continue }
+                let supportsTier = supported.contains(quality.lxType) ||
+                    (supported.isEmpty && quality == .q128k)
+                if !supportsTier { continue }
+
+                let platKey = UserApiManager.sourcePlatformKey(sourceId: source.id, platformCode: platformCode)
+                if failedSourcePlatformsForCurrentTrack.contains(platKey) { continue }
+                let trackKey = UserApiManager.sourceTrackKey(sourceId: source.id, trackId: track.id)
+                if failedSourceTracksForCurrentTrack.contains(trackKey) { continue }
+
+                let revision = UserApiManager.computeSourceRevision(for: source)
+                let key = AudioCacheManager.cacheKey(
+                    trackId: track.id,
+                    resolvedTrackId: track.id,
+                    sourceId: source.id,
+                    sourceRevision: revision,
+                    quality: quality
+                )
+                candidates.append((source: source, quality: quality, cacheKey: key))
+            }
+        }
+
+        guard !candidates.isEmpty else { return nil }
+        let keys = candidates.map(\.cacheKey)
+        guard let hit = await audioCacheManager.firstCachedFileAsync(for: keys) else { return nil }
+        let matched = candidates[hit.index]
+        return (url: hit.url, source: matched.source, quality: matched.quality, cacheKey: matched.cacheKey)
     }
 
     private func playPreparedTrack(
         track: Track,
         url: URL,
         isRemote: Bool,
+        prebuiltAsset: AVURLAsset? = nil,
         quality: AudioQuality?,
         qualityBadge: String,
         providerName: String,
@@ -1367,18 +1464,11 @@ final class PlayerController: ObservableObject {
             loadMetadataAndVisuals(for: track)
         }
 
-        let asset: AVURLAsset
-        if isRemote {
-            asset = AVURLAsset(url: url, options: [
-                "AVURLAssetHTTPHeaderFieldsKey": [
-                    "User-Agent": Self.chromeUserAgent
-                ]
-            ])
-        } else {
-            asset = AVURLAsset(url: url)
-        }
-
+        let asset = prebuiltAsset ?? Self.makeURLAsset(url: url, isRemote: isRemote)
         let item = AVPlayerItem(asset: asset)
+        if isRemote {
+            item.preferredForwardBufferDuration = 8.0
+        }
         pendingInitialSeekMs = effectiveSeekMs > 0 ? effectiveSeekMs : nil
         if effectiveSeekMs > 0 {
             state.positionMs = effectiveSeekMs
@@ -1460,6 +1550,14 @@ final class PlayerController: ObservableObject {
         }
     }
 
+    private func cancelPendingAutoSkipCountdown() {
+        guard recoveryTask != nil && resolveTask == nil && !isRecoveringError else { return }
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        activeLoadToken = UUID()
+        autoSkippedTrackIndices.removeAll()
+    }
+
     private func handleResolutionFailure(
         track: Track,
         message: String,
@@ -1474,30 +1572,73 @@ final class PlayerController: ObservableObject {
         updateNowPlayingInfo()
 
         if openSourceManager {
+            autoSkippedTrackIndices.removeAll()
             events.send(PlayerUiEvent(message: message, actionLabel: "导入音源", openSourceManager: true))
             return
         }
 
-        events.send(PlayerUiEvent(message: message))
-
-        // Auto-skip next if in a multi-track queue and another track exists (never skip past SEQUENTIAL end,
-        // never loop singleLoop, never auto-skip while offline or after manual alternate-source exhaustion)
-        if allowAutoSkip &&
+        let canAttemptAutoSkip = !track.isLocal &&
+            allowAutoSkip &&
             networkAdvisor.isNetworkConnected() &&
-            state.repeatMode != .singleLoop &&
-            queueNavigator.canSkipNext(
-                queueSize: state.queue.count,
-                currentIndex: state.currentIndex,
-                mode: state.repeatMode
-            ) &&
-            consecutiveAutoSkipCount < PlaybackRecoveryPolicy.maxConsecutiveAutoSkips {
-            consecutiveAutoSkipCount += 1
-            recoveryTask?.cancel()
-            recoveryTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 1_200_000_000)
-                guard !Task.isCancelled, let self else { return }
-                self.recoveryTask = nil
-                self.next(isAutoAdvance: true)
+            state.queue.indices.contains(state.currentIndex)
+
+        if canAttemptAutoSkip {
+            var candidateSkipped = autoSkippedTrackIndices
+            candidateSkipped.insert(state.currentIndex)
+            let cap = PlaybackRecoveryPolicy.maxAutoSkipCount(queueSize: state.queue.count)
+            if candidateSkipped.count < cap,
+               let targetIdx = queueNavigator.peekNextIndexForFailureAutoSkip(
+                   queueSize: state.queue.count,
+                   currentIndex: state.currentIndex,
+                   mode: state.repeatMode
+               ),
+               !candidateSkipped.contains(targetIdx) {
+                autoSkippedTrackIndices = candidateSkipped
+                events.send(PlayerUiEvent(message: "《\(track.title)》暂无可用音源，已自动跳至下一首"))
+                let failedLoadToken = activeLoadToken
+                let delayNs = autoSkipDelayNs
+                recoveryTask?.cancel()
+                recoveryTask = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: delayNs)
+                    guard !Task.isCancelled, let self else { return }
+                    self.recoveryTask = nil
+                    guard self.activeLoadToken == failedLoadToken else { return }
+                    self.performAutoSkipAfterFailure()
+                }
+                return
+            } else {
+                autoSkippedTrackIndices.removeAll()
+                events.send(PlayerUiEvent(message: "《\(track.title)》暂无可用音源，已停止播放"))
+                return
+            }
+        }
+
+        autoSkippedTrackIndices.removeAll()
+        events.send(PlayerUiEvent(message: message))
+    }
+
+    private func performAutoSkipAfterFailure() {
+        guard !state.queue.isEmpty else { return }
+        let outcome = queueNavigator.navigateNextOnFailure(
+            queueSize: state.queue.count,
+            currentIndex: state.currentIndex,
+            mode: state.repeatMode
+        )
+        switch outcome {
+        case .switchTo(let nextIdx):
+            guard state.queue.indices.contains(nextIdx) else { return }
+            pendingQualityOverride = nil
+            state.currentIndex = nextIdx
+            state.positionMs = 0
+            syncNavigationCapabilities()
+            progress.positionMs = 0
+            progress.durationMs = state.queue[nextIdx].durationMs
+            persistCursor(force: true)
+            loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+        case .stopAtEnd, .restartCurrent, .stayAtBoundary, .noOp:
+            autoSkippedTrackIndices.removeAll()
+            if let track = state.currentTrack {
+                events.send(PlayerUiEvent(message: "《\(track.title)》暂无可用音源，已停止播放"))
             }
         }
     }
@@ -1524,7 +1665,13 @@ final class PlayerController: ObservableObject {
         let kind = PlaybackRecoveryPolicy.classify(error: error, httpStatusCode: normalizedCode)
 
         guard runtimeRetryCount < PlaybackRecoveryPolicy.maxRuntimeRetries else {
-            handleResolutionFailure(track: track, message: "《\(track.title)》播放中断，已尝试切换其他音源")
+            let noSource = !userApiManager.hasReadySource()
+            handleResolutionFailure(
+                track: track,
+                message: "《\(track.title)》播放中断，已尝试切换其他音源",
+                openSourceManager: noSource,
+                allowAutoSkip: allowAutoSkipForCurrentLoad
+            )
             return
         }
 
@@ -1632,17 +1779,20 @@ final class PlayerController: ObservableObject {
                       ) == nextIdx,
                       nextIdx < self.state.queue.count,
                       self.state.queue[nextIdx].id == nextTrack.id else {
+                    item.prebuiltAsset?.cancelLoading()
                     return
                 }
+                item.prebuiltAsset?.loadValuesAsynchronously(forKeys: ["playable", "duration"], completionHandler: nil)
                 self.preloadedNext = item
             }
 
             if nextTrack.isLocal, let localUri = nextTrack.localUri {
                 let localUrl = Self.resolveLocalFileURL(from: localUri)
                 if FileManager.default.fileExists(atPath: localUrl.path) {
+                    let asset = Self.makeURLAsset(url: localUrl, isRemote: false)
                     commitIfStillValid(PreloadedNextItem(
                         forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
-                        playbackURL: localUrl, isRemote: false, quality: nil,
+                        playbackURL: localUrl, isRemote: false, prebuiltAsset: asset, quality: nil,
                         qualityBadge: "LOCAL", providerName: "本地音乐",
                         sourceId: nil, resolvedTrackId: nextTrack.id, resolvedPlatformCode: nextTrack.source.code,
                         cacheKey: nil, createdAt: Date()
@@ -1652,9 +1802,11 @@ final class PlayerController: ObservableObject {
             }
 
             if let offlineUrl = await self.downloadManager.localCachedFileURL(for: nextTrack.id) {
+                guard !Task.isCancelled else { return }
+                let asset = Self.makeURLAsset(url: offlineUrl, isRemote: false)
                 commitIfStillValid(PreloadedNextItem(
                     forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
-                    playbackURL: offlineUrl, isRemote: false, quality: nil,
+                    playbackURL: offlineUrl, isRemote: false, prebuiltAsset: asset, quality: nil,
                     qualityBadge: "离线", providerName: "已离线保存",
                     sourceId: nil, resolvedTrackId: nextTrack.id, resolvedPlatformCode: nextTrack.source.code,
                     cacheKey: nil, createdAt: Date()
@@ -1682,9 +1834,10 @@ final class PlayerController: ObservableObject {
                 )
                 if let cachedUrl = await self.audioCacheManager.cachedFileURLAsync(for: key) {
                     guard !Task.isCancelled else { return }
+                    let asset = Self.makeURLAsset(url: cachedUrl, isRemote: false)
                     commitIfStillValid(PreloadedNextItem(
                         forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
-                        playbackURL: cachedUrl, isRemote: false, quality: resolved.quality,
+                        playbackURL: cachedUrl, isRemote: false, prebuiltAsset: asset, quality: resolved.quality,
                         qualityBadge: "\(resolved.quality.badge) · 缓存", providerName: resolved.providerName,
                         sourceId: resolved.sourceId, resolvedTrackId: resolved.resolvedTrack.id,
                         resolvedPlatformCode: resolved.resolvedTrack.source.code,
@@ -1692,9 +1845,10 @@ final class PlayerController: ObservableObject {
                     ))
                     return
                 }
+                let asset = Self.makeURLAsset(url: url, isRemote: true)
                 commitIfStillValid(PreloadedNextItem(
                     forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
-                    playbackURL: url, isRemote: true, quality: resolved.quality,
+                    playbackURL: url, isRemote: true, prebuiltAsset: asset, quality: resolved.quality,
                     qualityBadge: resolved.quality.badge, providerName: resolved.providerName,
                     sourceId: resolved.sourceId, resolvedTrackId: resolved.resolvedTrack.id,
                     resolvedPlatformCode: resolved.resolvedTrack.source.code,
@@ -1704,11 +1858,26 @@ final class PlayerController: ObservableObject {
         }
     }
 
-    private func clearPreloadedNext() {
+    private func clearPreloadedNext(cancelAssetLoading: Bool = true) {
         preloadTask?.cancel()
         preloadTask = nil
+        if cancelAssetLoading {
+            preloadedNext?.prebuiltAsset?.cancelLoading()
+        }
         preloadedNext = nil
         preloadAttemptedForTrackId = nil
+    }
+
+    private nonisolated static func makeURLAsset(url: URL, isRemote: Bool) -> AVURLAsset {
+        if isRemote {
+            return AVURLAsset(url: url, options: [
+                "AVURLAssetHTTPHeaderFieldsKey": [
+                    "User-Agent": chromeUserAgent
+                ]
+            ])
+        } else {
+            return AVURLAsset(url: url)
+        }
     }
 
     // MARK: - Metadata, Cover, Lyrics & Ambient Palette
@@ -1850,7 +2019,7 @@ final class PlayerController: ObservableObject {
 
         center.previousTrackCommand.isEnabled = true
         let prevToken = center.previousTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.previous() }
+            Task { @MainActor in self?.handleRemotePreviousTrackCommand() }
             return .success
         }
         remoteCommandTargets.append((center.previousTrackCommand, prevToken))
@@ -1865,6 +2034,15 @@ final class PlayerController: ObservableObject {
         remoteCommandTargets.append((center.changePlaybackPositionCommand, seekToken))
     }
 
+    func handleRemotePreviousTrackCommand() {
+        previous()
+    }
+
+    func simulateRuntimeErrorForTesting(error: Error? = nil) {
+        guard let item = player.currentItem else { return }
+        handleRuntimePlaybackError(item: item, error: error)
+    }
+
     private func observePlayerState() {
         timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in
@@ -1876,7 +2054,7 @@ final class PlayerController: ObservableObject {
                     self.bufferingWatchdogTask = nil
                     self.state.isPlaying = true
                     self.state.isBuffering = false
-                    self.consecutiveAutoSkipCount = 0
+                    self.autoSkippedTrackIndices.removeAll()
                     self.startPendingBackgroundCacheIfNeeded()
                 case .waitingToPlayAtSpecifiedRate:
                     if self.player.currentItem != nil {
@@ -2228,7 +2406,8 @@ final class PlayerController: ObservableObject {
         failedSourceTracksForCurrentTrack.removeAll()
         failedTrackIdsForCurrentTrack.removeAll()
         runtimeRetryCount = 0
-        consecutiveAutoSkipCount = 0
+        autoSkippedTrackIndices.removeAll()
+        allowAutoSkipForCurrentLoad = true
         visualsTrackId = nil
         lyricsLoadedForTrackId = nil
         cachedArtworkImage = nil

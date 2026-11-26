@@ -32,7 +32,6 @@ class QueueNavigator(
     private val random: Random = Random.Default
 ) {
     companion object {
-        const val PREVIOUS_RESTART_THRESHOLD_MS = 5_000L
         const val MAX_SHUFFLE_HISTORY_BEHIND = 200
     }
 
@@ -371,14 +370,10 @@ class QueueNavigator(
         queueSize: Int,
         currentIndex: Int,
         mode: RepeatMode,
-        positionMs: Long
+        @Suppress("UNUSED_PARAMETER") positionMs: Long = 0L
     ): QueueNavigationOutcome {
         if (queueSize <= 0 || currentIndex !in 0 until queueSize) {
             return QueueNavigationOutcome.NoOp
-        }
-
-        if (positionMs > PREVIOUS_RESTART_THRESHOLD_MS) {
-            return QueueNavigationOutcome.RestartCurrent(null)
         }
 
         if (queueSize == 1) {

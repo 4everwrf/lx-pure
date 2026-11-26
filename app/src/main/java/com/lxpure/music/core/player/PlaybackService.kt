@@ -43,6 +43,7 @@ import java.io.FileNotFoundException
 class PlaybackService : MediaSessionService() {
     companion object {
         internal const val HINT_INTERNAL_CONTROLLER = "com.lxpure.music.INTERNAL_CONTROLLER"
+        internal const val BUFFER_FOR_PLAYBACK_MS = 700
         private val mainHandler = Handler(Looper.getMainLooper())
 
         @Volatile
@@ -123,12 +124,12 @@ class PlaybackService : MediaSessionService() {
         val mediaSourceFactory = DefaultMediaSourceFactory(cachedDataSourceFactory)
             .setLoadErrorHandlingPolicy(FastFailLoadErrorHandlingPolicy())
 
-        // Balanced load control: 1.5s fast start, 15s-30s anti-jitter buffer, capped at 10 MB RAM
+        // Balanced load control: 700ms fast start, 15s-30s anti-jitter buffer, capped at 10 MB RAM
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 /* minBufferMs = */ 15_000,
                 /* maxBufferMs = */ 30_000,
-                /* bufferForPlaybackMs = */ 1_500,
+                /* bufferForPlaybackMs = */ BUFFER_FOR_PLAYBACK_MS,
                 /* bufferForPlaybackAfterRebufferMs = */ 3_000
             )
             .setTargetBufferBytes(10 * 1024 * 1024)
@@ -178,63 +179,16 @@ class PlaybackService : MediaSessionService() {
             return builder.build()
         }
 
-        val forwardingPlayer = object : ForwardingPlayer(exoPlayer) {
-            override fun addListener(listener: Player.Listener) {
-                val proxy = synchronized(wrappedListeners) {
-                    wrappedListeners.getOrPut(listener) {
-                        CommandOverridingPlayerListener(
-                            delegate = listener,
-                            transformCommands = ::computeForwardingCommands
-                        )
-                    }
-                }
-                super.addListener(proxy)
-            }
-
-            override fun removeListener(listener: Player.Listener) {
-                val proxy = synchronized(wrappedListeners) {
-                    wrappedListeners.remove(listener)
-                } ?: listener
-                super.removeListener(proxy)
-            }
-
-            override fun getAvailableCommands(): Player.Commands {
-                return computeForwardingCommands(super.getAvailableCommands())
-            }
-
-            override fun isCommandAvailable(command: Int): Boolean {
-                val pc = app.container.playerController
-                return when (command) {
-                    Player.COMMAND_SEEK_TO_PREVIOUS -> pc.hasQueue()
-                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> pc.hasPrevious()
-                    Player.COMMAND_SEEK_TO_NEXT,
-                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> pc.hasNext()
-                    else -> super.isCommandAvailable(command)
-                }
-            }
-
-            override fun hasNextMediaItem(): Boolean = app.container.playerController.hasNext()
-            override fun hasPreviousMediaItem(): Boolean = app.container.playerController.hasPrevious()
-
-            override fun prepare() {
-                if (app.container.playerController.shouldDeferPrepareOrSeekToPlay()) return
-                super.prepare()
-            }
-
-            override fun seekToDefaultPosition() {
-                if (app.container.playerController.shouldDeferPrepareOrSeekToPlay()) return
-                super.seekToDefaultPosition()
-            }
-
-            override fun setPlayWhenReady(playWhenReady: Boolean) {
-                if (playWhenReady) {
-                    play()
-                } else {
-                    pause()
-                }
-            }
-
-            override fun pause() {
+        val forwardingPlayer = PlaybackForwardingPlayer(
+            basePlayer = exoPlayer,
+            wrappedListeners = wrappedListeners,
+            transformCommands = ::computeForwardingCommands,
+            hasQueue = { app.container.playerController.hasQueue() },
+            canSkipPrevious = { app.container.playerController.hasPrevious() },
+            canSkipNext = { app.container.playerController.hasNext() },
+            shouldDeferPrepareOrSeekToPlay = { app.container.playerController.shouldDeferPrepareOrSeekToPlay() },
+            needsReloadForCurrentTrack = { app.container.playerController.needsReloadForCurrentTrack(exoPlayer) },
+            onExternalPause = {
                 val session = mediaSession
                 val caller = session?.controllerForCurrentRequest
                 val isInternalAppController = caller != null &&
@@ -244,34 +198,12 @@ class PlaybackService : MediaSessionService() {
                 if (!isInternalAppController) {
                     app.container.playerController.onExternalPauseRequested()
                 }
-                super.pause()
-            }
-
-            override fun play() {
-                if (app.container.playerController.needsReloadForCurrentTrack(exoPlayer)) {
-                    app.container.playerController.resumeOrReloadCurrent()
-                } else {
-                    app.container.playerController.onExternalPlayRequested()
-                    super.play()
-                }
-            }
-
-            override fun seekToNext() {
-                app.container.playerController.next()
-            }
-
-            override fun seekToNextMediaItem() {
-                app.container.playerController.next()
-            }
-
-            override fun seekToPrevious() {
-                app.container.playerController.previous()
-            }
-
-            override fun seekToPreviousMediaItem() {
-                app.container.playerController.previous()
-            }
-        }
+            },
+            onExternalPlay = { app.container.playerController.onExternalPlayRequested() },
+            onResumeOrReload = { app.container.playerController.resumeOrReloadCurrent() },
+            onNext = { app.container.playerController.next() },
+            onPrevious = { app.container.playerController.previous() }
+        )
         notifyAvailableCommandsChanged = {
             val listenersSnapshot = synchronized(wrappedListeners) { wrappedListeners.keys.toList() }
             val updatedCommands = forwardingPlayer.availableCommands
@@ -363,6 +295,101 @@ class PlaybackService : MediaSessionService() {
         }
         mediaSession = null
         super.onDestroy()
+    }
+}
+
+@OptIn(UnstableApi::class)
+internal class PlaybackForwardingPlayer(
+    basePlayer: Player,
+    private val wrappedListeners: java.util.IdentityHashMap<Player.Listener, Player.Listener> = java.util.IdentityHashMap(),
+    private val transformCommands: (Player.Commands) -> Player.Commands = { it },
+    private val hasQueue: () -> Boolean,
+    private val canSkipPrevious: () -> Boolean,
+    private val canSkipNext: () -> Boolean,
+    private val shouldDeferPrepareOrSeekToPlay: () -> Boolean = { false },
+    private val needsReloadForCurrentTrack: () -> Boolean = { false },
+    private val onExternalPause: () -> Unit = {},
+    private val onExternalPlay: () -> Unit = {},
+    private val onResumeOrReload: () -> Unit = {},
+    private val onNext: () -> Unit,
+    private val onPrevious: () -> Unit
+) : ForwardingPlayer(basePlayer) {
+
+    override fun addListener(listener: Player.Listener) {
+        val proxy = synchronized(wrappedListeners) {
+            wrappedListeners.getOrPut(listener) {
+                CommandOverridingPlayerListener(
+                    delegate = listener,
+                    transformCommands = transformCommands
+                )
+            }
+        }
+        super.addListener(proxy)
+    }
+
+    override fun removeListener(listener: Player.Listener) {
+        val proxy = synchronized(wrappedListeners) {
+            wrappedListeners.remove(listener)
+        } ?: listener
+        super.removeListener(proxy)
+    }
+
+    override fun getAvailableCommands(): Player.Commands =
+        transformCommands(super.getAvailableCommands())
+
+    override fun isCommandAvailable(command: Int): Boolean = when (command) {
+        Player.COMMAND_SEEK_TO_PREVIOUS -> hasQueue()
+        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> canSkipPrevious()
+        Player.COMMAND_SEEK_TO_NEXT,
+        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> canSkipNext()
+        else -> super.isCommandAvailable(command)
+    }
+
+    override fun hasNextMediaItem(): Boolean = canSkipNext()
+    override fun hasPreviousMediaItem(): Boolean = canSkipPrevious()
+
+    override fun prepare() {
+        if (shouldDeferPrepareOrSeekToPlay()) return
+        super.prepare()
+    }
+
+    override fun seekToDefaultPosition() {
+        if (shouldDeferPrepareOrSeekToPlay()) return
+        super.seekToDefaultPosition()
+    }
+
+    override fun setPlayWhenReady(playWhenReady: Boolean) {
+        if (playWhenReady) play() else pause()
+    }
+
+    override fun pause() {
+        onExternalPause()
+        super.pause()
+    }
+
+    override fun play() {
+        if (needsReloadForCurrentTrack()) {
+            onResumeOrReload()
+        } else {
+            onExternalPlay()
+            super.play()
+        }
+    }
+
+    override fun seekToNext() {
+        onNext()
+    }
+
+    override fun seekToNextMediaItem() {
+        onNext()
+    }
+
+    override fun seekToPrevious() {
+        onPrevious()
+    }
+
+    override fun seekToPreviousMediaItem() {
+        onPrevious()
     }
 }
 

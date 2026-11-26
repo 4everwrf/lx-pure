@@ -3,6 +3,7 @@ package com.lxpure.music.core.player
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.HttpDataSource
+import com.lxpure.music.domain.model.RepeatMode
 
 enum class PlaybackErrorKind {
     TRANSIENT_NETWORK,
@@ -20,9 +21,21 @@ data class PlaybackRecoveryPlan(
     val backoffMs: Long
 )
 
+sealed class AutoSkipDecision {
+    data class SkipTo(
+        val targetIndex: Int,
+        val noticeMessage: String
+    ) : AutoSkipDecision()
+
+    data class Stop(
+        val noticeMessage: String,
+        val promptImportSource: Boolean = false
+    ) : AutoSkipDecision()
+}
+
 object PlaybackRecoveryPolicy {
     const val MAX_RUNTIME_RETRIES = 4
-    const val MAX_CONSECUTIVE_AUTO_SKIPS = 3
+    const val MAX_AUTO_SKIP_CHAIN = 10
 
     private val transientNetworkCauseNames = setOf(
         "UnknownHostException",
@@ -204,5 +217,116 @@ object PlaybackRecoveryPolicy {
         if (playbackState == Player.STATE_ENDED && playWhenReady && willAutoAdvanceOnEnd) return true
         if (hasPlayerError && canAutoRecoverFromError) return true
         return false
+    }
+
+    /**
+     * Computes the next candidate queue index when auto-skipping after all sources fail.
+     * Critically, for [RepeatMode.SINGLE_LOOP] with `queueSize > 1`, advances to `(currentIndex + 1) % queueSize`
+     * instead of restarting the unplayable track.
+     */
+    fun computeAutoSkipNextIndex(
+        queueSize: Int,
+        currentIndex: Int,
+        mode: RepeatMode,
+        queueNavigator: QueueNavigator
+    ): Int? {
+        if (queueSize <= 1 || currentIndex !in 0 until queueSize) return null
+        return when (mode) {
+            RepeatMode.SEQUENTIAL -> if (currentIndex + 1 < queueSize) currentIndex + 1 else null
+            RepeatMode.LIST_LOOP, RepeatMode.SINGLE_LOOP -> (currentIndex + 1) % queueSize
+            RepeatMode.SHUFFLE -> queueNavigator.peekNextIndexForAutoAdvance(queueSize, currentIndex, mode)
+        }
+    }
+
+    /**
+     * Resolves whether auto-skip on failure is permitted for the current playback load.
+     * Explicit manual source switches (`preserveExclusions = true` or `allowAutoSkipOnFailure = false`)
+     * disable auto-skip for the entire load, including across subsequent runtime fallback retries.
+     */
+    fun resolveAllowAutoSkipForLoad(
+        currentAllowAutoSkip: Boolean,
+        isRuntimeFallbackRetry: Boolean,
+        preserveExclusions: Boolean,
+        allowAutoSkipOnFailure: Boolean
+    ): Boolean = if (isRuntimeFallbackRetry) {
+        currentAllowAutoSkip
+    } else {
+        !preserveExclusions && allowAutoSkipOnFailure
+    }
+
+    /**
+     * Unified R3 decision for both stream-resolution failure and exhausted runtime playback retries.
+     */
+    fun decideAutoSkipOnFailure(
+        trackTitle: String,
+        isLocalTrack: Boolean,
+        hasReadySource: Boolean,
+        isNetworkConnected: Boolean,
+        preserveExclusions: Boolean,
+        allowAutoSkip: Boolean = !preserveExclusions,
+        queueSize: Int,
+        currentIndex: Int,
+        mode: RepeatMode,
+        autoSkippedIndices: Set<Int>,
+        queueNavigator: QueueNavigator,
+        fallbackErrorMessage: String? = null
+    ): AutoSkipDecision {
+        if (!hasReadySource && !isLocalTrack) {
+            return AutoSkipDecision.Stop(
+                noticeMessage = fallbackErrorMessage ?: "当前无可用自定义音源，请检查音源状态或导入音源",
+                promptImportSource = true
+            )
+        }
+        if (preserveExclusions) {
+            return AutoSkipDecision.Stop(
+                noticeMessage = "暂无其他可用音源或平台，点击播放可重新尝试默认音源",
+                promptImportSource = false
+            )
+        }
+        if (!allowAutoSkip) {
+            return AutoSkipDecision.Stop(
+                noticeMessage = fallbackErrorMessage ?: "《$trackTitle》暂无可用音源，已停止播放",
+                promptImportSource = false
+            )
+        }
+        if (isLocalTrack) {
+            return AutoSkipDecision.Stop(
+                noticeMessage = fallbackErrorMessage ?: "无法播放本地音频《$trackTitle》",
+                promptImportSource = false
+            )
+        }
+        if (!isNetworkConnected) {
+            return AutoSkipDecision.Stop(
+                noticeMessage = fallbackErrorMessage ?: "网络连接不可用，请恢复网络后重试",
+                promptImportSource = false
+            )
+        }
+
+        val updatedSkipped = autoSkippedIndices + currentIndex
+        val maxChain = minOf(queueSize, MAX_AUTO_SKIP_CHAIN)
+        if (queueSize <= 1 || updatedSkipped.size >= maxChain) {
+            return AutoSkipDecision.Stop(
+                noticeMessage = "《$trackTitle》暂无可用音源，已停止播放",
+                promptImportSource = false
+            )
+        }
+
+        val targetIndex = computeAutoSkipNextIndex(
+            queueSize = queueSize,
+            currentIndex = currentIndex,
+            mode = mode,
+            queueNavigator = queueNavigator
+        )
+        if (targetIndex == null || targetIndex in updatedSkipped || targetIndex == currentIndex) {
+            return AutoSkipDecision.Stop(
+                noticeMessage = "《$trackTitle》暂无可用音源，已停止播放",
+                promptImportSource = false
+            )
+        }
+
+        return AutoSkipDecision.SkipTo(
+            targetIndex = targetIndex,
+            noticeMessage = "《$trackTitle》暂无可用音源，已自动跳至下一首"
+        )
     }
 }

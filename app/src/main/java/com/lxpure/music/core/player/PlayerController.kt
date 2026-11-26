@@ -208,8 +208,9 @@ class PlayerController(
     private val failedSourcePlatformsForCurrentTrack = mutableSetOf<String>()
     private val failedSourceTracksForCurrentTrack = mutableSetOf<String>()
     private val failedTrackIdsForCurrentTrack = mutableSetOf<String>()
+    private val autoSkippedTrackIndices = mutableSetOf<Int>()
     private var runtimeRetryCount = 0
-    private var consecutiveAutoSkipCount = 0
+    private var allowAutoSkipForCurrentLoad = true
 
     // Gapless next-track preload state (eliminates STATE_ENDED between songs in background)
     private var preloadAttemptedForTrackId: String? = null
@@ -260,41 +261,46 @@ class PlayerController(
         scope.launch {
             val restored = withContext(Dispatchers.IO) {
                 playbackSessionStore.loadSession()
-            } ?: return@launch
+            }
+            if (restored != null && !hasUserInitiatedPlayback && _state.value.queue.isEmpty()) {
+                val track = restored.queue.getOrNull(restored.currentIndex)
+                if (track != null) {
+                    pendingResumePositionMs = restored.positionMs
+                    lastRecoveryStartPositionMs = restored.positionMs
+                    lastPersistedQueueSize = restored.queue.size
+                    lastPersistedSliceStart = 0
+                    lastPersistedSliceCount = restored.queue.size
+                    queueNavigator.onQueueReplaced(restored.queue.size, restored.currentIndex, restored.repeatMode)
+                    _progress.value = PlaybackProgress(
+                        positionMs = restored.positionMs,
+                        durationMs = restored.durationMs
+                    )
+                    _state.value = PlayerState(
+                        queue = restored.queue,
+                        currentIndex = restored.currentIndex,
+                        queueSource = restored.queueSource,
+                        isPlaying = false,
+                        isBuffering = false,
+                        positionMs = restored.positionMs,
+                        durationMs = restored.durationMs,
+                        repeatMode = restored.repeatMode,
+                        activeQualityBadge = restored.activeQualityBadge,
+                        activeProviderName = restored.activeProviderName,
+                        lyrics = ParsedLyrics(),
+                        isLoadingLyrics = true
+                    ).withNavCapabilities()
 
-            if (hasUserInitiatedPlayback || _state.value.queue.isNotEmpty()) return@launch
-            val track = restored.queue.getOrNull(restored.currentIndex) ?: return@launch
-
-            pendingResumePositionMs = restored.positionMs
-            lastRecoveryStartPositionMs = restored.positionMs
-            lastPersistedQueueSize = restored.queue.size
-            lastPersistedSliceStart = 0
-            lastPersistedSliceCount = restored.queue.size
-            queueNavigator.onQueueReplaced(restored.queue.size, restored.currentIndex, restored.repeatMode)
-            _progress.value = PlaybackProgress(
-                positionMs = restored.positionMs,
-                durationMs = restored.durationMs
-            )
-            _state.value = PlayerState(
-                queue = restored.queue,
-                currentIndex = restored.currentIndex,
-                queueSource = restored.queueSource,
-                isPlaying = false,
-                isBuffering = false,
-                positionMs = restored.positionMs,
-                durationMs = restored.durationMs,
-                repeatMode = restored.repeatMode,
-                activeQualityBadge = restored.activeQualityBadge,
-                activeProviderName = restored.activeProviderName,
-                lyrics = ParsedLyrics(),
-                isLoadingLyrics = true
-            ).withNavCapabilities()
-
-            loadLyricsAsync(track)
-            if (!track.coverUrl.isNullOrBlank()) {
-                extractAmbientPaletteAsync(track.coverUrl)
-            } else {
-                resolveCoverAsync(restored.currentIndex, track)
+                    loadLyricsAsync(track)
+                    if (!track.coverUrl.isNullOrBlank()) {
+                        extractAmbientPaletteAsync(track.coverUrl)
+                    } else {
+                        resolveCoverAsync(restored.currentIndex, track)
+                    }
+                }
+            }
+            // Pre-warm MediaController asynchronously so first Play avoids Service binding delay
+            if (mediaController?.isConnected != true) {
+                ensureController(emitError = false)
             }
         }
     }
@@ -531,7 +537,7 @@ class PlayerController(
         }
     }
 
-    private suspend fun ensureController(): MediaController? {
+    private suspend fun ensureController(emitError: Boolean = true): MediaController? {
         mediaController?.let { if (it.isConnected) return it }
         return controllerMutex.withLock {
             mediaController?.let { existing ->
@@ -576,7 +582,9 @@ class PlayerController(
                 throw ce
             } catch (t: Throwable) {
                 MediaController.releaseFuture(future)
-                emitMessage("音频服务启动失败：${t.message}")
+                if (emitError) {
+                    emitMessage("音频服务启动失败：${t.message}")
+                }
                 null
             }
         }
@@ -595,7 +603,7 @@ class PlayerController(
                     if (matchesActiveTrack && controller.playbackState == Player.STATE_READY) {
                         hasEnteredReadyForActiveMedia = true
                         isRecoveringError = false
-                        consecutiveAutoSkipCount = 0
+                        autoSkippedTrackIndices.clear()
                     }
                 }
                 _state.update {
@@ -622,7 +630,7 @@ class PlayerController(
                     requiresFreshReloadOnPlay = false
                     hasEnteredReadyForActiveMedia = true
                     isRecoveringError = false
-                    consecutiveAutoSkipCount = 0
+                    autoSkippedTrackIndices.clear()
                 }
                 _state.update {
                     if (it.isPlaying == livePlaying && it.isBuffering == liveBuffering) {
@@ -652,7 +660,7 @@ class PlayerController(
                     if (controller.playbackState == Player.STATE_READY) {
                         hasEnteredReadyForActiveMedia = true
                         isRecoveringError = false
-                        consecutiveAutoSkipCount = 0
+                        autoSkippedTrackIndices.clear()
                     }
                 }
                 _state.update {
@@ -708,7 +716,8 @@ class PlayerController(
                         pendingQualityOverride = null
                         lastRecoveryStartPositionMs = 0L
                         runtimeRetryCount = 0
-                        consecutiveAutoSkipCount = 0
+                        allowAutoSkipForCurrentLoad = true
+                        autoSkippedTrackIndices.clear()
                         failedSourcePlatformsForCurrentTrack.clear()
                         failedSourceTracksForCurrentTrack.clear()
                         failedTrackIdsForCurrentTrack.clear()
@@ -769,10 +778,10 @@ class PlayerController(
                         if (matchesActiveTrack) {
                             hasEnteredReadyForActiveMedia = true
                             isRecoveringError = false
-                            consecutiveAutoSkipCount = 0
                             val livePlaying = controller.isPlaying
                             if (livePlaying) {
                                 isErrorRecoverySuppressed = false
+                                autoSkippedTrackIndices.clear()
                             }
                             val dur = controller.duration.takeIf { it > 0L }
                                 ?: _progress.value.durationMs.takeIf { it > 0L }
@@ -963,19 +972,32 @@ class PlayerController(
                         )
                     }
                 } else {
-                    isRecoveringError = false
-                    isAwaitingMediaLoad = false
-                    isErrorRecoverySuppressed = true
-                    requiresFreshReloadOnPlay = true
-                    _progress.update { it.copy(positionMs = resumePos) }
-                    _state.update { it.copy(isBuffering = false, isPlaying = false, positionMs = resumePos) }
-                    PlaybackService.refreshNotificationIfNeeded()
-                    val msg = if (errorKind == PlaybackErrorKind.TRANSIENT_NETWORK) {
+                    val liveIdx = _state.value.queue.indexOfFirst { it.id == curTrack?.id }
+                    val terminalMsg = if (errorKind == PlaybackErrorKind.TRANSIENT_NETWORK && !networkAdvisor.isNetworkConnected()) {
                         "网络波动导致播放中断，恢复网络后点击播放可从原位置继续"
                     } else {
                         "当前曲目播放失败，可尝试切换音质或手动下一首"
                     }
-                    emitMessage(msg)
+                    if (curTrack != null && liveIdx >= 0) {
+                        handleAllSourcesFailed(
+                            failedIndex = liveIdx,
+                            failedTrack = curTrack,
+                            preserveExclusions = false,
+                            allowAutoSkip = allowAutoSkipForCurrentLoad,
+                            resumePositionMs = resumePos,
+                            fallbackErrorMessage = terminalMsg
+                        )
+                    } else {
+                        autoSkippedTrackIndices.clear()
+                        isRecoveringError = false
+                        isAwaitingMediaLoad = false
+                        isErrorRecoverySuppressed = true
+                        requiresFreshReloadOnPlay = true
+                        _progress.update { it.copy(positionMs = resumePos) }
+                        _state.update { it.copy(isBuffering = false, isPlaying = false, positionMs = resumePos) }
+                        PlaybackService.refreshNotificationIfNeeded()
+                        emitMessage(terminalMsg)
+                    }
                 }
             }
         })
@@ -1008,7 +1030,8 @@ class PlayerController(
         pendingQualityOverride = null
         lastRecoveryStartPositionMs = 0L
         runtimeRetryCount = 0
-        consecutiveAutoSkipCount = 0
+        allowAutoSkipForCurrentLoad = true
+        autoSkippedTrackIndices.clear()
         failedSourcePlatformsForCurrentTrack.clear()
         failedSourceTracksForCurrentTrack.clear()
         failedTrackIdsForCurrentTrack.clear()
@@ -1053,7 +1076,7 @@ class PlayerController(
     ) {
         if (tracks.isEmpty()) return
         hasUserInitiatedPlayback = true
-        consecutiveAutoSkipCount = 0
+        autoSkippedTrackIndices.clear()
         val clamped = startIndex.coerceIn(0, tracks.lastIndex)
         val targetTrack = tracks[clamped]
         val currentSnapshot = _state.value
@@ -1087,7 +1110,7 @@ class PlayerController(
         val st = _state.value
         if (index !in st.queue.indices) return
         hasUserInitiatedPlayback = true
-        consecutiveAutoSkipCount = 0
+        autoSkippedTrackIndices.clear()
         pendingQualityOverride = null
         clearPreloadedNext(removeFromPlayer = true)
         queueNavigator.onManualSelectIndex(st.queue.size, index, st.repeatMode)
@@ -1106,7 +1129,7 @@ class PlayerController(
 
     fun playSingle(track: Track, queueSource: PlaybackQueueSource? = null) {
         hasUserInitiatedPlayback = true
-        consecutiveAutoSkipCount = 0
+        autoSkippedTrackIndices.clear()
         pendingQualityOverride = null
         clearPreloadedNext(removeFromPlayer = true)
         val snapshot = _state.value
@@ -1192,6 +1215,7 @@ class PlayerController(
 
     fun removeFromQueue(index: Int) {
         hasUserInitiatedPlayback = true
+        autoSkippedTrackIndices.clear()
         clearPreloadedNext(removeFromPlayer = true)
         val snapshot = _state.value
         val queue = snapshot.queue.toMutableList()
@@ -1307,6 +1331,8 @@ class PlayerController(
 
     fun clearQueue() {
         hasUserInitiatedPlayback = true
+        allowAutoSkipForCurrentLoad = true
+        autoSkippedTrackIndices.clear()
         queueNavigator.reset()
         clearPreloadedNext(removeFromPlayer = false)
         recoveryDelayJob?.cancel()
@@ -1424,7 +1450,7 @@ class PlayerController(
         if (st.queue.isEmpty()) return
         hasUserInitiatedPlayback = true
         if (!isAutoAdvance) {
-            consecutiveAutoSkipCount = 0
+            autoSkippedTrackIndices.clear()
         }
 
         // Fast-path: if the exact next track chosen by QueueNavigator was already preloaded, play it with 0ms resolve
@@ -1460,6 +1486,7 @@ class PlayerController(
             failedSourceTracksForCurrentTrack.clear()
             failedTrackIdsForCurrentTrack.clear()
             runtimeRetryCount = 0
+            allowAutoSkipForCurrentLoad = true
             lastRecoveryStartPositionMs = 0L
             pendingResumePositionMs = 0L
             pendingQualityOverride = null
@@ -1532,6 +1559,7 @@ class PlayerController(
         val st = _state.value
         if (st.queue.isEmpty()) return
         hasUserInitiatedPlayback = true
+        autoSkippedTrackIndices.clear()
         val (curPos, _) = resolveLivePositionAndDuration(st)
         when (
             val outcome = queueNavigator.navigatePrevious(
@@ -1542,13 +1570,11 @@ class PlayerController(
             )
         ) {
             is QueueNavigationOutcome.SwitchTo -> {
-                consecutiveAutoSkipCount = 0
                 pendingQualityOverride = null
                 _state.update { it.copy(currentIndex = outcome.targetIndex).withNavCapabilities() }
                 loadAndPlayIndex(outcome.targetIndex)
             }
             is QueueNavigationOutcome.RestartCurrent -> {
-                consecutiveAutoSkipCount = 0
                 restartCurrentTrack(forcePlay = outcome.message != null, message = outcome.message)
             }
             is QueueNavigationOutcome.StayAtBoundary -> {
@@ -1636,7 +1662,7 @@ class PlayerController(
         hasEnteredReadyForActiveMedia = false
         pendingResumePositionMs = 0L
         lastRecoveryStartPositionMs = 0L
-        consecutiveAutoSkipCount = 0
+        autoSkippedTrackIndices.clear()
         val (_, curDur) = resolveLivePositionAndDuration(_state.value)
         mediaController?.let { ctrl ->
             if (ctrl.isConnected) {
@@ -1661,6 +1687,7 @@ class PlayerController(
     fun cycleRepeatMode() {
         val st = _state.value
         val nextMode = st.repeatMode.next()
+        autoSkippedTrackIndices.clear()
         queueNavigator.onModeChanged(st.queue.size, st.currentIndex, nextMode)
         _state.update { it.copy(repeatMode = nextMode).withNavCapabilities() }
         mediaController?.let { ctrl ->
@@ -1716,6 +1743,7 @@ class PlayerController(
             return
         }
         val (curPos, _) = resolveLivePositionAndDuration(snapshot)
+        autoSkippedTrackIndices.clear()
         loadAndPlayIndex(
             index = idx,
             qualityOverride = quality,
@@ -1741,12 +1769,14 @@ class PlayerController(
         val sourceLabel = targetSource?.name ?: "指定音源"
         userApiManager.clearCooldownsForSource(sourceId)
         val (curPos, _) = resolveLivePositionAndDuration(snapshot)
+        autoSkippedTrackIndices.clear()
         emitMessage("正在切换至音源：$sourceLabel")
         loadAndPlayIndex(
             index = idx,
             preferredSourceId = sourceId,
             resumePositionMs = curPos,
-            bypassOfflineCache = true
+            bypassOfflineCache = true,
+            allowAutoSkipOnFailure = false
         )
     }
 
@@ -1774,6 +1804,7 @@ class PlayerController(
             failedTrackIdsForCurrentTrack.add(curResolvedId)
         }
         val (curPos, _) = resolveLivePositionAndDuration(snapshot)
+        autoSkippedTrackIndices.clear()
         emitMessage("正在尝试切换其他音源或平台…")
         loadAndPlayIndex(
             index = idx,
@@ -1969,7 +2000,8 @@ class PlayerController(
         resumePositionMs: Long = 0L,
         isAutoAdvance: Boolean = false,
         preserveExclusions: Boolean = false,
-        bypassOfflineCache: Boolean = false
+        bypassOfflineCache: Boolean = false,
+        allowAutoSkipOnFailure: Boolean = true
     ) {
         val track = _state.value.queue.getOrNull(index) ?: return
         recoveryDelayJob?.cancel()
@@ -1995,6 +2027,12 @@ class PlayerController(
         activeExpectedMediaId = track.id
         PlaybackService.silenceForTransition()
 
+        allowAutoSkipForCurrentLoad = PlaybackRecoveryPolicy.resolveAllowAutoSkipForLoad(
+            currentAllowAutoSkip = allowAutoSkipForCurrentLoad,
+            isRuntimeFallbackRetry = isRuntimeFallbackRetry,
+            preserveExclusions = preserveExclusions,
+            allowAutoSkipOnFailure = allowAutoSkipOnFailure
+        )
         if (!isRuntimeFallbackRetry) {
             isRecoveringError = false
             if (!preserveExclusions) {
@@ -2140,26 +2178,73 @@ class PlayerController(
                     failedSourceTracksForCurrentTrack.clear()
                     failedTrackIdsForCurrentTrack.clear()
                 }
-                // During background playlist auto-advance, automatically skip up to 3 dead tracks while online
-                // (never auto-skip past the end of SEQUENTIAL mode or endlessly retry in SINGLE_LOOP)
-                val liveState = _state.value
-                if (isAutoAdvance &&
-                    networkAdvisor.isNetworkConnected() &&
-                    liveState.repeatMode != RepeatMode.SINGLE_LOOP &&
-                    queueNavigator.canSkipNext(liveState.queue.size, liveState.currentIndex, liveState.repeatMode) &&
-                    consecutiveAutoSkipCount < PlaybackRecoveryPolicy.MAX_CONSECUTIVE_AUTO_SKIPS
-                ) {
-                    consecutiveAutoSkipCount++
-                    emitMessage("《${latestTrack.title}》暂无可用音源，已自动跳至下一首")
-                    nextInternal(isAutoAdvance = true)
-                    return@launch
-                }
+                val liveIdx = _state.value.queue.indexOfFirst { it.id == latestTrack.id }
+                    .takeIf { it >= 0 } ?: _state.value.currentIndex
+                handleAllSourcesFailed(
+                    failedIndex = liveIdx,
+                    failedTrack = latestTrack,
+                    preserveExclusions = preserveExclusions,
+                    allowAutoSkip = allowAutoSkipForCurrentLoad,
+                    resumePositionMs = resumePositionMs,
+                    fallbackErrorMessage = err.message ?: "无法播放《${latestTrack.title}》"
+                )
+            }
+        }
+    }
 
+    private fun handleAllSourcesFailed(
+        failedIndex: Int,
+        failedTrack: Track,
+        preserveExclusions: Boolean,
+        allowAutoSkip: Boolean = allowAutoSkipForCurrentLoad,
+        resumePositionMs: Long,
+        fallbackErrorMessage: String?
+    ) {
+        val liveState = _state.value
+        val decision = PlaybackRecoveryPolicy.decideAutoSkipOnFailure(
+            trackTitle = failedTrack.title,
+            isLocalTrack = failedTrack.isLocal,
+            hasReadySource = userApiManager.hasReadySource(),
+            isNetworkConnected = networkAdvisor.isNetworkConnected(),
+            preserveExclusions = preserveExclusions,
+            allowAutoSkip = allowAutoSkip,
+            queueSize = liveState.queue.size,
+            currentIndex = failedIndex,
+            mode = liveState.repeatMode,
+            autoSkippedIndices = autoSkippedTrackIndices,
+            queueNavigator = queueNavigator,
+            fallbackErrorMessage = fallbackErrorMessage
+        )
+        when (decision) {
+            is AutoSkipDecision.SkipTo -> {
+                autoSkippedTrackIndices.add(failedIndex)
+                if (liveState.repeatMode == RepeatMode.SHUFFLE) {
+                    val navOut = queueNavigator.navigateNext(
+                        queueSize = liveState.queue.size,
+                        currentIndex = failedIndex,
+                        mode = RepeatMode.SHUFFLE,
+                        isAutoAdvance = true
+                    )
+                    if (navOut !is QueueNavigationOutcome.SwitchTo || navOut.targetIndex != decision.targetIndex) {
+                        queueNavigator.onManualSelectIndex(
+                            liveState.queue.size,
+                            decision.targetIndex,
+                            RepeatMode.SHUFFLE
+                        )
+                    }
+                }
+                emitMessage(decision.noticeMessage)
+                _state.update { it.copy(currentIndex = decision.targetIndex).withNavCapabilities() }
+                loadAndPlayIndex(decision.targetIndex, isAutoAdvance = true)
+            }
+            is AutoSkipDecision.Stop -> {
+                autoSkippedTrackIndices.clear()
                 isAwaitingMediaLoad = false
                 isRecoveringError = false
                 isErrorRecoverySuppressed = true
                 requiresFreshReloadOnPlay = true
                 hasEnteredReadyForActiveMedia = false
+                _progress.update { it.copy(positionMs = resumePositionMs) }
                 _state.update {
                     it.copy(
                         isBuffering = false,
@@ -2168,17 +2253,11 @@ class PlayerController(
                     )
                 }
                 PlaybackService.refreshNotificationIfNeeded()
-                val noSource = !userApiManager.hasReadySource()
-                val failureMessage = if (preserveExclusions && !noSource) {
-                    "暂无其他可用音源或平台，点击播放可重新尝试默认音源"
-                } else {
-                    err.message ?: "无法播放《${latestTrack.title}》"
-                }
                 _events.tryEmit(
                     PlayerUiEvent(
-                        message = failureMessage,
-                        actionLabel = if (noSource) "导入音源" else null,
-                        openSourceManager = noSource
+                        message = decision.noticeMessage,
+                        actionLabel = if (decision.promptImportSource) "导入音源" else null,
+                        openSourceManager = decision.promptImportSource
                     )
                 )
             }

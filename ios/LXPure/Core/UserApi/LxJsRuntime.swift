@@ -75,7 +75,13 @@ final class LxJsRuntime: @unchecked Sendable {
     private var pendingTimeouts: [String: DispatchWorkItem] = [:]
     private var activeTasks: [String: URLSessionDataTask] = [:]
     private var cancelledRequests = Set<String>()
+    private var childToParentKey: [String: String] = [:]
+    private var parentToChildKeys: [String: Set<String>] = [:]
+    private var timerParentKeys: [Int64: String] = [:]
+    private var cancelledParentRequests = Set<String>()
     private var activeTimers: [Int64: DispatchWorkItem] = [:]
+    // Accessed exclusively on serial jsQueue during callJs execution
+    private var currentJsParentRequestKey: String?
 
     var hasInFlightWork: Bool {
         stateLock.lock()
@@ -429,21 +435,34 @@ final class LxJsRuntime: @unchecked Sendable {
             let timerId = Int64(idVal?.toInt32() ?? 0)
             let rawDelay = Double(delayVal?.toInt32() ?? 0)
             let delaySec = min(max(rawDelay, 0.0), 60_000.0) / 1000.0
+            let capturedParentKey = self.currentJsParentRequestKey
 
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.stateLock.lock()
-                self.activeTimers.removeValue(forKey: timerId)
+                let removedWork = self.activeTimers.removeValue(forKey: timerId)
+                let parentKey = self.timerParentKeys.removeValue(forKey: timerId)
                 let destroyedNow = self.isDestroyed
+                let parentCancelled = parentKey.map { self.cancelledParentRequests.contains($0) } ?? false
                 self.stateLock.unlock()
-                guard !destroyedNow else { return }
+                guard removedWork != nil && !destroyedNow && !parentCancelled else { return }
+                let previousParentKey = self.currentJsParentRequestKey
+                self.currentJsParentRequestKey = parentKey
+                defer { self.currentJsParentRequestKey = previousParentKey }
                 self.callJs(action: "__set_timeout__", dataJson: String(timerId))
             }
 
             self.stateLock.lock()
-            if self.isDestroyed || self.activeTimers.count >= Self.maxActiveTimers {
+            if self.isDestroyed ||
+                self.activeTimers.count >= Self.maxActiveTimers ||
+                (capturedParentKey.map { self.cancelledParentRequests.contains($0) } ?? false) {
                 self.stateLock.unlock()
                 return
+            }
+            if let capturedParentKey {
+                self.timerParentKeys[timerId] = capturedParentKey
+            } else {
+                self.timerParentKeys.removeValue(forKey: timerId)
             }
             let old = self.activeTimers.updateValue(work, forKey: timerId)
             self.stateLock.unlock()
@@ -458,6 +477,7 @@ final class LxJsRuntime: @unchecked Sendable {
             let timerId = Int64(idVal?.toInt32() ?? 0)
             self.stateLock.lock()
             let work = self.activeTimers.removeValue(forKey: timerId)
+            self.timerParentKeys.removeValue(forKey: timerId)
             self.stateLock.unlock()
             work?.cancel()
         }
@@ -503,7 +523,7 @@ final class LxJsRuntime: @unchecked Sendable {
             guard let obj = parseJsonObject(dataJson),
                   let requestKey = obj["requestKey"] as? String else { return }
             guard let urlStr = obj["url"] as? String, !urlStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                sendHttpErrorResponse(requestKey: requestKey, error: "Invalid URL")
+                sendHttpErrorResponse(requestKey: requestKey, error: "Invalid URL", parentRequestKey: currentJsParentRequestKey)
                 return
             }
             let options = obj["options"] as? [String: Any]
@@ -536,7 +556,7 @@ final class LxJsRuntime: @unchecked Sendable {
 
     private func executeHttpForScript(requestKey: String, urlString: String, options: [String: Any]?) {
         guard let url = Self.parseLenientURL(urlString) else {
-            sendHttpErrorResponse(requestKey: requestKey, error: "Invalid URL")
+            sendHttpErrorResponse(requestKey: requestKey, error: "Invalid URL", parentRequestKey: currentJsParentRequestKey)
             return
         }
 
@@ -624,14 +644,19 @@ final class LxJsRuntime: @unchecked Sendable {
             }
         }
 
+        let parentKey = currentJsParentRequestKey
         let targetSession = (followMax == 0) ? Self.noRedirectSession : session
         let task = targetSession.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
-            let wasCancelled = self.finishActiveTask(requestKey: requestKey)
+            let (wasCancelled, finishedParentKey) = self.finishActiveTask(requestKey: requestKey)
             guard !wasCancelled, !self.checkDestroyed() else { return }
 
             if let error {
-                self.sendHttpErrorResponse(requestKey: requestKey, error: error.localizedDescription)
+                self.sendHttpErrorResponse(
+                    requestKey: requestKey,
+                    error: error.localizedDescription,
+                    parentRequestKey: finishedParentKey
+                )
                 return
             }
 
@@ -685,9 +710,13 @@ final class LxJsRuntime: @unchecked Sendable {
             ]
 
             if let jsonStr = self.stringifyJson(payload) {
-                self.postCallJs(action: "response", dataJson: jsonStr)
+                self.postCallJs(action: "response", dataJson: jsonStr, parentRequestKey: finishedParentKey)
             } else {
-                self.sendHttpErrorResponse(requestKey: requestKey, error: "Response serialization failed")
+                self.sendHttpErrorResponse(
+                    requestKey: requestKey,
+                    error: "Response serialization failed",
+                    parentRequestKey: finishedParentKey
+                )
             }
         }
 
@@ -696,7 +725,16 @@ final class LxJsRuntime: @unchecked Sendable {
             stateLock.unlock()
             return
         }
+        if let parentKey, cancelledParentRequests.contains(parentKey) {
+            stateLock.unlock()
+            sendHttpErrorResponse(requestKey: requestKey, error: "Cancelled", parentRequestKey: parentKey)
+            return
+        }
         activeTasks[requestKey] = task
+        if let parentKey {
+            childToParentKey[requestKey] = parentKey
+            parentToChildKeys[parentKey, default: []].insert(requestKey)
+        }
         stateLock.unlock()
         task.resume()
     }
@@ -727,14 +765,14 @@ final class LxJsRuntime: @unchecked Sendable {
         return String(decoding: data, as: UTF8.self)
     }
 
-    private func sendHttpErrorResponse(requestKey: String, error: String) {
+    private func sendHttpErrorResponse(requestKey: String, error: String, parentRequestKey: String? = nil) {
         let payload: [String: Any] = [
             "requestKey": requestKey,
             "error": error,
             "response": NSNull()
         ]
         if let jsonStr = stringifyJson(payload) {
-            postCallJs(action: "response", dataJson: jsonStr)
+            postCallJs(action: "response", dataJson: jsonStr, parentRequestKey: parentRequestKey)
         }
     }
 
@@ -791,7 +829,7 @@ final class LxJsRuntime: @unchecked Sendable {
                     execute: timeoutWork
                 )
 
-                postCallJs(action: "request", dataJson: payloadJson)
+                postCallJs(action: "request", dataJson: payloadJson, parentRequestKey: requestKey)
             }
         } onCancel: { [weak self] in
             self?.completePendingAction(
@@ -830,6 +868,10 @@ final class LxJsRuntime: @unchecked Sendable {
         let tasksToCancel = Array(activeTasks.values)
         activeTasks.removeAll()
         cancelledRequests.removeAll()
+        childToParentKey.removeAll()
+        parentToChildKeys.removeAll()
+        timerParentKeys.removeAll()
+        cancelledParentRequests.removeAll()
         let timersToCancel = Array(activeTimers.values)
         activeTimers.removeAll()
         let timeoutsToCancel = Array(pendingTimeouts.values)
@@ -897,17 +939,48 @@ final class LxJsRuntime: @unchecked Sendable {
         stateLock.lock()
         let cont = pendingActions.removeValue(forKey: requestKey)
         let timeoutWork = pendingTimeouts.removeValue(forKey: requestKey)
-        var orphanedTasks: [URLSessionDataTask] = []
-        if shouldCancelOrphans && pendingActions.isEmpty && initResultCached != nil {
-            for (k, task) in activeTasks {
-                cancelledRequests.insert(k)
-                orphanedTasks.append(task)
+        var tasksToCancel: [URLSessionDataTask] = []
+        var timersToCancel: [DispatchWorkItem] = []
+        let childKeys = parentToChildKeys.removeValue(forKey: requestKey) ?? []
+        if shouldCancelOrphans {
+            if cancelledParentRequests.count > 512 {
+                cancelledParentRequests.removeAll()
             }
-            activeTasks.removeAll()
+            cancelledParentRequests.insert(requestKey)
+            for (tid, pKey) in timerParentKeys where pKey == requestKey {
+                timerParentKeys.removeValue(forKey: tid)
+                if let timerWork = activeTimers.removeValue(forKey: tid) {
+                    timersToCancel.append(timerWork)
+                }
+            }
+            for childKey in childKeys {
+                childToParentKey.removeValue(forKey: childKey)
+                cancelledRequests.insert(childKey)
+                if let task = activeTasks.removeValue(forKey: childKey) {
+                    tasksToCancel.append(task)
+                }
+            }
+            if pendingActions.isEmpty && initResultCached != nil {
+                for (k, task) in activeTasks {
+                    cancelledRequests.insert(k)
+                    childToParentKey.removeValue(forKey: k)
+                    tasksToCancel.append(task)
+                }
+                activeTasks.removeAll()
+                parentToChildKeys.removeAll()
+            }
+        } else {
+            for (tid, pKey) in timerParentKeys where pKey == requestKey {
+                timerParentKeys.removeValue(forKey: tid)
+            }
+            for childKey in childKeys {
+                childToParentKey.removeValue(forKey: childKey)
+            }
         }
         stateLock.unlock()
         timeoutWork?.cancel()
-        orphanedTasks.forEach { $0.cancel() }
+        timersToCancel.forEach { $0.cancel() }
+        tasksToCancel.forEach { $0.cancel() }
         cont?.resume(returning: result)
     }
 
@@ -915,16 +988,29 @@ final class LxJsRuntime: @unchecked Sendable {
         stateLock.lock()
         cancelledRequests.insert(requestKey)
         let task = activeTasks.removeValue(forKey: requestKey)
+        if let parentKey = childToParentKey.removeValue(forKey: requestKey) {
+            parentToChildKeys[parentKey]?.remove(requestKey)
+            if parentToChildKeys[parentKey]?.isEmpty == true {
+                parentToChildKeys.removeValue(forKey: parentKey)
+            }
+        }
         stateLock.unlock()
         task?.cancel()
     }
 
-    private func finishActiveTask(requestKey: String) -> Bool {
+    private func finishActiveTask(requestKey: String) -> (wasCancelled: Bool, parentKey: String?) {
         stateLock.lock()
         activeTasks.removeValue(forKey: requestKey)
+        let parentKey = childToParentKey.removeValue(forKey: requestKey)
+        if let parentKey {
+            parentToChildKeys[parentKey]?.remove(requestKey)
+            if parentToChildKeys[parentKey]?.isEmpty == true {
+                parentToChildKeys.removeValue(forKey: parentKey)
+            }
+        }
         let wasCancelled = cancelledRequests.remove(requestKey) != nil
         stateLock.unlock()
-        return wasCancelled
+        return (wasCancelled, parentKey)
     }
 
     private func checkDestroyed() -> Bool {
@@ -933,10 +1019,20 @@ final class LxJsRuntime: @unchecked Sendable {
         return isDestroyed
     }
 
-    private func postCallJs(action: String, dataJson: String) {
+    private func isParentCancelled(_ parentRequestKey: String) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return cancelledParentRequests.contains(parentRequestKey)
+    }
+
+    private func postCallJs(action: String, dataJson: String, parentRequestKey: String? = nil) {
         if checkDestroyed() { return }
         jsQueue.async { [weak self] in
             guard let self, !self.checkDestroyed() else { return }
+            if let parentRequestKey, self.isParentCancelled(parentRequestKey) { return }
+            let previousParentKey = self.currentJsParentRequestKey
+            self.currentJsParentRequestKey = parentRequestKey
+            defer { self.currentJsParentRequestKey = previousParentKey }
             self.callJs(action: action, dataJson: dataJson)
         }
     }

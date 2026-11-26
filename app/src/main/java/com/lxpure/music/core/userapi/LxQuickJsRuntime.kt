@@ -33,6 +33,7 @@ import kotlinx.serialization.json.put
 import okhttp3.CacheControl
 import okhttp3.Call
 import okhttp3.FormBody
+import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -144,6 +145,24 @@ class LxQuickJsRuntime(
 
                 else -> cleaned.take(64)
             }
+        }
+
+        internal const val CHROME_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+        internal fun sanitizeRequestUrl(raw: String): String {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return trimmed
+            return trimmed
+                .replace(" ", "%20")
+                .replace("|", "%7C")
+                .replace("{", "%7B")
+                .replace("}", "%7D")
+                .replace("\"", "%22")
+                .replace("<", "%3C")
+                .replace(">", "%3E")
+                .replace("^", "%5E")
+                .replace("`", "%60")
         }
 
         private fun readBoundedBytes(body: ResponseBody?, maxBytes: Int): ByteArray {
@@ -446,28 +465,33 @@ class LxQuickJsRuntime(
                 if (destroyed.get() || cancelledRequests.remove(requestKey)) return@launch
 
                 val method = options?.get("method").asStringOrNull()?.uppercase(Locale.ROOT) ?: "GET"
-                val timeoutMs = options?.get("timeout").asIntOrNull()?.toLong()?.coerceIn(1_000L, 12_000L) ?: 8_000L
+                val timeoutMs = options?.get("timeout").asIntOrNull()?.toLong()?.coerceIn(1_000L, 10_000L) ?: 6_500L
                 val isBinary = options?.get("binary").asBooleanOrNull() == true
                 val followMax = options?.get("follow_max").asIntOrNull()
 
+                val safeUrl = sanitizeRequestUrl(url)
                 val reqBuilder = Request.Builder()
-                    .url(url)
+                    .url(safeUrl)
                     .cacheControl(CacheControl.FORCE_NETWORK)
                 var hasUserAgent = false
                 var explicitContentType: String? = null
+                val headersBuilder = Headers.Builder()
 
                 options?.get("headers").asJsonObjectOrNull()?.forEach { (k, v) ->
-                    val value = v.asStringOrNull() ?: return@forEach
-                    if (k.equals("User-Agent", ignoreCase = true)) hasUserAgent = true
-                    if (k.equals("Content-Type", ignoreCase = true)) explicitContentType = value
-                    reqBuilder.header(k, value)
+                    val rawKey = k.trim().replace("\r", "").replace("\n", "")
+                    val rawValue = (v.asStringOrNull() ?: return@forEach).replace("\r", "").replace("\n", "")
+                    if (rawKey.isEmpty()) return@forEach
+                    // Never pass Accept-Encoding manually; OkHttp's BridgeInterceptor automatically
+                    // negotiates and transparently decompresses gzip when Accept-Encoding is omitted.
+                    if (rawKey.equals("Accept-Encoding", ignoreCase = true)) return@forEach
+                    if (rawKey.equals("User-Agent", ignoreCase = true)) hasUserAgent = true
+                    if (rawKey.equals("Content-Type", ignoreCase = true)) explicitContentType = rawValue
+                    runCatching { headersBuilder.addUnsafeNonAscii(rawKey, rawValue) }
                 }
                 if (!hasUserAgent) {
-                    reqBuilder.header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    )
+                    headersBuilder.add("User-Agent", CHROME_USER_AGENT)
                 }
+                reqBuilder.headers(headersBuilder.build())
 
                 if (method in setOf("POST", "PUT", "PATCH", "DELETE")) {
                     val formEl = options?.get("form")
@@ -549,7 +573,7 @@ class LxQuickJsRuntime(
                         JsonPrimitive(Base64.getEncoder().encodeToString(rawBytes))
                     } else {
                         val charset = resp.body?.contentType()?.charset(StandardCharsets.UTF_8) ?: StandardCharsets.UTF_8
-                        val text = String(rawBytes, charset)
+                        val text = String(rawBytes, charset).removePrefix("\uFEFF")
                         val contentType = resp.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
                         val trimmed = text.trimStart()
                         val shouldParseJson = contentType.contains("json") ||
@@ -612,10 +636,12 @@ class LxQuickJsRuntime(
 
         postCallJs("request", payload.toString())
 
+        var completedNormally = false
         return try {
             val outcome = withTimeoutOrNull(timeoutMs) {
                 deferred.await()
             } ?: return Result.failure(IllegalStateException("请求超时，请检查网络连接"))
+            completedNormally = true
 
             val res = outcome.getOrElse { err ->
                 return Result.failure(IllegalStateException(formatFriendlyError(err.message)))
@@ -623,13 +649,26 @@ class LxQuickJsRuntime(
             val extracted = res.asJsonObjectOrNull()
                 ?.get("data").asJsonObjectOrNull()
                 ?.get("url").asStringOrNull()
-            if (extracted.isNullOrBlank() || !extracted.startsWith("http")) {
+                ?.trim()
+            if (extracted.isNullOrBlank() ||
+                (!extracted.startsWith("http://", ignoreCase = true) && !extracted.startsWith("https://", ignoreCase = true))
+            ) {
                 Result.failure(IllegalStateException("未返回有效音频直链"))
             } else {
                 Result.success(extracted)
             }
         } finally {
             pendingActions.remove(requestKey)
+            // If this request timed out or was cancelled and no other script requests are awaiting a result,
+            // cancel orphaned child HTTP calls so OkHttp slots are freed immediately.
+            if (!completedNormally && pendingActions.isEmpty() && initDeferred.isCompleted) {
+                activeHttpCalls.entries.toList().forEach { (key, call) ->
+                    if (activeHttpCalls.remove(key, call)) {
+                        cancelledRequests.add(key)
+                        runCatching { call.cancel() }
+                    }
+                }
+            }
         }
     }
 

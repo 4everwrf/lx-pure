@@ -28,6 +28,9 @@ struct FullPlayerView: View {
     let onOpenQueue: () -> Void
     let onSelectQuality: (AudioQuality) -> Void
     let onSetSleepTimer: (Int?) -> Void
+    let readySources: [UserApiSource]
+    let onSelectSource: (String) -> Void
+    let onSwitchAlternateSource: () -> Void
     let onArtistClick: (String) -> Void
 
     @Environment(\.lxPalette) private var lx
@@ -47,14 +50,6 @@ struct FullPlayerView: View {
 
     private var activeLyricIndex: Int {
         state.lyrics.activeIndex(at: progress.positionMs)
-    }
-
-    private func isActiveQuality(_ q: AudioQuality) -> Bool {
-        if let badge = state.activeQualityBadge?.split(separator: "·").first.map({ String($0).trimmingCharacters(in: .whitespaces) }),
-           AudioQuality.allCases.contains(where: { $0.badge.caseInsensitiveCompare(badge) == .orderedSame }) {
-            return q.badge.caseInsensitiveCompare(badge) == .orderedSame
-        }
-        return q == preferredQuality
     }
 
     var body: some View {
@@ -412,13 +407,31 @@ struct FullPlayerView: View {
                     pendingSeekTargetMs = nil
                 }
             }
-            .confirmationDialog("选择偏好音质", isPresented: $showQualitySheet, titleVisibility: .visible) {
-                ForEach(AudioQuality.allCases) { q in
-                    Button(isActiveQuality(q) ? "✓ \(q.label)" : q.label) {
+            .sheet(isPresented: $showQualitySheet) {
+                QualityAndSourceSheetView(
+                    track: track,
+                    preferredQuality: preferredQuality,
+                    activeQualityBadge: state.activeQualityBadge,
+                    activeProviderName: state.activeProviderName,
+                    activeStreamSourceId: state.activeStreamSourceId,
+                    readySources: readySources,
+                    onSelectQuality: { q in
                         onSelectQuality(q)
+                        showQualitySheet = false
+                    },
+                    onSelectSource: { sid in
+                        onSelectSource(sid)
+                        showQualitySheet = false
+                    },
+                    onSwitchAlternateSource: {
+                        onSwitchAlternateSource()
+                        showQualitySheet = false
                     }
-                }
-                Button("取消", role: .cancel) {}
+                )
+                .environment(\.lxPalette, lx)
+                .preferredColorScheme(lx.isDark ? .dark : .light)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
             }
             .confirmationDialog("睡眠定时", isPresented: $showSleepSheet, titleVisibility: .visible) {
                 ForEach([15, 30, 45, 60, 90], id: \.self) { minVal in
@@ -919,6 +932,140 @@ private struct ArtistPickerSheetView: View {
                 }
                 .padding(.bottom, 24)
             }
+        }
+        .background(lx.surfaceElevated.ignoresSafeArea())
+    }
+}
+
+private struct QualityAndSourceSheetView: View {
+    let track: Track
+    let preferredQuality: AudioQuality
+    let activeQualityBadge: String?
+    let activeProviderName: String?
+    let activeStreamSourceId: String?
+    let readySources: [UserApiSource]
+    let onSelectQuality: (AudioQuality) -> Void
+    let onSelectSource: (String) -> Void
+    let onSwitchAlternateSource: () -> Void
+
+    @Environment(\.lxPalette) private var lx
+
+    private func isCurrentQuality(_ q: AudioQuality) -> Bool {
+        if let badge = activeQualityBadge?.split(separator: "·").first.map({ String($0).trimmingCharacters(in: .whitespaces) }),
+           AudioQuality.allCases.contains(where: { $0.badge.caseInsensitiveCompare(badge) == .orderedSame }) {
+            return q.badge.caseInsensitiveCompare(badge) == .orderedSame
+        }
+        return q == preferredQuality
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("切换音质")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(lx.textPrimary)
+                    .padding(.bottom, 4)
+
+                ForEach(Array(AudioQuality.allCases.reversed())) { q in
+                    let isCurrent = isCurrentQuality(q)
+                    Button {
+                        onSelectQuality(q)
+                    } label: {
+                        HStack {
+                            Text(q.label)
+                                .font(.system(size: 15, weight: isCurrent ? .semibold : .regular))
+                                .foregroundColor(isCurrent ? lx.accent : lx.textPrimary)
+                            Spacer()
+                            HStack(spacing: 8) {
+                                Text(q.badge)
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(isCurrent ? lx.accent : lx.textSecondary)
+                                if isCurrent {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .foregroundColor(lx.accent)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .background(isCurrent ? lx.accentSoft : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if !track.isLocal && !readySources.isEmpty {
+                    Divider()
+                        .overlay(lx.hairline)
+                        .padding(.vertical, 8)
+
+                    Text("切换音源")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(lx.textPrimary)
+                        .padding(.bottom, 2)
+
+                    Button {
+                        onSwitchAlternateSource()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(lx.accent)
+                            Text("自动换源重试（切换其他音源/平台）")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundColor(lx.textPrimary)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(lx.textTertiary)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .background(lx.hairline.opacity(0.45))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 4)
+
+                    ForEach(readySources) { src in
+                        let isActive = (activeStreamSourceId == src.id) ||
+                            (activeStreamSourceId == nil && activeProviderName == src.name)
+                        Button {
+                            onSelectSource(src.id)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Text(src.name)
+                                    .font(.system(size: 15, weight: isActive ? .semibold : .regular))
+                                    .foregroundColor(isActive ? lx.accent : lx.textPrimary)
+                                    .lineLimit(1)
+                                Spacer()
+                                if let ms = src.latencyMs {
+                                    Text("\(ms)ms")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(isActive ? lx.accent : lx.textTertiary)
+                                }
+                                if isActive {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .foregroundColor(lx.accent)
+                                }
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 12)
+                            .background(isActive ? lx.accentSoft : Color.clear)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 28)
         }
         .background(lx.surfaceElevated.ignoresSafeArea())
     }

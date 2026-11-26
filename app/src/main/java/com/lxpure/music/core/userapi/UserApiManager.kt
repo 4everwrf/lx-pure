@@ -54,7 +54,8 @@ data class ResolvedStream(
     val sourceId: String,
     val providerName: String,
     val switchedPlatform: Boolean = false,
-    val switchedSource: Boolean = false
+    val switchedSource: Boolean = false,
+    val sourceRevision: String = ""
 )
 
 data class SourceUpdateResult(
@@ -104,10 +105,27 @@ class UserApiManager(
 ) {
     companion object {
         private const val TAG = "UserApiManager"
-        private const val SCRIPT_URL_TIMEOUT_MS = 4_500L
-        private const val STREAM_PROBE_TIMEOUT_MS = 2_500L
+        private const val SCRIPT_URL_TIMEOUT_MS = 5_500L
+        private const val STREAM_PROBE_TIMEOUT_MS = 3_000L
+        private const val RESOLVE_TOTAL_BUDGET_MS = 18_000L
         private const val COOLDOWN_MS = 45_000L
         private const val MAX_SCRIPT_DOWNLOAD_BYTES = 2 * 1024 * 1024 // 2 MB cap
+        private val SEARCHABLE_PLATFORM_CODES = setOf(
+            MusicSource.WY.code,
+            MusicSource.TX.code,
+            MusicSource.KW.code,
+            MusicSource.KG.code
+        )
+        private val HEALTH_PROBE_QUERIES = listOf("海阔天空", "起风了", "晴天")
+
+        internal fun sourcePlatformKey(sourceId: String, platformCode: String): String =
+            "${sourceId}_${platformCode.lowercase(Locale.ROOT)}"
+
+        internal fun sourceTrackKey(sourceId: String, trackId: String): String =
+            "${sourceId}_${trackId}"
+
+        internal fun computeSourceRevision(source: UserApiSource): String =
+            LxCrypto.md5Hex("${source.version}:${source.script.trim()}").take(8)
 
         /**
          * Validates a downloaded custom source script while rejecting HTML/JSON error pages
@@ -143,6 +161,19 @@ class UserApiManager(
                 lower.contains("已停用") ||
                 lower.contains("已切换")
         }
+
+        internal fun isDeterministicTrackMiss(rawMessage: String?): Boolean {
+            val lower = rawMessage.orEmpty().lowercase(Locale.ROOT)
+            if (lower.isEmpty()) return false
+            // Never include VIP / 403 here: many sources block FLAC/320k as VIP while 128k remains playable.
+            return lower.contains("无版权") ||
+                lower.contains("版权") ||
+                lower.contains("copyright") ||
+                lower.contains("下架") ||
+                lower.contains("不存在") ||
+                lower.contains("not found") ||
+                lower.contains("404")
+        }
     }
 
     private data class ResolveCandidate(
@@ -156,6 +187,7 @@ class UserApiManager(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val runtimes = ConcurrentHashMap<String, LxQuickJsRuntime>()
     private val sourceMutexes = ConcurrentHashMap<String, Mutex>()
+    private val priorityMutex = Mutex()
     private val sourceGenerations = ConcurrentHashMap<String, AtomicLong>()
     private val platformCooldowns = ConcurrentHashMap<String, Long>()
 
@@ -195,15 +227,18 @@ class UserApiManager(
      * waits for saved custom source runtimes to finish loading/initializing instead
      * of falsely reporting "no available source".
      */
-    suspend fun awaitInitialLoadIfNeeded(timeoutMs: Long = 4_000L) {
+    suspend fun awaitInitialLoadIfNeeded(timeoutMs: Long = 4_500L, preferredSourceId: String? = null) {
         withTimeoutOrNull(timeoutMs) {
             initialDbLoadDone.await()
             val deadline = System.currentTimeMillis() + timeoutMs
             while (System.currentTimeMillis() < deadline) {
-                val list = _sources.value
-                val hasReady = list.any { it.enabled && it.status == UserApiRuntimeStatus.READY }
-                val hasInitializing = list.any { it.enabled && it.status == UserApiRuntimeStatus.INITIALIZING }
-                if (hasReady || !hasInitializing) break
+                val enabled = _sources.value.filter { it.enabled }.sortedBy { it.priority }
+                if (enabled.isEmpty()) break
+                val primary = preferredSourceId?.let { id -> enabled.firstOrNull { it.id == id } } ?: enabled.first()
+                val primarySettled = primary.status != UserApiRuntimeStatus.INITIALIZING
+                val hasReady = enabled.any { it.status == UserApiRuntimeStatus.READY }
+                val hasInitializing = enabled.any { it.status == UserApiRuntimeStatus.INITIALIZING }
+                if ((primarySettled && hasReady) || !hasInitializing) break
                 kotlinx.coroutines.delay(60L)
             }
         }
@@ -420,8 +455,21 @@ class UserApiManager(
                 it.copy(enabled = false, status = UserApiRuntimeStatus.IDLE, errorMessage = null, latencyMs = null)
             }
         } else {
-            val target = _sources.value.firstOrNull { it.id == id }?.copy(enabled = true) ?: return
-            updateSourceState(id) { it.copy(enabled = true) }
+            val target = _sources.value.firstOrNull { it.id == id }?.copy(
+                enabled = true,
+                status = UserApiRuntimeStatus.INITIALIZING,
+                errorMessage = null,
+                latencyMs = null
+            ) ?: return
+            clearCooldownsForSource(id)
+            updateSourceState(id) {
+                it.copy(
+                    enabled = true,
+                    status = UserApiRuntimeStatus.INITIALIZING,
+                    errorMessage = null,
+                    latencyMs = null
+                )
+            }
             scope.launch { startRuntime(target) }
         }
     }
@@ -597,14 +645,15 @@ class UserApiManager(
         )
     }
 
-    suspend fun movePriorityUp(id: String) {
+    suspend fun movePriorityUp(id: String) = priorityMutex.withLock {
         val current = dao.getAllOnce().toMutableList()
         val index = current.indexOfFirst { it.id == id }
-        if (index <= 0) return
+        if (index <= 0) return@withLock
         val item = current.removeAt(index)
         current.add(index - 1, item)
         val updated = current.mapIndexed { idx, entity -> entity.copy(priority = idx) }
         dao.updateAll(updated)
+        clearCooldownsForSource(id)
 
         val priorityMap = updated.associate { it.id to it.priority }
         _sources.update { list ->
@@ -618,6 +667,9 @@ class UserApiManager(
     suspend fun testSourceHealth(id: String): Result<Long> = withContext(Dispatchers.IO) {
         val source = _sources.value.firstOrNull { it.id == id }
             ?: return@withContext Result.failure(IllegalStateException("音源不存在"))
+        if (!source.enabled) {
+            return@withContext Result.failure(IllegalStateException("请先启用该音源后再测速"))
+        }
         var runtime = runtimes[id]
         if (runtime == null) {
             startRuntime(source)
@@ -631,75 +683,102 @@ class UserApiManager(
         val platformOrder = currentMeta?.supportedPlatforms?.keys
             ?.mapNotNull { code ->
                 MusicSource.entries.firstOrNull {
-                    it.code.equals(code, ignoreCase = true) && it != MusicSource.LOCAL
+                    it.code.equals(code, ignoreCase = true) && it.code in SEARCHABLE_PLATFORM_CODES
                 }
             }
             ?.distinct()
-            ?.sortedByDescending { MusicAggregator.platformPriority(it) }
+            ?.sortedByDescending { platform ->
+                // Prefer platforms with highest open-catalog availability for health checks first
+                when (platform) {
+                    MusicSource.KW -> 4
+                    MusicSource.KG -> 3
+                    MusicSource.TX -> 2
+                    MusicSource.WY -> 1
+                    else -> 0
+                }
+            }
             .orEmpty()
         if (platformOrder.isEmpty()) {
             val msg = "音源未声明可用音乐平台"
             updateSourceState(id) {
-                it.copy(status = UserApiRuntimeStatus.ERROR, latencyMs = null, errorMessage = msg)
+                if (!it.enabled) it else it.copy(status = UserApiRuntimeStatus.ERROR, latencyMs = null, errorMessage = msg)
             }
             return@withContext Result.failure(IllegalStateException(msg))
         }
 
-        var probeTrack: Track? = null
+        val runtimeGen = currentGeneration(id)
+        var lastFriendlyError: String? = null
+        var testedAnyTrack = false
         for (platform in platformOrder) {
-            val found = try {
-                aggregator.searchSinglePlatform(platform, "晴天", limit = 3).firstOrNull()
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Throwable) {
-                null
+            var probeTrack: Track? = null
+            for (query in HEALTH_PROBE_QUERIES) {
+                val found = try {
+                    aggregator.searchSinglePlatform(platform, query, limit = 3).firstOrNull()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+                if (found != null) {
+                    probeTrack = found
+                    break
+                }
             }
-            if (found != null) {
-                probeTrack = found
-                break
+            if (probeTrack == null) continue
+            testedAnyTrack = true
+
+            val start = System.currentTimeMillis()
+            val probeRes = activeRuntime.requestMusicUrl(probeTrack, AudioQuality.Q128K, timeoutMs = 6_000L)
+            val url = probeRes.getOrNull()
+            val playable = url != null && verifyPlayableAudioUrl(url)
+            val elapsed = (System.currentTimeMillis() - start).coerceAtLeast(1L)
+
+            if (playable) {
+                if (currentGeneration(id) == runtimeGen) {
+                    clearCooldownsForSource(id)
+                    updateSourceState(id) {
+                        if (!it.enabled) it else it.copy(latencyMs = elapsed, status = UserApiRuntimeStatus.READY, errorMessage = null)
+                    }
+                }
+                return@withContext Result.success(elapsed)
+            } else {
+                val rawErr = probeRes.exceptionOrNull()?.message ?: "返回链接不可播放"
+                lastFriendlyError = LxQuickJsRuntime.formatFriendlyError(rawErr)
+                if (currentGeneration(id) == runtimeGen) {
+                    markCooldown(id, probeTrack.source.code)
+                }
             }
         }
-        if (probeTrack == null) {
-            val msg = "测试曲目检索失败，请检查网络"
-            updateSourceState(id) {
-                it.copy(status = UserApiRuntimeStatus.ERROR, latencyMs = null, errorMessage = msg)
-            }
-            return@withContext Result.failure(IllegalStateException(msg))
-        }
 
-        val start = System.currentTimeMillis()
-        val probeRes = activeRuntime.requestMusicUrl(probeTrack, AudioQuality.Q128K, timeoutMs = 6_000L)
-        val url = probeRes.getOrNull()
-        val playable = url != null && verifyPlayableAudioUrl(url)
-        val elapsed = (System.currentTimeMillis() - start).coerceAtLeast(1L)
-
-        if (playable) {
-            clearCooldownsForSource(id)
-            updateSourceState(id) {
-                it.copy(latencyMs = elapsed, status = UserApiRuntimeStatus.READY, errorMessage = null)
-            }
-            Result.success(elapsed)
+        val finalMsg = if (!testedAnyTrack) {
+            "测试曲目检索失败，请检查网络"
         } else {
-            val rawErr = probeRes.exceptionOrNull()?.message ?: "返回链接不可播放"
-            val friendly = LxQuickJsRuntime.formatFriendlyError(rawErr)
-            markCooldown(id, probeTrack.source.code)
-            updateSourceState(id) {
-                it.copy(
-                    status = UserApiRuntimeStatus.ERROR,
-                    latencyMs = null,
-                    errorMessage = "测速失败：$friendly"
-                )
-            }
-            Result.failure(IllegalStateException(friendly))
+            lastFriendlyError ?: "当前各平台测试曲目均未返回可播链接"
         }
+        // Keep an initialized QuickJS runtime READY so a temporary probe miss never permanently disables
+        // playback across other tracks; surface a soft warning message on the card instead.
+        if (currentGeneration(id) == runtimeGen) {
+            updateSourceState(id) {
+                if (!it.enabled) {
+                    it
+                } else {
+                    it.copy(
+                        status = UserApiRuntimeStatus.READY,
+                        latencyMs = null,
+                        errorMessage = "测速未通过：$finalMsg"
+                    )
+                }
+            }
+        }
+        Result.failure(IllegalStateException(finalMsg))
     }
 
     /**
-     * High-speed concurrent racing stream resolver:
-     * 1. Quality-tier-first parallel racing across all ready sources (guarantees SQ/HR priority over single-source downgrade)
-     * 2. Per-source/platform pruning & 45s cooldown ONLY on transport/runtime failures (preserves FLAC -> 320k -> 128k fallback)
-     * 3. Live cancellable HTTP Range audio-header probe (2.5s timeout; first valid URL wins & cancels all siblings)
-     * 4. Parallel cross-platform fallback across attached alternates & dynamic fuzzy search matches
+     * Priority-aware, time-bounded stream resolver:
+     * 1. Explicit `preferredSourceId` tries its full downward quality chain before falling back to other sources.
+     * 2. Normal playback honors user source priority (Priority #0 tried first; backup sources race in parallel on miss).
+     * 3. Per-(source, platform) & per-(source, track) exclusions keep single-source cross-platform fallback alive.
+     * 4. Strict total time budget (18s) + per-request dead-tier pruning prevents 30s-60s spinner stalls.
      */
     suspend fun resolveStream(
         track: Track,
@@ -707,9 +786,12 @@ class UserApiManager(
         allowCrossPlatformFallback: Boolean = true,
         preferredSourceId: String? = null,
         excludedSourceIds: Set<String> = emptySet(),
-        excludedTrackIds: Set<String> = emptySet()
+        excludedTrackIds: Set<String> = emptySet(),
+        excludedSourcePlatforms: Set<String> = emptySet(),
+        excludedSourceTracks: Set<String> = emptySet()
     ): Result<ResolvedStream> = withContext(Dispatchers.IO) {
-        awaitInitialLoadIfNeeded()
+        awaitInitialLoadIfNeeded(preferredSourceId = preferredSourceId)
+        val deadlineMs = System.currentTimeMillis() + RESOLVE_TOTAL_BUDGET_MS
         val readySources = _sources.value
             .filter {
                 it.enabled &&
@@ -729,57 +811,122 @@ class UserApiManager(
         }
 
         val prunedSourcePlatforms = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+        prunedSourcePlatforms.addAll(excludedSourcePlatforms)
+        val prunedSourceTracks = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+        prunedSourceTracks.addAll(excludedSourceTracks)
+        val trackMissCounts = ConcurrentHashMap<String, AtomicInteger>()
 
-        // 1. Primary track: race across ready sources by quality tier
+        val attemptedTrackIds = excludedTrackIds.toMutableSet()
+        val attachedAlts = if (allowCrossPlatformFallback) {
+            track.alternates
+                .filter { it.id !in excludedTrackIds }
+                .sortedByDescending { MusicAggregator.platformPriority(it.source) }
+        } else {
+            emptyList()
+        }
+
+        // Phase A: Healthy (non-cooling) sources — Primary -> Attached Alts -> Dynamic Alts
         if (track.id !in excludedTrackIds) {
-            tryResolveTracksByQualityTiers(
+            attemptedTrackIds.add(track.id)
+            tryResolveTracks(
                 tracks = listOf(track),
                 preferredQuality = preferredQuality,
                 sources = readySources,
                 switchedPlatform = false,
                 preferredSourceId = preferredSourceId,
-                prunedSourcePlatforms = prunedSourcePlatforms
+                prunedSourcePlatforms = prunedSourcePlatforms,
+                prunedSourceTracks = prunedSourceTracks,
+                trackMissCounts = trackMissCounts,
+                includeCooling = false,
+                deadlineMs = deadlineMs
             )?.let { return@withContext Result.success(it) }
         }
 
-        // 2. Cross-platform fallback: race across attached deduplicated alternates in parallel
-        if (allowCrossPlatformFallback) {
-            val attachedAlts = track.alternates
-                .filter { it.id !in excludedTrackIds }
-                .sortedByDescending { MusicAggregator.platformPriority(it.source) }
+        var dynamicCandidates: List<Track> = emptyList()
+        if (allowCrossPlatformFallback && System.currentTimeMillis() < deadlineMs) {
             if (attachedAlts.isNotEmpty()) {
-                tryResolveTracksByQualityTiers(
+                attachedAlts.forEach { attemptedTrackIds.add(it.id) }
+                tryResolveTracks(
                     tracks = attachedAlts,
                     preferredQuality = preferredQuality,
                     sources = readySources,
                     switchedPlatform = true,
                     preferredSourceId = preferredSourceId,
-                    prunedSourcePlatforms = prunedSourcePlatforms
+                    prunedSourcePlatforms = prunedSourcePlatforms,
+                    prunedSourceTracks = prunedSourceTracks,
+                    trackMissCounts = trackMissCounts,
+                    includeCooling = false,
+                    deadlineMs = deadlineMs
                 )?.let { return@withContext Result.success(it) }
             }
 
-            // 3. Dynamic cross-platform search & fuzzy match across remaining platforms
-            val triedPlatformCodes = (listOf(track) + attachedAlts).map { it.source.code }.toSet()
-            val remainingPlatformCodes = readySources
-                .flatMap { it.supportedPlatforms.keys }
-                .filter { it !in triedPlatformCodes }
-                .toSet()
-            val searchPlatformCodes = remainingPlatformCodes.ifEmpty {
-                readySources.flatMap { it.supportedPlatforms.keys }.toSet()
-            }
-            val dynamicAlts = withTimeoutOrNull(3_500L) {
-                aggregator.findAlternativeTracks(track, searchPlatformCodes)
-            }.orEmpty().filter { it.id !in excludedTrackIds }
+            if (System.currentTimeMillis() < deadlineMs) {
+                val triedPlatformCodes = (listOf(track) + attachedAlts).map { it.source.code }.toSet()
+                val searchableSupported = readySources
+                    .flatMap { it.supportedPlatforms.keys }
+                    .map { it.lowercase(Locale.ROOT) }
+                    .filter { it in SEARCHABLE_PLATFORM_CODES }
+                    .toSet()
+                val remainingPlatformCodes = searchableSupported.filter { it !in triedPlatformCodes }.toSet()
+                val searchPlatformCodes = remainingPlatformCodes.ifEmpty { searchableSupported }
 
-            if (dynamicAlts.isNotEmpty()) {
-                val bestPerPlatform = dynamicAlts.distinctBy { it.source }.take(3)
-                tryResolveTracksByQualityTiers(
-                    tracks = bestPerPlatform,
+                val searchBudgetMs = minOf(3_500L, (deadlineMs - System.currentTimeMillis()).coerceAtLeast(500L))
+                val dynamicAlts = if (searchPlatformCodes.isNotEmpty()) {
+                    withTimeoutOrNull(searchBudgetMs) {
+                        aggregator.findAlternativeTracks(track, searchPlatformCodes)
+                    }.orEmpty().filter { it.id !in attemptedTrackIds }
+                } else {
+                    emptyList()
+                }
+
+                if (dynamicAlts.isNotEmpty()) {
+                    dynamicCandidates = dynamicAlts.distinctBy { it.source }.take(3)
+                    dynamicCandidates.forEach { attemptedTrackIds.add(it.id) }
+                    tryResolveTracks(
+                        tracks = dynamicCandidates,
+                        preferredQuality = preferredQuality,
+                        sources = readySources,
+                        switchedPlatform = true,
+                        preferredSourceId = preferredSourceId,
+                        prunedSourcePlatforms = prunedSourcePlatforms,
+                        prunedSourceTracks = prunedSourceTracks,
+                        trackMissCounts = trackMissCounts,
+                        includeCooling = false,
+                        deadlineMs = deadlineMs
+                    )?.let { return@withContext Result.success(it) }
+                }
+            }
+        }
+
+        // Phase B: Cooling sources fallback ONLY after healthy primary & cross-platform alternates are exhausted
+        if (System.currentTimeMillis() < deadlineMs) {
+            if (track.id !in excludedTrackIds) {
+                tryResolveTracks(
+                    tracks = listOf(track),
+                    preferredQuality = preferredQuality,
+                    sources = readySources,
+                    switchedPlatform = false,
+                    preferredSourceId = preferredSourceId,
+                    prunedSourcePlatforms = prunedSourcePlatforms,
+                    prunedSourceTracks = prunedSourceTracks,
+                    trackMissCounts = trackMissCounts,
+                    includeCooling = true,
+                    deadlineMs = deadlineMs
+                )?.let { return@withContext Result.success(it) }
+            }
+            val allAlts = (attachedAlts + dynamicCandidates).distinctBy { it.id }
+            if (allowCrossPlatformFallback && allAlts.isNotEmpty() && System.currentTimeMillis() < deadlineMs) {
+                tryResolveTracks(
+                    tracks = allAlts,
                     preferredQuality = preferredQuality,
                     sources = readySources,
                     switchedPlatform = true,
                     preferredSourceId = preferredSourceId,
-                    prunedSourcePlatforms = prunedSourcePlatforms
+                    prunedSourcePlatforms = prunedSourcePlatforms,
+                    prunedSourceTracks = prunedSourceTracks,
+                    trackMissCounts = trackMissCounts,
+                    includeCooling = true,
+                    deadlineMs = deadlineMs
                 )?.let { return@withContext Result.success(it) }
             }
         }
@@ -787,44 +934,140 @@ class UserApiManager(
         Result.failure(IllegalStateException("所有音源与平台均无法获取《${track.title}》的可用音频流"))
     }
 
-    private suspend fun tryResolveTracksByQualityTiers(
+    private suspend fun tryResolveTracks(
         tracks: List<Track>,
         preferredQuality: AudioQuality,
         sources: List<UserApiSource>,
         switchedPlatform: Boolean,
         preferredSourceId: String?,
-        prunedSourcePlatforms: MutableSet<String>
+        prunedSourcePlatforms: MutableSet<String>,
+        prunedSourceTracks: MutableSet<String>,
+        trackMissCounts: ConcurrentHashMap<String, AtomicInteger>,
+        includeCooling: Boolean,
+        deadlineMs: Long
     ): ResolvedStream? {
         val qualityChain = AudioQuality.fallbackChain(preferredQuality)
 
-        // Pass 1: Healthy (non-cooling) sources first across all quality tiers
+        // When user explicitly selected a source, honor it across its full downward quality chain first
+        // (bypassing cooldown in Phase A so explicit manual source picks always try the chosen source).
+        if (!preferredSourceId.isNullOrBlank()) {
+            val preferredSources = sources.filter { it.id == preferredSourceId }
+            val otherSources = sources.filterNot { it.id == preferredSourceId }
+            if (preferredSources.isNotEmpty()) {
+                if (!includeCooling) {
+                    for (quality in qualityChain) {
+                        if (System.currentTimeMillis() >= deadlineMs) return null
+                        val candidates = buildTierCandidates(
+                            tracks = tracks,
+                            quality = quality,
+                            sources = preferredSources,
+                            switchedPlatform = switchedPlatform,
+                            prunedSourcePlatforms = prunedSourcePlatforms,
+                            prunedSourceTracks = prunedSourceTracks,
+                            trackMissCounts = trackMissCounts,
+                            includeCooling = false,
+                            ignoreCooldown = true
+                        )
+                        if (candidates.isEmpty()) continue
+                        raceFirstValid(
+                            candidates = candidates,
+                            prunedSourcePlatforms = prunedSourcePlatforms,
+                            prunedSourceTracks = prunedSourceTracks,
+                            trackMissCounts = trackMissCounts,
+                            switchedSourceOnWin = false,
+                            deadlineMs = deadlineMs
+                        )?.let { return it }
+                    }
+                }
+                if (otherSources.isEmpty()) return null
+                return tryResolveQualityTiersOrdered(
+                    tracks = tracks,
+                    qualityChain = qualityChain,
+                    sources = otherSources,
+                    switchedPlatform = switchedPlatform,
+                    prunedSourcePlatforms = prunedSourcePlatforms,
+                    prunedSourceTracks = prunedSourceTracks,
+                    trackMissCounts = trackMissCounts,
+                    includeCooling = includeCooling,
+                    initialSwitched = true,
+                    deadlineMs = deadlineMs
+                )
+            }
+        }
+
+        return tryResolveQualityTiersOrdered(
+            tracks = tracks,
+            qualityChain = qualityChain,
+            sources = sources,
+            switchedPlatform = switchedPlatform,
+            prunedSourcePlatforms = prunedSourcePlatforms,
+            prunedSourceTracks = prunedSourceTracks,
+            trackMissCounts = trackMissCounts,
+            includeCooling = includeCooling,
+            initialSwitched = false,
+            deadlineMs = deadlineMs
+        )
+    }
+
+    private suspend fun tryResolveQualityTiersOrdered(
+        tracks: List<Track>,
+        qualityChain: List<AudioQuality>,
+        sources: List<UserApiSource>,
+        switchedPlatform: Boolean,
+        prunedSourcePlatforms: MutableSet<String>,
+        prunedSourceTracks: MutableSet<String>,
+        trackMissCounts: ConcurrentHashMap<String, AtomicInteger>,
+        includeCooling: Boolean,
+        initialSwitched: Boolean,
+        deadlineMs: Long
+    ): ResolvedStream? {
         for (quality in qualityChain) {
+            if (System.currentTimeMillis() >= deadlineMs) return null
             val candidates = buildTierCandidates(
                 tracks = tracks,
                 quality = quality,
                 sources = sources,
                 switchedPlatform = switchedPlatform,
                 prunedSourcePlatforms = prunedSourcePlatforms,
-                includeCooling = false
+                prunedSourceTracks = prunedSourceTracks,
+                trackMissCounts = trackMissCounts,
+                includeCooling = includeCooling
             )
             if (candidates.isEmpty()) continue
-            raceTier(candidates, preferredSourceId, prunedSourcePlatforms)?.let { return it }
-        }
 
-        // Pass 2: Fallback to cooling sources that haven't already failed in this request
-        for (quality in qualityChain) {
-            val candidates = buildTierCandidates(
-                tracks = tracks,
-                quality = quality,
-                sources = sources,
-                switchedPlatform = switchedPlatform,
-                prunedSourcePlatforms = prunedSourcePlatforms,
-                includeCooling = true
-            )
-            if (candidates.isEmpty()) continue
-            raceTier(candidates, preferredSourceId, prunedSourcePlatforms)?.let { return it }
+            // Respect user's top-priority source (#0) on single-track primary resolution so
+            // reordering sources in SourceManager deterministically takes effect; race backups in parallel on miss.
+            if (tracks.size == 1 && candidates.size > 1) {
+                val primaryCandidate = candidates.first()
+                val backupCandidates = candidates.drop(1)
+                raceFirstValid(
+                    candidates = listOf(primaryCandidate),
+                    prunedSourcePlatforms = prunedSourcePlatforms,
+                    prunedSourceTracks = prunedSourceTracks,
+                    trackMissCounts = trackMissCounts,
+                    switchedSourceOnWin = initialSwitched,
+                    deadlineMs = deadlineMs
+                )?.let { return it }
+                if (System.currentTimeMillis() >= deadlineMs) return null
+                raceInBalancedWaves(
+                    candidates = backupCandidates,
+                    prunedSourcePlatforms = prunedSourcePlatforms,
+                    prunedSourceTracks = prunedSourceTracks,
+                    trackMissCounts = trackMissCounts,
+                    initialSwitched = true,
+                    deadlineMs = deadlineMs
+                )?.let { return it }
+            } else {
+                raceInBalancedWaves(
+                    candidates = candidates,
+                    prunedSourcePlatforms = prunedSourcePlatforms,
+                    prunedSourceTracks = prunedSourceTracks,
+                    trackMissCounts = trackMissCounts,
+                    initialSwitched = initialSwitched,
+                    deadlineMs = deadlineMs
+                )?.let { return it }
+            }
         }
-
         return null
     }
 
@@ -834,21 +1077,31 @@ class UserApiManager(
         sources: List<UserApiSource>,
         switchedPlatform: Boolean,
         prunedSourcePlatforms: Set<String>,
-        includeCooling: Boolean
+        prunedSourceTracks: Set<String>,
+        trackMissCounts: ConcurrentHashMap<String, AtomicInteger>,
+        includeCooling: Boolean,
+        ignoreCooldown: Boolean = false
     ): List<ResolveCandidate> {
         val result = mutableListOf<ResolveCandidate>()
         for (track in tracks) {
-            val platformCode = track.source.code
+            val platformCode = track.source.code.lowercase(Locale.ROOT)
             for (source in sources) {
                 val supportedQualities = source.supportedPlatforms[platformCode] ?: continue
                 val supportsTier = quality.lxType in supportedQualities ||
                     (supportedQualities.isEmpty() && quality == AudioQuality.Q128K)
                 if (!supportsTier) continue
 
-                val key = cooldownKey(source.id, platformCode)
-                if (key in prunedSourcePlatforms) continue
-                val cooling = isInCooldown(key)
-                if (includeCooling != cooling) continue
+                val platKey = sourcePlatformKey(source.id, platformCode)
+                if (platKey in prunedSourcePlatforms) continue
+                val trackKey = sourceTrackKey(source.id, track.id)
+                if (trackKey in prunedSourceTracks) continue
+                // Skip redundant intermediate tiers (e.g. 320k after FLAC24 + FLAC both missed),
+                // but NEVER skip Q128K fallback which is frequently the only free/playable tier.
+                if (quality != AudioQuality.Q128K && (trackMissCounts[trackKey]?.get() ?: 0) >= 2) continue
+                if (!ignoreCooldown) {
+                    val cooling = isInCooldown(platKey)
+                    if (includeCooling != cooling) continue
+                }
 
                 val runtime = runtimes[source.id]
                 result.add(ResolveCandidate(track, source, runtime, quality, switchedPlatform))
@@ -857,39 +1110,24 @@ class UserApiManager(
         return result
     }
 
-    private suspend fun raceTier(
-        candidates: List<ResolveCandidate>,
-        preferredSourceId: String?,
-        prunedSourcePlatforms: MutableSet<String>
-    ): ResolvedStream? {
-        if (candidates.isEmpty()) return null
-
-        if (!preferredSourceId.isNullOrBlank()) {
-            val preferred = candidates.filter { it.source.id == preferredSourceId }
-            val others = candidates.filterNot { it.source.id == preferredSourceId }
-            if (preferred.isNotEmpty()) {
-                raceFirstValid(preferred, prunedSourcePlatforms, switchedSourceOnWin = false)?.let { return it }
-                if (others.isNotEmpty()) {
-                    return raceInBalancedWaves(others, prunedSourcePlatforms, initialSwitched = true)
-                }
-                return null
-            }
-        }
-
-        return raceInBalancedWaves(candidates, prunedSourcePlatforms, initialSwitched = false)
-    }
-
     private suspend fun raceInBalancedWaves(
         candidates: List<ResolveCandidate>,
         prunedSourcePlatforms: MutableSet<String>,
-        initialSwitched: Boolean
+        prunedSourceTracks: MutableSet<String>,
+        trackMissCounts: ConcurrentHashMap<String, AtomicInteger>,
+        initialSwitched: Boolean,
+        deadlineMs: Long
     ): ResolvedStream? {
         val waveSize = if (networkAdvisor.isMeteredNetwork()) 2 else 3
         candidates.chunked(waveSize).forEachIndexed { waveIdx, wave ->
+            if (System.currentTimeMillis() >= deadlineMs) return null
             raceFirstValid(
                 candidates = wave,
                 prunedSourcePlatforms = prunedSourcePlatforms,
-                switchedSourceOnWin = initialSwitched || waveIdx > 0
+                prunedSourceTracks = prunedSourceTracks,
+                trackMissCounts = trackMissCounts,
+                switchedSourceOnWin = initialSwitched || waveIdx > 0,
+                deadlineMs = deadlineMs
             )?.let { return it }
         }
         return null
@@ -898,9 +1136,14 @@ class UserApiManager(
     private suspend fun raceFirstValid(
         candidates: List<ResolveCandidate>,
         prunedSourcePlatforms: MutableSet<String>,
-        switchedSourceOnWin: Boolean
+        prunedSourceTracks: MutableSet<String>,
+        trackMissCounts: ConcurrentHashMap<String, AtomicInteger>,
+        switchedSourceOnWin: Boolean,
+        deadlineMs: Long
     ): ResolvedStream? = withContext(Dispatchers.IO) {
         if (candidates.isEmpty()) return@withContext null
+        val remainingBudgetMs = deadlineMs - System.currentTimeMillis()
+        if (remainingBudgetMs <= 250L) return@withContext null
 
         val winner = CompletableDeferred<ResolvedStream?>()
         val remaining = AtomicInteger(candidates.size)
@@ -909,29 +1152,34 @@ class UserApiManager(
 
         candidates.forEach { candidate ->
             raceScope.launch {
-                val platformCode = candidate.track.source.code
-                val key = cooldownKey(candidate.source.id, platformCode)
+                val platformCode = candidate.track.source.code.lowercase(Locale.ROOT)
+                val platKey = sourcePlatformKey(candidate.source.id, platformCode)
+                val trackKey = sourceTrackKey(candidate.source.id, candidate.track.id)
                 val startMs = System.currentTimeMillis()
                 try {
                     val activeRuntime = candidate.runtime ?: ensureRuntimeReady(candidate.source)
                     if (activeRuntime == null) {
-                        prunedSourcePlatforms.add(key)
+                        prunedSourcePlatforms.add(platKey)
                         markCooldown(candidate.source.id, platformCode)
                         return@launch
                     }
+                    val reqBudget = minOf(
+                        SCRIPT_URL_TIMEOUT_MS,
+                        (deadlineMs - System.currentTimeMillis()).coerceAtLeast(500L)
+                    )
                     val res = activeRuntime.requestMusicUrl(
                         track = candidate.track,
                         quality = candidate.quality,
-                        timeoutMs = SCRIPT_URL_TIMEOUT_MS
+                        timeoutMs = reqBudget
                     )
                     if (res.isSuccess) {
                         val url = res.getOrThrow()
                         if (verifyPlayableAudioUrl(url)) {
                             val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
-                            clearCooldown(key)
+                            clearCooldown(platKey)
                             updateSourceState(candidate.source.id) {
                                 if (it.status == UserApiRuntimeStatus.READY) {
-                                    it.copy(latencyMs = elapsed)
+                                    it.copy(latencyMs = elapsed, errorMessage = null)
                                 } else {
                                     it
                                 }
@@ -947,7 +1195,8 @@ class UserApiManager(
                                 sourceId = candidate.source.id,
                                 providerName = candidate.source.name,
                                 switchedPlatform = candidate.switchedPlatform,
-                                switchedSource = switchedSourceOnWin
+                                switchedSource = switchedSourceOnWin,
+                                sourceRevision = computeSourceRevision(candidate.source)
                             )
                             if (winner.complete(resolved)) {
                                 raceJob.cancel()
@@ -958,6 +1207,10 @@ class UserApiManager(
                                 TAG,
                                 "Stream probe rejected dead/invalid URL from ${candidate.source.name} ($platformCode/${candidate.quality.lxType})"
                             )
+                            trackMissCounts.computeIfAbsent(trackKey) { AtomicInteger(0) }.incrementAndGet()
+                            if (candidate.quality == AudioQuality.Q128K) {
+                                prunedSourceTracks.add(trackKey)
+                            }
                         }
                     } else {
                         val errMsg = res.exceptionOrNull()?.message
@@ -965,10 +1218,20 @@ class UserApiManager(
                             TAG,
                             "Script resolve failed from ${candidate.source.name} ($platformCode/${candidate.quality.lxType}): $errMsg"
                         )
-                        // Only prune & cooldown on transport/runtime failures so FLAC -> 320k -> 128k fallback stays intact
-                        if (isTransportOrRuntimeFailure(errMsg)) {
-                            prunedSourcePlatforms.add(key)
-                            markCooldown(candidate.source.id, platformCode)
+                        when {
+                            isTransportOrRuntimeFailure(errMsg) -> {
+                                prunedSourcePlatforms.add(platKey)
+                                markCooldown(candidate.source.id, platformCode)
+                            }
+                            isDeterministicTrackMiss(errMsg) -> {
+                                prunedSourceTracks.add(trackKey)
+                            }
+                            else -> {
+                                trackMissCounts.computeIfAbsent(trackKey) { AtomicInteger(0) }.incrementAndGet()
+                                if (candidate.quality == AudioQuality.Q128K) {
+                                    prunedSourceTracks.add(trackKey)
+                                }
+                            }
                         }
                     }
                 } catch (e: CancellationException) {
@@ -976,7 +1239,7 @@ class UserApiManager(
                 } catch (t: Throwable) {
                     Log.w(TAG, "Race candidate error (${candidate.source.name}): ${t.message}")
                     if (isTransportOrRuntimeFailure(t.message)) {
-                        prunedSourcePlatforms.add(key)
+                        prunedSourcePlatforms.add(platKey)
                         markCooldown(candidate.source.id, platformCode)
                     }
                 } finally {
@@ -987,8 +1250,12 @@ class UserApiManager(
             }
         }
 
+        val waveTimeoutMs = minOf(
+            SCRIPT_URL_TIMEOUT_MS + STREAM_PROBE_TIMEOUT_MS + 600L,
+            remainingBudgetMs
+        )
         try {
-            withTimeoutOrNull(SCRIPT_URL_TIMEOUT_MS + STREAM_PROBE_TIMEOUT_MS + 600L) {
+            withTimeoutOrNull(waveTimeoutMs) {
                 winner.await()
             }
         } finally {
@@ -996,49 +1263,80 @@ class UserApiManager(
         }
     }
 
-    private suspend fun verifyPlayableAudioUrl(url: String): Boolean = suspendCancellableCoroutine { cont ->
-        val req = runCatching {
-            Request.Builder()
-                .url(url)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                .header("Range", "bytes=0-127")
-                .get()
-                .build()
-        }.getOrElse {
-            cont.resume(false)
-            return@suspendCancellableCoroutine
+    private suspend fun verifyPlayableAudioUrl(url: String): Boolean {
+        val safeUrl = LxQuickJsRuntime.sanitizeRequestUrl(url)
+        if (safeUrl.isEmpty()) return false
+        val rangeStatus = executeProbeRequest(safeUrl, useRange = true)
+        if (rangeStatus == ProbeOutcome.PLAYABLE) return true
+        if (rangeStatus == ProbeOutcome.RETRY_WITHOUT_RANGE) {
+            return executeProbeRequest(safeUrl, useRange = false) == ProbeOutcome.PLAYABLE
         }
-
-        val call = probeClient.newCall(req)
-        cont.invokeOnCancellation {
-            runCatching { call.cancel() }
-        }
-
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                if (cont.isActive) cont.resume(false)
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                val ok = response.use { resp ->
-                    if (resp.code !in listOf(200, 206)) return@use false
-                    val contentType = resp.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
-                    if (contentType.contains("text/html") ||
-                        contentType.contains("application/json") ||
-                        contentType.contains("text/plain")
-                    ) {
-                        return@use false
-                    }
-                    val contentLength = resp.header("Content-Length")?.toLongOrNull()
-                    if (contentLength != null && contentLength == 0L) return@use false
-                    true
-                }
-                if (cont.isActive) cont.resume(ok)
-            }
-        })
+        return false
     }
 
-    private fun cooldownKey(sourceId: String, platformCode: String): String = "${sourceId}_${platformCode}"
+    private enum class ProbeOutcome { PLAYABLE, RETRY_WITHOUT_RANGE, REJECTED }
+
+    private suspend fun executeProbeRequest(safeUrl: String, useRange: Boolean): ProbeOutcome =
+        suspendCancellableCoroutine { cont ->
+            val req = runCatching {
+                Request.Builder()
+                    .url(safeUrl)
+                    .header("User-Agent", LxQuickJsRuntime.CHROME_USER_AGENT)
+                    .apply {
+                        if (useRange) {
+                            header("Range", "bytes=0-127")
+                            get()
+                        } else {
+                            head()
+                        }
+                    }
+                    .build()
+            }.getOrElse {
+                cont.resume(ProbeOutcome.REJECTED)
+                return@suspendCancellableCoroutine
+            }
+
+            val call = probeClient.newCall(req)
+            cont.invokeOnCancellation {
+                runCatching { call.cancel() }
+            }
+
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) cont.resume(ProbeOutcome.REJECTED)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    val outcome = response.use { resp ->
+                        if (useRange && (resp.code == 416 || resp.code == 501)) {
+                            return@use ProbeOutcome.RETRY_WITHOUT_RANGE
+                        }
+                        if (resp.code !in listOf(200, 206)) return@use ProbeOutcome.REJECTED
+                        val contentType = resp.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
+                        if (contentType.contains("text/html") ||
+                            contentType.contains("application/json") ||
+                            contentType.contains("application/xml") ||
+                            contentType.contains("text/xml") ||
+                            contentType.contains("application/javascript") ||
+                            contentType.startsWith("image/")
+                        ) {
+                            return@use ProbeOutcome.REJECTED
+                        }
+                        val contentLength = resp.header("Content-Length")?.toLongOrNull()
+                        if (contentLength != null) {
+                            if (contentLength == 0L) return@use ProbeOutcome.REJECTED
+                            // A tiny 200 OK payload (not a 206 byte range) is almost always an error stub
+                            if (resp.code == 200 && contentLength < 1024L) return@use ProbeOutcome.REJECTED
+                        }
+                        ProbeOutcome.PLAYABLE
+                    }
+                    if (cont.isActive) cont.resume(outcome)
+                }
+            })
+        }
+
+    private fun cooldownKey(sourceId: String, platformCode: String): String =
+        sourcePlatformKey(sourceId, platformCode)
 
     private fun isInCooldown(key: String): Boolean {
         val until = platformCooldowns[key] ?: return false
@@ -1057,7 +1355,7 @@ class UserApiManager(
         platformCooldowns.remove(key)
     }
 
-    private fun clearCooldownsForSource(sourceId: String) {
+    fun clearCooldownsForSource(sourceId: String) {
         val prefix = "${sourceId}_"
         platformCooldowns.keys.filter { it.startsWith(prefix) }.forEach { platformCooldowns.remove(it) }
     }

@@ -309,17 +309,19 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
       Promise.resolve().then(() => events.request.call(globalThis.lx, { source: data.source, action: data.action, info: data.info })).then(response => {
         let result
         switch (data.action) {
-          case 'musicUrl':
-            if (typeof response != 'string' || response.length > 2048 || !/^https?:/.test(response)) throw new Error('failed')
+          case 'musicUrl': {
+            const trimmedUrl = typeof response == 'string' ? response.trim() : ''
+            if (!trimmedUrl || trimmedUrl.length > 2048 || !/^https?:/i.test(trimmedUrl)) throw new Error('failed')
             result = {
               source: data.source,
               action: data.action,
               data: {
                 type: data.info.type,
-                url: response,
+                url: trimmedUrl,
               },
             }
             break
+          }
           case 'lyric':
             result = {
               source: data.source,
@@ -327,14 +329,16 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
               data: verifyLyricInfo(response),
             }
             break
-          case 'pic':
-            if (typeof response != 'string' || response.length > 2048 || !/^https?:/.test(response)) throw new Error('failed')
+          case 'pic': {
+            const trimmedPic = typeof response == 'string' ? response.trim() : ''
+            if (!trimmedPic || trimmedPic.length > 2048 || !/^https?:/i.test(trimmedPic)) throw new Error('failed')
             result = {
               source: data.source,
               action: data.action,
-              data: response,
+              data: trimmedPic,
             }
             break
+          }
         }
         nativeCall(NATIVE_EVENTS_NAMES.response, { requestKey, status: true, result })
       }).catch(err => {

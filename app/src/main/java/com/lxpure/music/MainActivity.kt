@@ -989,6 +989,15 @@ private fun LxPureRoot(container: AppContainer) {
                         onSetSleepTimer = { mins ->
                             container.playerController.setSleepTimerMinutes(mins)
                         },
+                        readySources = remember(sources) {
+                            sources.filter { it.enabled && it.status == UserApiRuntimeStatus.READY }
+                        },
+                        onSelectSource = { sourceId ->
+                            container.playerController.switchSource(sourceId)
+                        },
+                        onSwitchAlternateSource = {
+                            container.playerController.switchToAlternateSource()
+                        },
                         isExpanded = isPlayerExpanded,
                         onArtistClick = { artistName ->
                             if (isPlayerExpanded) {

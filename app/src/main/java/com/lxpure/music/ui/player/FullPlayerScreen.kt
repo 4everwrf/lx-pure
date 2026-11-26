@@ -37,8 +37,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
@@ -64,6 +66,7 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
+import androidx.compose.material.icons.rounded.SwapHoriz
 import androidx.compose.material.icons.rounded.Translate
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -126,6 +129,7 @@ import com.lxpure.music.domain.model.PlaybackQueueSource
 import com.lxpure.music.domain.model.QueueSourceType
 import com.lxpure.music.domain.model.RepeatMode
 import com.lxpure.music.domain.model.Track
+import com.lxpure.music.domain.model.UserApiSource
 import com.lxpure.music.ui.components.AlbumArtwork
 import com.lxpure.music.ui.components.MiniEqualizerIndicator
 import com.lxpure.music.ui.components.SyncDialogSystemBars
@@ -161,6 +165,9 @@ fun FullPlayerScreen(
     onOpenQueue: () -> Unit,
     onSelectQuality: (AudioQuality) -> Unit,
     onSetSleepTimer: (Int?) -> Unit,
+    readySources: List<UserApiSource> = emptyList(),
+    onSelectSource: (String) -> Unit = {},
+    onSwitchAlternateSource: () -> Unit = {},
     isExpanded: Boolean = true,
     onArtistClick: (String) -> Unit = {}
 ) {
@@ -683,6 +690,7 @@ fun FullPlayerScreen(
         val lxColors = LocalLxColors.current
         ModalBottomSheet(
             onDismissRequest = { showQualitySheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
             containerColor = lxColors.surfaceElevated
         ) {
             SyncDialogSystemBars(
@@ -691,6 +699,7 @@ fun FullPlayerScreen(
             )
             Column(
                 modifier = Modifier
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 10.dp)
                     .padding(bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -713,7 +722,7 @@ fun FullPlayerScreen(
                                 onSelectQuality(q)
                                 showQualitySheet = false
                             }
-                            .padding(horizontal = 14.dp, vertical = 14.dp),
+                            .padding(horizontal = 14.dp, vertical = 13.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -740,6 +749,106 @@ fun FullPlayerScreen(
                                     tint = lxColors.accent,
                                     modifier = Modifier.size(18.dp)
                                 )
+                            }
+                        }
+                    }
+                }
+
+                if (!track.isLocal && readySources.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    HorizontalDivider(color = lxColors.hairline)
+                    Spacer(Modifier.height(10.dp))
+                    Text("切换音源", style = MaterialTheme.typography.titleMedium, color = lxColors.textPrimary)
+                    Spacer(Modifier.height(4.dp))
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(lxColors.hairline.copy(alpha = 0.45f))
+                            .clickable {
+                                onSwitchAlternateSource()
+                                showQualitySheet = false
+                            }
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.SwapHoriz,
+                                contentDescription = null,
+                                tint = lxColors.accent,
+                                modifier = Modifier.size(19.dp)
+                            )
+                            Text(
+                                text = "自动换源重试（切换其他音源/平台）",
+                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                                color = lxColors.textPrimary,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Icon(
+                            imageVector = Icons.Rounded.ChevronRight,
+                            contentDescription = null,
+                            tint = lxColors.textTertiary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    Spacer(Modifier.height(4.dp))
+
+                    readySources.forEach { src ->
+                        val isActiveSource = state.activeStreamSourceId == src.id ||
+                            (state.activeStreamSourceId == null && state.activeProviderName == src.name)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (isActiveSource) lxColors.accentSoft else Color.Transparent)
+                                .clickable {
+                                    onSelectSource(src.id)
+                                    showQualitySheet = false
+                                }
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = src.name,
+                                style = MaterialTheme.typography.bodyLarge.copy(
+                                    fontWeight = if (isActiveSource) FontWeight.SemiBold else FontWeight.Normal
+                                ),
+                                color = if (isActiveSource) lxColors.accent else lxColors.textPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                src.latencyMs?.let { ms ->
+                                    Text(
+                                        text = "${ms}ms",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (isActiveSource) lxColors.accent else lxColors.textTertiary
+                                    )
+                                }
+                                if (isActiveSource) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Check,
+                                        contentDescription = "当前音源",
+                                        tint = lxColors.accent,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
                             }
                         }
                     }

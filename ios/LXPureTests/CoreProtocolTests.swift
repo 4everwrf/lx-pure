@@ -1296,4 +1296,71 @@ final class CoreProtocolTests: XCTestCase {
         hardNav.onTrackRemovedFromQueue(removedIndex: -1, newCurrentIndex: 0, newQueueSize: 2, mode: .shuffle)
         XCTAssertEqual(hardNav.peekNextIndexForAutoAdvance(queueSize: 2, currentIndex: 0, mode: .shuffle), 1)
     }
+
+    func testPlaybackFastFailAndSourceSwitchingParitySuite() {
+        // 1. AudioQuality.fallbackChain must strictly descend (never escalate on cellular data saver)
+        XCTAssertEqual(AudioQuality.fallbackChain(preferred: .flac24), [.flac24, .flac, .q320k, .q128k])
+        XCTAssertEqual(AudioQuality.fallbackChain(preferred: .flac), [.flac, .q320k, .q128k])
+        XCTAssertEqual(AudioQuality.fallbackChain(preferred: .q320k), [.q320k, .q128k])
+        XCTAssertEqual(AudioQuality.fallbackChain(preferred: .q128k), [.q128k])
+
+        // 2. Startup HTTP 403 (wasReady = false) immediately switches source; mid-song 403 refreshes same source first
+        let midSong403 = PlaybackRecoveryPolicy.decideRecovery(
+            kind: .expiredOrDeniedUrl,
+            retryAttemptIndex: 0,
+            primaryTrackId: "wy_1001",
+            resolvedTrackId: "wy_1001",
+            wasReady: true
+        )
+        XCTAssertFalse(midSong403.excludeCurrentSource)
+        XCTAssertTrue(midSong403.preferSameSourceFirst)
+
+        let startup403 = PlaybackRecoveryPolicy.decideRecovery(
+            kind: .expiredOrDeniedUrl,
+            retryAttemptIndex: 0,
+            primaryTrackId: "wy_1001",
+            resolvedTrackId: "wy_1001",
+            wasReady: false
+        )
+        XCTAssertTrue(startup403.excludeCurrentSource)
+        XCTAssertFalse(startup403.preferSameSourceFirst)
+        XCTAssertTrue(startup403.evictStreamCache)
+        XCTAssertFalse(startup403.excludeResolvedTrack)
+
+        // 3. Scoped AudioCacheManager cache keys isolate sourceId, resolvedTrackId, and script revision
+        let k1 = AudioCacheManager.cacheKey(
+            trackId: "wy_1",
+            resolvedTrackId: "wy_1",
+            sourceId: "src_a",
+            sourceRevision: "rev11111",
+            quality: .flac
+        )
+        let k2 = AudioCacheManager.cacheKey(
+            trackId: "wy_1",
+            resolvedTrackId: "wy_1",
+            sourceId: "src_b",
+            sourceRevision: "rev11111",
+            quality: .flac
+        )
+        let k3 = AudioCacheManager.cacheKey(
+            trackId: "wy_1",
+            resolvedTrackId: "wy_1",
+            sourceId: "src_a",
+            sourceRevision: "rev22222",
+            quality: .flac
+        )
+        XCTAssertNotEqual(k1, k2)
+        XCTAssertNotEqual(k1, k3)
+        XCTAssertTrue(k1.hasSuffix("_flac"))
+
+        // 4. Per-platform/track keys & deterministic track-miss classification
+        XCTAssertEqual(UserApiManager.sourcePlatformKey(sourceId: "s1", platformCode: "WY"), "s1_wy")
+        XCTAssertEqual(UserApiManager.sourceTrackKey(sourceId: "s1", trackId: "wy_1001"), "s1_wy_1001")
+        XCTAssertTrue(UserApiManager.isDeterministicTrackMiss("该歌曲暂无版权"))
+        XCTAssertTrue(UserApiManager.isDeterministicTrackMiss("歌曲已下架 404"))
+        // VIP / 403 on higher tiers must NOT prune full-track fallback so 128k still runs
+        XCTAssertFalse(UserApiManager.isDeterministicTrackMiss("需要VIP会员才可试听无损"))
+        XCTAssertFalse(UserApiManager.isDeterministicTrackMiss("HTTP 403 Forbidden"))
+        XCTAssertFalse(UserApiManager.isDeterministicTrackMiss("当前音质不可用"))
+    }
 }

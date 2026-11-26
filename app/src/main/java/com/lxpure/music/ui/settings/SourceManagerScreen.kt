@@ -424,7 +424,7 @@ private fun SourceItemCard(
         UserApiRuntimeStatus.IDLE -> lxColors.textTertiary
     }
     val statusText = when (source.status) {
-        UserApiRuntimeStatus.READY -> source.latencyMs?.let { "就绪 · ${it}ms" } ?: "已就绪"
+        UserApiRuntimeStatus.READY -> source.errorMessage ?: source.latencyMs?.let { "就绪 · ${it}ms" } ?: "已就绪"
         UserApiRuntimeStatus.INITIALIZING -> "初始化中…"
         UserApiRuntimeStatus.ERROR -> source.errorMessage ?: "初始化失败"
         UserApiRuntimeStatus.IDLE -> "已停用"
@@ -522,7 +522,7 @@ private fun SourceItemCard(
                 }
                 TextButton(
                     onClick = onTestHealth,
-                    enabled = !isTesting && !isUpdating,
+                    enabled = source.enabled && !isTesting && !isUpdating,
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                 ) {
                     if (isTesting) {

@@ -29,6 +29,7 @@ struct PlayerState: Equatable {
     var repeatMode: RepeatMode = .listLoop
     var activeQualityBadge: String? = nil
     var activeProviderName: String? = nil
+    var activeStreamSourceId: String? = nil
     var lyrics: ParsedLyrics = ParsedLyrics()
     var isLoadingLyrics: Bool = false
     var ambientPalette: AmbientPalette = .default
@@ -57,7 +58,15 @@ private struct PreloadedNextItem {
     let providerName: String
     let sourceId: String?
     let resolvedTrackId: String?
+    let resolvedPlatformCode: String?
     let cacheKey: String?
+    let createdAt: Date
+}
+
+private struct PendingBackgroundCache {
+    let remoteUrlString: String
+    let cacheKey: String
+    let quality: AudioQuality
 }
 
 @MainActor
@@ -77,8 +86,12 @@ final class PlayerController: ObservableObject {
 
     private static let preloadWindowMs: Int64 = 20_000
     private static let minTrackDurationForPreloadMs: Int64 = 25_000
+    private static let preloadMaxAgeSec: TimeInterval = 300.0
+    private static let bufferingWatchdogTimeoutNs: UInt64 = 12_000_000_000
     private static let stablePlaybackResetDeltaMs: Int64 = 8_000
     private static let cursorPersistIntervalSec: TimeInterval = 10.0
+    private static let chromeUserAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     private let player = AVPlayer()
     private let queueNavigator = QueueNavigator()
@@ -96,11 +109,14 @@ final class PlayerController: ObservableObject {
     private var timeControlObservation: NSKeyValueObservation?
     private var itemEndObserver: NSObjectProtocol?
     private var itemFailedObserver: NSObjectProtocol?
+    private var itemStalledObserver: NSObjectProtocol?
     private var interruptionObserver: NSObjectProtocol?
     private var routeChangeObserver: NSObjectProtocol?
+    private var sourcesCancellable: AnyCancellable?
 
     private var resolveTask: Task<Void, Never>?
     private var recoveryTask: Task<Void, Never>?
+    private var bufferingWatchdogTask: Task<Void, Never>?
     private var preloadTask: Task<Void, Never>?
     private var coverTask: Task<Void, Never>?
     private var lyricTask: Task<Void, Never>?
@@ -110,13 +126,19 @@ final class PlayerController: ObservableObject {
     private var activeLoadToken = UUID()
     private var activeSeekToken = UUID()
     private var isSeeking = false
+    private var isRestartingForPlay = false
+    private var wantsPlayback = false
+    private var hasEnteredReadyForActiveMedia = false
     private var activeStreamSourceId: String?
     private var activeResolvedTrackId: String?
+    private var activeResolvedPlatformCode: String?
     private var activeCacheKey: String?
+    private var pendingBackgroundCache: PendingBackgroundCache?
     private var pendingResumePositionMs: Int64 = 0
     private var pendingQualityOverride: AudioQuality?
     private var lastRecoveryStartPositionMs: Int64 = 0
-    private var failedSourceIdsForCurrentTrack = Set<String>()
+    private var failedSourcePlatformsForCurrentTrack = Set<String>()
+    private var failedSourceTracksForCurrentTrack = Set<String>()
     private var failedTrackIdsForCurrentTrack = Set<String>()
     private var runtimeRetryCount = 0
     private var consecutiveAutoSkipCount = 0
@@ -161,7 +183,34 @@ final class PlayerController: ObservableObject {
         configureRemoteCommands()
         observePlayerState()
         observeAudioSessionNotifications()
+        observeSourceConfigChanges()
         restoreLastSessionAsync()
+    }
+
+    private func observeSourceConfigChanges() {
+        sourcesCancellable = userApiManager.$sources
+            .map { list in
+                list.map { src in
+                    "\(src.id):\(src.enabled):\(src.priority):\(src.status == .ready):\(UserApiManager.computeSourceRevision(for: src))"
+                }
+            }
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.clearPreloadedNext()
+                if let cur = self.state.currentTrack,
+                   !cur.isLocal,
+                   !self.state.isPlaying,
+                   !self.state.isBuffering,
+                   self.resolveTask == nil {
+                    self.detachCurrentPlayerItem()
+                }
+            }
+    }
+
+    func invalidatePreload() {
+        clearPreloadedNext()
     }
 
     private func restoreLastSessionAsync() {
@@ -310,6 +359,11 @@ final class PlayerController: ObservableObject {
     }
 
     private func detachCurrentPlayerItem() {
+        isRestartingForPlay = false
+        hasEnteredReadyForActiveMedia = false
+        pendingBackgroundCache = nil
+        bufferingWatchdogTask?.cancel()
+        bufferingWatchdogTask = nil
         statusObservation?.invalidate()
         statusObservation = nil
         if let obs = itemEndObserver {
@@ -319,6 +373,10 @@ final class PlayerController: ObservableObject {
         if let obs = itemFailedObserver {
             NotificationCenter.default.removeObserver(obs)
             itemFailedObserver = nil
+        }
+        if let obs = itemStalledObserver {
+            NotificationCenter.default.removeObserver(obs)
+            itemStalledObserver = nil
         }
         player.pause()
         player.replaceCurrentItem(with: nil)
@@ -331,7 +389,7 @@ final class PlayerController: ObservableObject {
         for (command, token) in remoteCommandTargets {
             command.removeTarget(token)
         }
-        [itemEndObserver, itemFailedObserver, interruptionObserver, routeChangeObserver].forEach {
+        [itemEndObserver, itemFailedObserver, itemStalledObserver, interruptionObserver, routeChangeObserver].forEach {
             if let obs = $0 { NotificationCenter.default.removeObserver(obs) }
         }
     }
@@ -373,6 +431,13 @@ final class PlayerController: ObservableObject {
         guard !tracks.isEmpty else { return }
         hasUserInitiatedPlayback = true
         let safeIndex = min(max(startIndex, 0), tracks.count - 1)
+        if resolveTask != nil &&
+            state.currentTrack?.id == tracks[safeIndex].id &&
+            state.queue.count == tracks.count &&
+            state.currentIndex == safeIndex {
+            // Avoid cancelling and restarting an identical in-flight stream resolution on rapid double-taps
+            return
+        }
         consecutiveAutoSkipCount = 0
         pendingQualityOverride = nil
         clearPreloadedNext()
@@ -527,12 +592,27 @@ final class PlayerController: ObservableObject {
 
     func togglePlayPause() {
         if state.currentTrack == nil { return }
+        // If user taps Play while an auto-skip countdown is pending after a failure (button visibly shows ▶),
+        // cancel the countdown and immediately retry playing the current track instead of swallowing the tap.
+        if recoveryTask != nil && resolveTask == nil && !isRecoveringError && !state.isPlaying && !state.isBuffering {
+            recoveryTask?.cancel()
+            recoveryTask = nil
+            let resumeMs = max(progress.positionMs, pendingResumePositionMs)
+            loadAndPlayCurrent(resetRecoveryState: true, seekToMs: resumeMs)
+            return
+        }
         if resolveTask != nil || recoveryTask != nil || isRecoveringError {
+            wantsPlayback = false
             resolveTask?.cancel()
             resolveTask = nil
             recoveryTask?.cancel()
             recoveryTask = nil
+            bufferingWatchdogTask?.cancel()
+            bufferingWatchdogTask = nil
             activeLoadToken = UUID()
+            activeSeekToken = UUID()
+            isSeeking = false
+            isRestartingForPlay = false
             isRecoveringError = false
             resumeAfterInterruption = false
             player.pause()
@@ -548,20 +628,42 @@ final class PlayerController: ObservableObject {
             loadAndPlayCurrent(resetRecoveryState: true, seekToMs: resumeMs)
             return
         }
-        if state.isPlaying || player.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+        if state.isPlaying || state.isBuffering || isRestartingForPlay || player.timeControlStatus != .paused {
+            let wasStuckBeforeReady = !hasEnteredReadyForActiveMedia
+            wantsPlayback = false
             resumeAfterInterruption = false
             activeSeekToken = UUID()
             isSeeking = false
-            player.pause()
+            isRestartingForPlay = false
+            bufferingWatchdogTask?.cancel()
+            bufferingWatchdogTask = nil
+            if wasStuckBeforeReady {
+                // Detach stalled item so the next Play tap re-resolves cleanly instead of hanging on a dead CDN URL
+                detachCurrentPlayerItem()
+            } else {
+                player.pause()
+            }
             state.isPlaying = false
             state.isBuffering = false
             pendingResumePositionMs = progress.positionMs
             persistCursor(force: true)
             updateNowPlayingInfo()
         } else {
+            wantsPlayback = true
             activateAudioSession()
-            player.play()
-            state.isPlaying = true
+            if pendingInitialSeekMs != nil && player.currentItem?.status == .unknown {
+                state.isPlaying = true
+                state.isBuffering = true
+            } else {
+                player.play()
+                state.isPlaying = true
+                if player.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+                    state.isBuffering = true
+                } else if player.timeControlStatus == .playing {
+                    state.isBuffering = false
+                }
+            }
+            scheduleBufferingWatchdogIfNeeded()
             updateNowPlayingInfo()
         }
     }
@@ -571,23 +673,39 @@ final class PlayerController: ObservableObject {
         progress.positionMs = clamped
         state.positionMs = clamped
         pendingResumePositionMs = clamped
-        if pendingInitialSeekMs != nil {
-            pendingInitialSeekMs = clamped
-        }
-        if player.currentItem != nil {
-            let token = UUID()
-            activeSeekToken = token
-            isSeeking = true
-            let target = CMTime(value: clamped, timescale: 1000)
-            player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-                Task { @MainActor in
-                    guard let self, self.activeSeekToken == token else { return }
-                    self.isSeeking = false
-                    self.progress.positionMs = clamped
-                    self.state.positionMs = clamped
-                    self.pendingResumePositionMs = clamped
-                    self.updateNowPlayingInfo()
+        let resumePlayAfterSeek = isRestartingForPlay || (pendingInitialSeekMs != nil && state.isPlaying)
+        isRestartingForPlay = false
+        if let item = player.currentItem {
+            if item.status == .readyToPlay {
+                pendingInitialSeekMs = nil
+                let token = UUID()
+                activeSeekToken = token
+                isSeeking = true
+                isRestartingForPlay = resumePlayAfterSeek
+                let target = CMTime(value: clamped, timescale: 1000)
+                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] _ in
+                    Task { @MainActor in
+                        guard let self, self.activeSeekToken == token else { return }
+                        self.isSeeking = false
+                        let shouldStartPlay = self.isRestartingForPlay
+                        self.isRestartingForPlay = false
+                        guard let item, self.player.currentItem == item else { return }
+                        self.progress.positionMs = clamped
+                        self.state.positionMs = clamped
+                        self.pendingResumePositionMs = clamped
+                        if shouldStartPlay && self.state.isPlaying {
+                            self.activateAudioSession()
+                            self.player.play()
+                            self.state.isBuffering = (self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate)
+                        }
+                        self.updateNowPlayingInfo()
+                    }
                 }
+            } else if item.status == .unknown {
+                pendingInitialSeekMs = clamped
+                updateNowPlayingInfo()
+            } else {
+                updateNowPlayingInfo()
             }
         } else {
             updateNowPlayingInfo()
@@ -613,7 +731,8 @@ final class PlayerController: ObservableObject {
            preloaded.nextIndex == expectedPeek,
            preloaded.nextIndex >= 0,
            preloaded.nextIndex < state.queue.count,
-           preloaded.track.id == state.queue[preloaded.nextIndex].id {
+           preloaded.track.id == state.queue[preloaded.nextIndex].id,
+           (!preloaded.isRemote || Date().timeIntervalSince(preloaded.createdAt) <= Self.preloadMaxAgeSec) {
             queueNavigator.onPromotedPreloadedNext(
                 queueSize: state.queue.count,
                 promotedIndex: preloaded.nextIndex,
@@ -625,7 +744,8 @@ final class PlayerController: ObservableObject {
             recoveryTask = nil
             clearPreloadedNext()
             activeLoadToken = UUID()
-            failedSourceIdsForCurrentTrack.removeAll()
+            failedSourcePlatformsForCurrentTrack.removeAll()
+            failedSourceTracksForCurrentTrack.removeAll()
             failedTrackIdsForCurrentTrack.removeAll()
             runtimeRetryCount = 0
             isRecoveringError = false
@@ -650,6 +770,7 @@ final class PlayerController: ObservableObject {
                 providerName: preloaded.providerName,
                 sourceId: preloaded.sourceId,
                 resolvedTrackId: preloaded.resolvedTrackId,
+                resolvedPlatformCode: preloaded.resolvedPlatformCode,
                 cacheKey: preloaded.cacheKey,
                 seekToMs: 0
             )
@@ -738,7 +859,7 @@ final class PlayerController: ObservableObject {
         }
 
         clearPreloadedNext()
-        if let item = player.currentItem, item.status != .failed {
+        if let item = player.currentItem, item.status == .readyToPlay {
             let shouldPlay = forcePlay || state.isPlaying
             progress.positionMs = 0
             state.positionMs = 0
@@ -746,23 +867,61 @@ final class PlayerController: ObservableObject {
             let token = UUID()
             activeSeekToken = token
             isSeeking = true
+            isRestartingForPlay = shouldPlay
+            if shouldPlay {
+                wantsPlayback = true
+                state.isPlaying = true
+                state.isBuffering = true
+                updateNowPlayingInfo()
+            }
             player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] _ in
                 Task { @MainActor in
                     guard let self, self.activeSeekToken == token else { return }
                     self.isSeeking = false
+                    let resumePlay = self.isRestartingForPlay || shouldPlay || self.state.isPlaying
+                    self.isRestartingForPlay = false
                     guard let item, self.player.currentItem == item else { return }
+                    if item.status == .failed {
+                        if resumePlay {
+                            self.loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+                        }
+                        return
+                    }
                     self.progress.positionMs = 0
                     self.state.positionMs = 0
                     self.pendingResumePositionMs = 0
-                    if shouldPlay {
+                    if resumePlay {
                         self.activateAudioSession()
                         self.player.play()
                         self.state.isPlaying = true
+                        self.state.isBuffering = (self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate)
+                    } else {
+                        self.state.isBuffering = false
                     }
                     self.updateNowPlayingInfo()
                 }
             }
             persistCursor(force: true)
+        } else if let item = player.currentItem, item.status == .unknown {
+            let shouldPlay = forcePlay || state.isPlaying
+            progress.positionMs = 0
+            state.positionMs = 0
+            pendingInitialSeekMs = nil
+            isRestartingForPlay = false
+            if shouldPlay {
+                wantsPlayback = true
+                activateAudioSession()
+                player.play()
+                state.isPlaying = true
+                state.isBuffering = (player.timeControlStatus != .playing)
+            } else {
+                wantsPlayback = false
+                player.pause()
+                state.isPlaying = false
+                state.isBuffering = false
+            }
+            persistCursor(force: true)
+            updateNowPlayingInfo()
         } else if forcePlay || state.isPlaying {
             loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
         } else {
@@ -796,6 +955,7 @@ final class PlayerController: ObservableObject {
 
         // Detach the ended item cleanly instead of issuing an unguarded async seek(to: .zero),
         // eliminating timeObserver/timeControl races and expired-URL auto-recovery.
+        wantsPlayback = false
         detachCurrentPlayerItem()
         progress.positionMs = 0
         state.positionMs = 0
@@ -825,6 +985,7 @@ final class PlayerController: ObservableObject {
 
     func changePreferredQuality(_ quality: AudioQuality) {
         settingsStore.update { $0.preferredQuality = quality }
+        clearPreloadedNext()
         guard let track = state.currentTrack, !track.isLocal else { return }
         if state.activeQualityBadge == "离线" {
             events.send(PlayerUiEvent(message: "已更新偏好音质为 \(quality.label)（当前播放离线文件）"))
@@ -832,17 +993,66 @@ final class PlayerController: ObservableObject {
         }
         let resumePos = max(progress.positionMs, pendingResumePositionMs)
         pendingResumePositionMs = resumePos
-        if state.isPlaying || state.isBuffering || resolveTask != nil {
+        let hasHealthyLoadedItem = player.currentItem != nil && player.currentItem?.status != .failed
+        if state.isPlaying || state.isBuffering || resolveTask != nil || !hasHealthyLoadedItem {
             events.send(PlayerUiEvent(message: "正在切换至 \(quality.label)"))
             loadAndPlayCurrent(resetRecoveryState: true, seekToMs: resumePos, qualityOverride: quality)
         } else {
             // Stay paused; detach current item so the next Play resolves in the newly chosen quality
+            recoveryTask?.cancel()
+            recoveryTask = nil
+            isRecoveringError = false
             detachCurrentPlayerItem()
             pendingQualityOverride = quality
             state.activeQualityBadge = quality.badge
             persistCursor(force: true)
             events.send(PlayerUiEvent(message: "已更新偏好音质为 \(quality.label)，继续播放时生效"))
         }
+    }
+
+    func switchSource(sourceId: String) {
+        guard let track = state.currentTrack else { return }
+        if track.isLocal {
+            events.send(PlayerUiEvent(message: "当前播放本地音频，无需切换在线音源"))
+            return
+        }
+        let sourceName = userApiManager.sources.first(where: { $0.id == sourceId })?.name ?? "指定音源"
+        userApiManager.clearCooldowns(forSourceId: sourceId)
+        let resumePos = max(progress.positionMs, pendingResumePositionMs)
+        events.send(PlayerUiEvent(message: "正在切换至音源：\(sourceName)"))
+        loadAndPlayCurrent(
+            resetRecoveryState: true,
+            seekToMs: resumePos,
+            preferredSourceId: sourceId,
+            bypassOfflineCache: true
+        )
+    }
+
+    func switchToAlternateSource() {
+        guard let track = state.currentTrack else { return }
+        if track.isLocal {
+            events.send(PlayerUiEvent(message: "当前播放本地音频，无需换源"))
+            return
+        }
+        let curSid = activeStreamSourceId ?? state.activeStreamSourceId
+        let curPlat = activeResolvedPlatformCode ?? track.source.code
+        let curResolvedId = activeResolvedTrackId ?? track.id
+        if let curSid, !curSid.isEmpty {
+            failedSourceTracksForCurrentTrack.insert(UserApiManager.sourceTrackKey(sourceId: curSid, trackId: curResolvedId))
+            failedSourcePlatformsForCurrentTrack.insert(UserApiManager.sourcePlatformKey(sourceId: curSid, platformCode: curPlat))
+        }
+        if curResolvedId != track.id {
+            failedTrackIdsForCurrentTrack.insert(curResolvedId)
+        }
+        let resumePos = max(progress.positionMs, pendingResumePositionMs)
+        events.send(PlayerUiEvent(message: "正在尝试切换其他音源或平台…"))
+        loadAndPlayCurrent(
+            resetRecoveryState: true,
+            seekToMs: resumePos,
+            preferredSourceId: nil,
+            preserveExclusions: true,
+            bypassOfflineCache: true
+        )
     }
 
     func setSleepTimer(minutes: Int?) {
@@ -873,11 +1083,18 @@ final class PlayerController: ObservableObject {
                 try? await Task.sleep(nanoseconds: sleepNs)
             }
             guard !Task.isCancelled, let self else { return }
+            self.wantsPlayback = false
             self.resumeAfterInterruption = false
             self.resolveTask?.cancel()
             self.resolveTask = nil
             self.recoveryTask?.cancel()
             self.recoveryTask = nil
+            self.bufferingWatchdogTask?.cancel()
+            self.bufferingWatchdogTask = nil
+            self.activeLoadToken = UUID()
+            self.activeSeekToken = UUID()
+            self.isSeeking = false
+            self.isRestartingForPlay = false
             self.isRecoveringError = false
             self.player.pause()
             self.state.isPlaying = false
@@ -896,12 +1113,15 @@ final class PlayerController: ObservableObject {
         resetRecoveryState: Bool,
         seekToMs: Int64,
         preferredSourceId: String? = nil,
-        qualityOverride: AudioQuality? = nil
+        qualityOverride: AudioQuality? = nil,
+        preserveExclusions: Bool = false,
+        bypassOfflineCache: Bool = false
     ) {
         guard let track = state.currentTrack else { return }
 
         let effectiveQualityOverride = qualityOverride ?? pendingQualityOverride
         pendingQualityOverride = nil
+        let previousActiveSourceId = activeStreamSourceId
 
         resolveTask?.cancel()
         resolveTask = nil
@@ -911,8 +1131,15 @@ final class PlayerController: ObservableObject {
         detachCurrentPlayerItem()
 
         if resetRecoveryState {
-            failedSourceIdsForCurrentTrack.removeAll()
-            failedTrackIdsForCurrentTrack.removeAll()
+            if !preserveExclusions {
+                failedSourcePlatformsForCurrentTrack.removeAll()
+                failedSourceTracksForCurrentTrack.removeAll()
+                failedTrackIdsForCurrentTrack.removeAll()
+            }
+            activeStreamSourceId = nil
+            activeResolvedTrackId = nil
+            activeResolvedPlatformCode = nil
+            activeCacheKey = nil
             runtimeRetryCount = 0
             isRecoveringError = false
             lastRecoveryStartPositionMs = 0
@@ -922,6 +1149,7 @@ final class PlayerController: ObservableObject {
         activeLoadToken = loadToken
         activeSeekToken = UUID()
         isSeeking = false
+        wantsPlayback = true
         pendingResumePositionMs = max(seekToMs, 0)
         pendingInitialSeekMs = seekToMs > 0 ? seekToMs : nil
 
@@ -934,10 +1162,13 @@ final class PlayerController: ObservableObject {
         state.durationMs = initialDur
         progress.positionMs = initialPos
         progress.durationMs = initialDur
-        if resetRecoveryState && !reuseVisuals {
-            state.activeQualityBadge = nil
+        if resetRecoveryState {
+            state.activeQualityBadge = effectiveQualityOverride?.badge ?? (reuseVisuals ? state.activeQualityBadge : nil)
             state.activeProviderName = nil
-            loadMetadataAndVisuals(for: track)
+            state.activeStreamSourceId = nil
+            if !reuseVisuals {
+                loadMetadataAndVisuals(for: track)
+            }
         }
         persistCursor(force: true)
         updateNowPlayingInfo()
@@ -966,6 +1197,7 @@ final class PlayerController: ObservableObject {
                         providerName: "本地音乐",
                         sourceId: nil,
                         resolvedTrackId: track.id,
+                        resolvedPlatformCode: track.source.code,
                         cacheKey: nil,
                         seekToMs: self.pendingResumePositionMs
                     )
@@ -973,8 +1205,8 @@ final class PlayerController: ObservableObject {
                 }
             }
 
-            // 2. Offline downloaded file
-            if let offlineUrl = await self.downloadManager.localCachedFileURL(for: track.id) {
+            // 2. Offline downloaded file (bypassed on explicit online source switch or runtime error fallback)
+            if resetRecoveryState && !bypassOfflineCache, let offlineUrl = await self.downloadManager.localCachedFileURL(for: track.id) {
                 guard self.activeLoadToken == loadToken else { return }
                 self.playPreparedTrack(
                     track: track,
@@ -985,6 +1217,7 @@ final class PlayerController: ObservableObject {
                     providerName: "已离线保存",
                     sourceId: nil,
                     resolvedTrackId: track.id,
+                    resolvedPlatformCode: track.source.code,
                     cacheKey: nil,
                     seekToMs: self.pendingResumePositionMs
                 )
@@ -1002,50 +1235,62 @@ final class PlayerController: ObservableObject {
                 )
             }
             let targetQuality = qualityDecision.quality
-            let cacheKey = AudioCacheManager.cacheKey(trackId: track.id, quality: targetQuality)
 
-            // 4. Hit 300MB disk LRU audio cache if available (skip cache during error recovery or explicit source preference)
-            if resetRecoveryState && preferredSourceId == nil && self.failedSourceIdsForCurrentTrack.isEmpty,
-               let cachedUrl = await self.audioCacheManager.cachedFileURLAsync(for: cacheKey) {
-                guard self.activeLoadToken == loadToken else { return }
-                self.playPreparedTrack(
-                    track: track,
-                    url: cachedUrl,
-                    isRemote: false,
-                    quality: targetQuality,
-                    qualityBadge: "\(targetQuality.badge) · 缓存",
-                    providerName: track.source.displayName,
-                    sourceId: nil,
-                    resolvedTrackId: track.id,
-                    cacheKey: cacheKey,
-                    seekToMs: self.pendingResumePositionMs
-                )
-                return
-            }
-
-            // 5. Resolve online stream via UserApiManager
+            // 4. Resolve online stream via UserApiManager (priority-aware + scoped cache lookup after resolution)
             let result = await self.userApiManager.resolveStream(
                 track: track,
                 preferredQuality: targetQuality,
                 allowCrossPlatformFallback: settings.autoFallbackSource,
                 preferredSourceId: preferredSourceId,
-                excludedSourceIds: self.failedSourceIdsForCurrentTrack,
-                excludedTrackIds: self.failedTrackIdsForCurrentTrack
+                excludedTrackIds: self.failedTrackIdsForCurrentTrack,
+                excludedSourcePlatforms: self.failedSourcePlatformsForCurrentTrack,
+                excludedSourceTracks: self.failedSourceTracksForCurrentTrack
             )
             guard self.activeLoadToken == loadToken else { return }
 
             switch result {
             case .success(let resolved):
-                guard let remoteUrl = URL(string: resolved.url) else {
+                guard let remoteUrl = LxJsRuntime.parseLenientURL(resolved.url) else {
                     self.handleResolutionFailure(track: track, message: "返回的音频地址无效")
                     return
                 }
+                let actuallySwitchedSource = resolved.switchedSource ||
+                    ((!resetRecoveryState || preserveExclusions) &&
+                        previousActiveSourceId != nil &&
+                        resolved.sourceId != previousActiveSourceId)
                 if qualityDecision.downgradedForCellular {
                     self.events.send(PlayerUiEvent(message: "当前为移动网络，已智能省流切换 \(resolved.quality.badge)"))
                 } else if resolved.switchedPlatform {
-                    self.events.send(PlayerUiEvent(message: "已自动换源至 \(resolved.resolvedTrack.source.displayName)"))
+                    self.events.send(PlayerUiEvent(message: "已自动换源至 \(resolved.resolvedTrack.source.shortLabel) · \(resolved.providerName)"))
+                } else if actuallySwitchedSource {
+                    self.events.send(PlayerUiEvent(message: "已自动切换至备用音源：\(resolved.providerName)"))
                 }
-                let finalCacheKey = AudioCacheManager.cacheKey(trackId: track.id, quality: resolved.quality)
+                let finalCacheKey = AudioCacheManager.cacheKey(
+                    trackId: track.id,
+                    resolvedTrackId: resolved.resolvedTrack.id,
+                    sourceId: resolved.sourceId,
+                    sourceRevision: resolved.sourceRevision,
+                    quality: resolved.quality
+                )
+                // Check scoped disk cache (keyed by track + resolvedTrack + source + script revision + quality)
+                if resetRecoveryState && !preserveExclusions,
+                   let cachedUrl = await self.audioCacheManager.cachedFileURLAsync(for: finalCacheKey) {
+                    guard self.activeLoadToken == loadToken else { return }
+                    self.playPreparedTrack(
+                        track: track,
+                        url: cachedUrl,
+                        isRemote: false,
+                        quality: resolved.quality,
+                        qualityBadge: "\(resolved.quality.badge) · 缓存",
+                        providerName: resolved.providerName,
+                        sourceId: resolved.sourceId,
+                        resolvedTrackId: resolved.resolvedTrack.id,
+                        resolvedPlatformCode: resolved.resolvedTrack.source.code,
+                        cacheKey: finalCacheKey,
+                        seekToMs: self.pendingResumePositionMs
+                    )
+                    return
+                }
                 self.playPreparedTrack(
                     track: track,
                     url: remoteUrl,
@@ -1055,16 +1300,26 @@ final class PlayerController: ObservableObject {
                     providerName: resolved.providerName,
                     sourceId: resolved.sourceId,
                     resolvedTrackId: resolved.resolvedTrack.id,
+                    resolvedPlatformCode: resolved.resolvedTrack.source.code,
                     cacheKey: finalCacheKey,
                     seekToMs: self.pendingResumePositionMs
                 )
 
             case .failure(let error):
+                if preserveExclusions {
+                    self.failedSourcePlatformsForCurrentTrack.removeAll()
+                    self.failedSourceTracksForCurrentTrack.removeAll()
+                    self.failedTrackIdsForCurrentTrack.removeAll()
+                }
                 let noSource = !self.userApiManager.hasReadySource()
+                let msg = (preserveExclusions && !noSource)
+                    ? "暂无其他可用音源或平台，点击播放可重新尝试默认音源"
+                    : error.localizedDescription
                 self.handleResolutionFailure(
                     track: track,
-                    message: error.localizedDescription,
-                    openSourceManager: noSource
+                    message: msg,
+                    openSourceManager: noSource,
+                    allowAutoSkip: !preserveExclusions
                 )
             }
         }
@@ -1079,21 +1334,29 @@ final class PlayerController: ObservableObject {
         providerName: String,
         sourceId: String?,
         resolvedTrackId: String?,
+        resolvedPlatformCode: String?,
         cacheKey: String?,
         seekToMs: Int64
     ) {
+        // Clear resolveTask before arming bufferingWatchdogTask (loadAndPlayCurrent's defer runs after return)
+        resolveTask = nil
         activateAudioSession()
+        wantsPlayback = true
+        hasEnteredReadyForActiveMedia = false
         activeStreamSourceId = sourceId
         activeResolvedTrackId = resolvedTrackId
+        activeResolvedPlatformCode = resolvedPlatformCode ?? track.source.code
         activeCacheKey = cacheKey
         let effectiveSeekMs = max(seekToMs, 0)
         pendingResumePositionMs = effectiveSeekMs
         isRecoveringError = false
         isSeeking = false
+        isRestartingForPlay = false
         activeSeekToken = UUID()
 
         state.activeQualityBadge = qualityBadge
         state.activeProviderName = providerName
+        state.activeStreamSourceId = sourceId
         state.isBuffering = true
         let prepDur = max(track.durationMs, visualsTrackId == track.id ? max(progress.durationMs, state.durationMs) : 0)
         state.durationMs = prepDur
@@ -1108,7 +1371,7 @@ final class PlayerController: ObservableObject {
         if isRemote {
             asset = AVURLAsset(url: url, options: [
                 "AVURLAssetHTTPHeaderFieldsKey": [
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    "User-Agent": Self.chromeUserAgent
                 ]
             ])
         } else {
@@ -1121,30 +1384,89 @@ final class PlayerController: ObservableObject {
             state.positionMs = effectiveSeekMs
             progress.positionMs = effectiveSeekMs
         }
-        observeCurrentItem(item)
-        player.replaceCurrentItem(with: item)
-
-        // When resuming at a non-zero offset, wait for .readyToPlay to perform a single accurate seek
-        // before starting playback so there is no audible 0:00 blip or double-seek stall.
-        if effectiveSeekMs == 0 {
-            player.play()
-        }
-        state.isPlaying = true
-        libraryStore.recordPlay(track)
-        persistCursor(force: true)
-        updateNowPlayingInfo()
-
-        // Opportunistically cache remote stream on disk for instant zero-data replays
+        // Defer background disk caching until AVPlayer actually begins .playing so it never
+        // competes with initial frame buffering or triggers anti-concurrency CDN rejections.
         if isRemote, let quality, let cacheKey {
-            audioCacheManager.cacheInBackground(
+            pendingBackgroundCache = PendingBackgroundCache(
                 remoteUrlString: url.absoluteString,
                 cacheKey: cacheKey,
                 quality: quality
             )
+        } else {
+            pendingBackgroundCache = nil
+        }
+
+        observeCurrentItem(item)
+        player.replaceCurrentItem(with: item)
+
+        // When resuming at a non-zero offset, wait for .readyToPlay to perform a single seek
+        // before starting playback so there is no audible 0:00 blip or double-seek stall.
+        if effectiveSeekMs == 0 {
+            player.play()
+            if player.timeControlStatus == .playing {
+                hasEnteredReadyForActiveMedia = true
+                state.isBuffering = false
+                startPendingBackgroundCacheIfNeeded()
+            }
+        }
+        state.isPlaying = true
+        scheduleBufferingWatchdogIfNeeded()
+        libraryStore.recordPlay(track)
+        persistCursor(force: true)
+        updateNowPlayingInfo()
+    }
+
+    private func startPendingBackgroundCacheIfNeeded() {
+        guard let pending = pendingBackgroundCache else { return }
+        pendingBackgroundCache = nil
+        audioCacheManager.cacheInBackground(
+            remoteUrlString: pending.remoteUrlString,
+            cacheKey: pending.cacheKey,
+            quality: pending.quality
+        )
+    }
+
+    private func scheduleBufferingWatchdogIfNeeded() {
+        bufferingWatchdogTask?.cancel()
+        bufferingWatchdogTask = nil
+        guard wantsPlayback,
+              !isRecoveringError,
+              resolveTask == nil,
+              let track = state.currentTrack,
+              !track.isLocal,
+              let item = player.currentItem,
+              player.timeControlStatus != .playing else {
+            return
+        }
+        bufferingWatchdogTask = Task { [weak self, weak item] in
+            try? await Task.sleep(nanoseconds: Self.bufferingWatchdogTimeoutNs)
+            guard !Task.isCancelled, let self, let item else { return }
+            self.bufferingWatchdogTask = nil
+            guard self.wantsPlayback,
+                  !self.isRecoveringError,
+                  self.resolveTask == nil,
+                  self.player.currentItem == item,
+                  self.player.timeControlStatus != .playing else {
+                return
+            }
+            let watchdogError: Error = self.networkAdvisor.isNetworkConnected()
+                ? LxRuntimeError.message("音频缓冲超时")
+                : NSError(
+                    domain: NSURLErrorDomain,
+                    code: NSURLErrorNotConnectedToInternet,
+                    userInfo: [NSLocalizedDescriptionKey: "网络连接已断开，音频缓冲超时"]
+                )
+            self.handleRuntimePlaybackError(item: item, error: watchdogError)
         }
     }
 
-    private func handleResolutionFailure(track: Track, message: String, openSourceManager: Bool = false) {
+    private func handleResolutionFailure(
+        track: Track,
+        message: String,
+        openSourceManager: Bool = false,
+        allowAutoSkip: Bool = true
+    ) {
+        wantsPlayback = false
         detachCurrentPlayerItem()
         isRecoveringError = false
         state.isBuffering = false
@@ -1158,8 +1480,11 @@ final class PlayerController: ObservableObject {
 
         events.send(PlayerUiEvent(message: message))
 
-        // Auto-skip next if in a multi-track queue and another track exists (never skip past SEQUENTIAL end or loop singleLoop)
-        if state.repeatMode != .singleLoop &&
+        // Auto-skip next if in a multi-track queue and another track exists (never skip past SEQUENTIAL end,
+        // never loop singleLoop, never auto-skip while offline or after manual alternate-source exhaustion)
+        if allowAutoSkip &&
+            networkAdvisor.isNetworkConnected() &&
+            state.repeatMode != .singleLoop &&
             queueNavigator.canSkipNext(
                 queueSize: state.queue.count,
                 currentIndex: state.currentIndex,
@@ -1170,18 +1495,21 @@ final class PlayerController: ObservableObject {
             recoveryTask?.cancel()
             recoveryTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 1_200_000_000)
-                if Task.isCancelled { return }
-                await MainActor.run {
-                    self?.next(isAutoAdvance: true)
-                }
+                guard !Task.isCancelled, let self else { return }
+                self.recoveryTask = nil
+                self.next(isAutoAdvance: true)
             }
         }
     }
 
     private func handleRuntimePlaybackError(item: AVPlayerItem, error: Error?) {
         guard let track = state.currentTrack, !isRecoveringError else { return }
-        // Never auto-recover & unexpectedly resume playback if the player is explicitly paused/stopped
-        let isPlaybackActive = state.isPlaying || state.isBuffering || player.timeControlStatus != .paused
+        if track.isLocal {
+            handleResolutionFailure(track: track, message: "本地音频《\(track.title)》无法播放")
+            return
+        }
+        // Use wantsPlayback so a .paused KVO task firing ahead of .failed never silently kills auto-recovery
+        let isPlaybackActive = wantsPlayback || state.isPlaying || state.isBuffering || player.timeControlStatus != .paused
         guard isPlaybackActive else {
             detachCurrentPlayerItem()
             state.isBuffering = false
@@ -1190,6 +1518,7 @@ final class PlayerController: ObservableObject {
             return
         }
 
+        let wasReady = hasEnteredReadyForActiveMedia
         let httpCode = item.errorLog()?.events.last?.errorStatusCode
         let normalizedCode = (httpCode != nil && httpCode! >= 400) ? httpCode : nil
         let kind = PlaybackRecoveryPolicy.classify(error: error, httpStatusCode: normalizedCode)
@@ -1203,17 +1532,22 @@ final class PlayerController: ObservableObject {
             kind: kind,
             retryAttemptIndex: runtimeRetryCount,
             primaryTrackId: track.id,
-            resolvedTrackId: activeResolvedTrackId
+            resolvedTrackId: activeResolvedTrackId,
+            wasReady: wasReady
         )
         runtimeRetryCount += 1
         isRecoveringError = true
         lastRecoveryStartPositionMs = progress.positionMs
+        detachCurrentPlayerItem()
 
         if plan.evictStreamCache, let key = activeCacheKey {
             audioCacheManager.evict(cacheKey: key)
         }
         if plan.excludeCurrentSource, let sid = activeStreamSourceId {
-            failedSourceIdsForCurrentTrack.insert(sid)
+            let plat = activeResolvedPlatformCode ?? track.source.code
+            failedSourcePlatformsForCurrentTrack.insert(UserApiManager.sourcePlatformKey(sourceId: sid, platformCode: plat))
+            let rtid = activeResolvedTrackId ?? track.id
+            failedSourceTracksForCurrentTrack.insert(UserApiManager.sourceTrackKey(sourceId: sid, trackId: rtid))
         }
         if plan.excludeResolvedTrack, let rtid = activeResolvedTrackId {
             failedTrackIdsForCurrentTrack.insert(rtid)
@@ -1223,19 +1557,36 @@ final class PlayerController: ObservableObject {
         let preferSource = plan.preferSameSourceFirst ? activeStreamSourceId : nil
         let backoffNs = UInt64(max(plan.backoffMs, 100)) * 1_000_000
 
+        state.isPlaying = false
+        state.isBuffering = true
+        updateNowPlayingInfo()
+        switch plan.kind {
+        case .transientNetwork:
+            events.send(PlayerUiEvent(message: "网络波动，正在自动恢复播放…"))
+        case .expiredOrDeniedUrl:
+            events.send(PlayerUiEvent(message: plan.excludeCurrentSource ? "当前音源不可用，正在自动换源播放…" : "音频链接已刷新，正在无缝续播…"))
+        case .streamOrSourceBroken:
+            events.send(PlayerUiEvent(message: "音频流异常，正在自动切换备用音源续播…"))
+        }
+
         recoveryTask?.cancel()
         recoveryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: backoffNs)
-            if Task.isCancelled { return }
-            await MainActor.run {
-                guard let self else { return }
-                let targetResume = plan.preservePosition ? self.pendingResumePositionMs : 0
-                self.loadAndPlayCurrent(
-                    resetRecoveryState: false,
-                    seekToMs: targetResume,
-                    preferredSourceId: preferSource
-                )
+            guard !Task.isCancelled, let self else { return }
+            if plan.kind == .transientNetwork && !self.networkAdvisor.isNetworkConnected() {
+                for _ in 0..<16 {
+                    if Task.isCancelled || self.networkAdvisor.isNetworkConnected() { break }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
             }
+            guard !Task.isCancelled else { return }
+            self.recoveryTask = nil
+            let targetResume = plan.preservePosition ? self.pendingResumePositionMs : 0
+            self.loadAndPlayCurrent(
+                resetRecoveryState: false,
+                seekToMs: targetResume,
+                preferredSourceId: preferSource
+            )
         }
     }
 
@@ -1293,7 +1644,8 @@ final class PlayerController: ObservableObject {
                         forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
                         playbackURL: localUrl, isRemote: false, quality: nil,
                         qualityBadge: "LOCAL", providerName: "本地音乐",
-                        sourceId: nil, resolvedTrackId: nextTrack.id, cacheKey: nil
+                        sourceId: nil, resolvedTrackId: nextTrack.id, resolvedPlatformCode: nextTrack.source.code,
+                        cacheKey: nil, createdAt: Date()
                     ))
                     return
                 }
@@ -1304,7 +1656,8 @@ final class PlayerController: ObservableObject {
                     forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
                     playbackURL: offlineUrl, isRemote: false, quality: nil,
                     qualityBadge: "离线", providerName: "已离线保存",
-                    sourceId: nil, resolvedTrackId: nextTrack.id, cacheKey: nil
+                    sourceId: nil, resolvedTrackId: nextTrack.id, resolvedPlatformCode: nextTrack.source.code,
+                    cacheKey: nil, createdAt: Date()
                 ))
                 return
             }
@@ -1313,30 +1666,39 @@ final class PlayerController: ObservableObject {
                 preferred: settings.preferredQuality,
                 cellularDataSaverEnabled: settings.wifiOnlyHighQuality
             )
-            let cacheKey = AudioCacheManager.cacheKey(trackId: nextTrack.id, quality: decision.quality)
-            if let cachedUrl = await self.audioCacheManager.cachedFileURLAsync(for: cacheKey) {
-                commitIfStillValid(PreloadedNextItem(
-                    forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
-                    playbackURL: cachedUrl, isRemote: false, quality: decision.quality,
-                    qualityBadge: "\(decision.quality.badge) · 缓存", providerName: nextTrack.source.displayName,
-                    sourceId: nil, resolvedTrackId: nextTrack.id, cacheKey: cacheKey
-                ))
-                return
-            }
-
             let res = await self.userApiManager.resolveStream(
                 track: nextTrack,
                 preferredQuality: decision.quality,
                 allowCrossPlatformFallback: settings.autoFallbackSource
             )
             guard !Task.isCancelled else { return }
-            if case .success(let resolved) = res, let url = URL(string: resolved.url) {
-                let key = AudioCacheManager.cacheKey(trackId: nextTrack.id, quality: resolved.quality)
+            if case .success(let resolved) = res, let url = LxJsRuntime.parseLenientURL(resolved.url) {
+                let key = AudioCacheManager.cacheKey(
+                    trackId: nextTrack.id,
+                    resolvedTrackId: resolved.resolvedTrack.id,
+                    sourceId: resolved.sourceId,
+                    sourceRevision: resolved.sourceRevision,
+                    quality: resolved.quality
+                )
+                if let cachedUrl = await self.audioCacheManager.cachedFileURLAsync(for: key) {
+                    guard !Task.isCancelled else { return }
+                    commitIfStillValid(PreloadedNextItem(
+                        forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
+                        playbackURL: cachedUrl, isRemote: false, quality: resolved.quality,
+                        qualityBadge: "\(resolved.quality.badge) · 缓存", providerName: resolved.providerName,
+                        sourceId: resolved.sourceId, resolvedTrackId: resolved.resolvedTrack.id,
+                        resolvedPlatformCode: resolved.resolvedTrack.source.code,
+                        cacheKey: key, createdAt: Date()
+                    ))
+                    return
+                }
                 commitIfStillValid(PreloadedNextItem(
                     forTrackId: forTrackId, nextIndex: nextIdx, track: nextTrack,
                     playbackURL: url, isRemote: true, quality: resolved.quality,
                     qualityBadge: resolved.quality.badge, providerName: resolved.providerName,
-                    sourceId: resolved.sourceId, resolvedTrackId: resolved.resolvedTrack.id, cacheKey: key
+                    sourceId: resolved.sourceId, resolvedTrackId: resolved.resolvedTrack.id,
+                    resolvedPlatformCode: resolved.resolvedTrack.source.code,
+                    cacheKey: key, createdAt: Date()
                 ))
             }
         }
@@ -1448,8 +1810,11 @@ final class PlayerController: ObservableObject {
         let playToken = center.playCommand.addTarget { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                let isActivelyLoading = self.resolveTask != nil || self.recoveryTask != nil || self.isRecoveringError
-                if !self.state.isPlaying && !isActivelyLoading { self.togglePlayPause() }
+                let isActive = self.state.isPlaying || self.state.isBuffering ||
+                    self.isRestartingForPlay || self.resolveTask != nil ||
+                    self.recoveryTask != nil || self.isRecoveringError ||
+                    self.player.timeControlStatus != .paused
+                if !isActive { self.togglePlayPause() }
             }
             return .success
         }
@@ -1459,8 +1824,11 @@ final class PlayerController: ObservableObject {
         let pauseToken = center.pauseCommand.addTarget { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                let isActivelyLoading = self.resolveTask != nil || self.recoveryTask != nil || self.isRecoveringError
-                if self.state.isPlaying || isActivelyLoading { self.togglePlayPause() }
+                let isActive = self.state.isPlaying || self.state.isBuffering ||
+                    self.isRestartingForPlay || self.resolveTask != nil ||
+                    self.recoveryTask != nil || self.isRecoveringError ||
+                    self.player.timeControlStatus != .paused
+                if isActive { self.togglePlayPause() }
             }
             return .success
         }
@@ -1498,27 +1866,45 @@ final class PlayerController: ObservableObject {
     }
 
     private func observePlayerState() {
-        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in
                 guard let self else { return }
-                switch player.timeControlStatus {
+                switch self.player.timeControlStatus {
                 case .playing:
+                    self.hasEnteredReadyForActiveMedia = true
+                    self.bufferingWatchdogTask?.cancel()
+                    self.bufferingWatchdogTask = nil
                     self.state.isPlaying = true
                     self.state.isBuffering = false
                     self.consecutiveAutoSkipCount = 0
+                    self.startPendingBackgroundCacheIfNeeded()
                 case .waitingToPlayAtSpecifiedRate:
-                    self.state.isBuffering = true
-                case .paused:
-                    if self.pendingInitialSeekMs == nil {
+                    if self.player.currentItem != nil {
+                        self.state.isBuffering = true
+                        if self.player.rate > 0 {
+                            self.state.isPlaying = true
+                        }
+                        self.scheduleBufferingWatchdogIfNeeded()
+                    } else if self.resolveTask == nil && !self.isRecoveringError {
+                        self.player.pause()
+                        self.state.isBuffering = false
                         self.state.isPlaying = false
                     }
-                    if self.resolveTask == nil && !self.isRecoveringError && self.pendingInitialSeekMs == nil {
-                        self.state.isBuffering = false
-                    }
-                    if self.pendingInitialSeekMs == nil {
+                case .paused:
+                    // Guard against stale .paused KVO Tasks during active play start, restart seek, or initial seek
+                    let isTransitioningToPlay = self.player.rate > 0 ||
+                        self.isRestartingForPlay ||
+                        (self.pendingInitialSeekMs != nil && self.state.isPlaying)
+                    if !isTransitioningToPlay {
+                        self.state.isPlaying = false
                         self.pendingResumePositionMs = self.progress.positionMs
                     }
-                    self.persistCursor(force: true)
+                    if self.resolveTask == nil && !self.isRecoveringError && !isTransitioningToPlay {
+                        self.state.isBuffering = false
+                    }
+                    if !isTransitioningToPlay && self.resolveTask == nil {
+                        self.persistCursor(force: true)
+                    }
                 @unknown default:
                     break
                 }
@@ -1530,6 +1916,11 @@ final class PlayerController: ObservableObject {
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             MainActor.assumeIsolated {
                 guard let self, self.player.currentItem != nil, self.resolveTask == nil, !self.isRecoveringError else { return }
+                if self.player.timeControlStatus == .playing && (!self.state.isPlaying || self.state.isBuffering) {
+                    self.state.isPlaying = true
+                    self.state.isBuffering = false
+                    self.updateNowPlayingInfo()
+                }
                 var nextPos = self.progress.positionMs
                 var nextDur = max(self.progress.durationMs, self.state.durationMs)
                 let hadZeroDuration = (nextDur <= 0)
@@ -1542,7 +1933,8 @@ final class PlayerController: ObservableObject {
                     if self.runtimeRetryCount > 0 &&
                         posMs >= self.lastRecoveryStartPositionMs + Self.stablePlaybackResetDeltaMs {
                         self.runtimeRetryCount = 0
-                        self.failedSourceIdsForCurrentTrack.removeAll()
+                        self.failedSourcePlatformsForCurrentTrack.removeAll()
+                        self.failedSourceTracksForCurrentTrack.removeAll()
                         self.failedTrackIdsForCurrentTrack.removeAll()
                     }
                 }
@@ -1573,40 +1965,70 @@ final class PlayerController: ObservableObject {
         statusObservation?.invalidate()
         if let obs = itemEndObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = itemFailedObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = itemStalledObserver { NotificationCenter.default.removeObserver(obs) }
 
-        statusObservation = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
+        statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, change in
+            let observedStatus = change.newValue ?? observedItem.status
+            guard observedStatus != .unknown else { return }
             Task { @MainActor in
-                guard let self, observedItem == self.player.currentItem else { return }
-                switch observedItem.status {
+                guard let self,
+                      observedItem == self.player.currentItem,
+                      observedItem.status == observedStatus else { return }
+                switch observedStatus {
                 case .readyToPlay:
+                    self.hasEnteredReadyForActiveMedia = true
                     if observedItem.duration.seconds.isFinite && observedItem.duration.seconds > 0 {
                         let resolvedDur = Int64(observedItem.duration.seconds * 1000.0)
                         self.state.durationMs = resolvedDur
                         self.progress.durationMs = resolvedDur
                     }
                     if let targetMs = self.pendingInitialSeekMs {
+                        self.pendingInitialSeekMs = nil
                         let curDur = max(self.progress.durationMs, self.state.durationMs)
                         let clampedTarget = curDur > 0
                             ? min(targetMs, max(curDur - 1_000, 0))
                             : targetMs
                         let targetTime = CMTime(value: clampedTarget, timescale: 1000)
+                        let seekTolerance = CMTime(seconds: 0.5, preferredTimescale: 600)
                         let shouldAutoPlay = self.state.isPlaying
-                        self.player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak observedItem] _ in
+                        let token = UUID()
+                        self.activeSeekToken = token
+                        self.isSeeking = true
+                        self.isRestartingForPlay = shouldAutoPlay
+                        self.player.seek(to: targetTime, toleranceBefore: seekTolerance, toleranceAfter: seekTolerance) { [weak self, weak observedItem] _ in
                             Task { @MainActor in
-                                guard let self, let observedItem, self.player.currentItem == observedItem else { return }
+                                guard let self, self.activeSeekToken == token else { return }
+                                self.isSeeking = false
+                                let resumePlay = self.isRestartingForPlay || self.state.isPlaying
+                                self.isRestartingForPlay = false
+                                guard let observedItem, self.player.currentItem == observedItem else { return }
                                 self.progress.positionMs = clampedTarget
                                 self.state.positionMs = clampedTarget
                                 self.pendingResumePositionMs = clampedTarget
-                                self.pendingInitialSeekMs = nil
-                                self.state.isBuffering = false
-                                if shouldAutoPlay && self.state.isPlaying {
+                                if resumePlay {
+                                    self.wantsPlayback = true
+                                    self.activateAudioSession()
                                     self.player.play()
+                                    self.state.isPlaying = true
+                                    self.state.isBuffering = (self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate)
+                                    self.scheduleBufferingWatchdogIfNeeded()
+                                } else {
+                                    self.state.isBuffering = false
                                 }
                                 self.updateNowPlayingInfo()
                             }
                         }
                     } else {
-                        self.state.isBuffering = false
+                        let status = self.player.timeControlStatus
+                        self.state.isBuffering = (status == .waitingToPlayAtSpecifiedRate)
+                        if status == .playing {
+                            self.state.isPlaying = true
+                            self.bufferingWatchdogTask?.cancel()
+                            self.bufferingWatchdogTask = nil
+                            self.startPendingBackgroundCacheIfNeeded()
+                        } else if status == .paused && self.player.rate == 0 && !self.isRestartingForPlay {
+                            self.state.isPlaying = false
+                        }
                         self.updateNowPlayingInfo()
                     }
                 case .failed:
@@ -1623,7 +2045,7 @@ final class PlayerController: ObservableObject {
             object: item,
             queue: .main
         ) { [weak self, weak item] _ in
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 guard let self, let item, self.player.currentItem == item else { return }
                 self.next(isAutoAdvance: true)
             }
@@ -1635,9 +2057,21 @@ final class PlayerController: ObservableObject {
             queue: .main
         ) { [weak self, weak item] note in
             let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 guard let self, let item, let curItem = self.player.currentItem, curItem == item else { return }
                 self.handleRuntimePlaybackError(item: curItem, error: err)
+            }
+        }
+
+        itemStalledObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemPlaybackStalled,
+            object: item,
+            queue: .main
+        ) { [weak self, weak item] _ in
+            MainActor.assumeIsolated {
+                guard let self, let item, self.player.currentItem == item, self.wantsPlayback else { return }
+                self.state.isBuffering = true
+                self.scheduleBufferingWatchdogIfNeeded()
             }
         }
     }
@@ -1655,19 +2089,46 @@ final class PlayerController: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if type == .began {
-                    self.resumeAfterInterruption = self.state.isPlaying || self.player.rate > 0
+                    self.resumeAfterInterruption = self.wantsPlayback || self.state.isPlaying || self.state.isBuffering ||
+                        self.isRestartingForPlay || self.resolveTask != nil || self.player.rate > 0
+                    self.wantsPlayback = false
+                    self.resolveTask?.cancel()
+                    self.resolveTask = nil
+                    self.recoveryTask?.cancel()
+                    self.recoveryTask = nil
+                    self.bufferingWatchdogTask?.cancel()
+                    self.bufferingWatchdogTask = nil
+                    self.activeLoadToken = UUID()
+                    self.activeSeekToken = UUID()
+                    self.isSeeking = false
+                    self.isRestartingForPlay = false
+                    self.isRecoveringError = false
                     self.player.pause()
                     self.state.isPlaying = false
+                    self.state.isBuffering = false
                     self.updateNowPlayingInfo()
                 } else if type == .ended {
                     let shouldResume = self.resumeAfterInterruption
                     self.resumeAfterInterruption = false
                     let opts = AVAudioSession.InterruptionOptions(rawValue: optsVal)
                     if opts.contains(.shouldResume) && shouldResume && self.state.currentTrack != nil {
-                        self.activateAudioSession()
-                        self.player.play()
-                        self.state.isPlaying = true
-                        self.updateNowPlayingInfo()
+                        if self.player.currentItem == nil || self.player.currentItem?.status == .failed {
+                            let resumeMs = max(self.progress.positionMs, self.pendingResumePositionMs)
+                            self.loadAndPlayCurrent(resetRecoveryState: true, seekToMs: resumeMs)
+                        } else {
+                            self.wantsPlayback = true
+                            self.activateAudioSession()
+                            if self.pendingInitialSeekMs != nil && self.player.currentItem?.status == .unknown {
+                                self.state.isPlaying = true
+                                self.state.isBuffering = true
+                            } else {
+                                self.player.play()
+                                self.state.isPlaying = true
+                                self.state.isBuffering = (self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate)
+                            }
+                            self.scheduleBufferingWatchdogIfNeeded()
+                            self.updateNowPlayingInfo()
+                        }
                     }
                 }
             }
@@ -1684,9 +2145,22 @@ final class PlayerController: ObservableObject {
                   reason == .oldDeviceUnavailable else { return }
             Task { @MainActor in
                 guard let self else { return }
+                self.wantsPlayback = false
                 self.resumeAfterInterruption = false
+                self.resolveTask?.cancel()
+                self.resolveTask = nil
+                self.recoveryTask?.cancel()
+                self.recoveryTask = nil
+                self.bufferingWatchdogTask?.cancel()
+                self.bufferingWatchdogTask = nil
+                self.activeLoadToken = UUID()
+                self.activeSeekToken = UUID()
+                self.isSeeking = false
+                self.isRestartingForPlay = false
+                self.isRecoveringError = false
                 self.player.pause()
                 self.state.isPlaying = false
+                self.state.isBuffering = false
                 self.updateNowPlayingInfo()
             }
         }
@@ -1697,14 +2171,22 @@ final class PlayerController: ObservableObject {
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
             return
         }
+        var elapsedSec = Double(progress.positionMs) / 1000.0
+        if player.currentItem != nil, pendingInitialSeekMs == nil, !isSeeking {
+            let liveSec = player.currentTime().seconds
+            if liveSec.isFinite && liveSec >= 0 {
+                elapsedSec = liveSec
+            }
+        }
         let playbackRate = (state.isPlaying && !state.isBuffering) ? 1.0 : 0.0
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: track.title,
             MPMediaItemPropertyArtist: track.artist,
             MPMediaItemPropertyAlbumTitle: track.album,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: Double(progress.positionMs) / 1000.0,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsedSec,
             MPMediaItemPropertyPlaybackDuration: Double(max(progress.durationMs, state.durationMs, track.durationMs)) / 1000.0,
-            MPNowPlayingInfoPropertyPlaybackRate: playbackRate
+            MPNowPlayingInfoPropertyPlaybackRate: playbackRate,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
         ]
         if let cachedArtwork {
             info[MPMediaItemPropertyArtwork] = cachedArtwork
@@ -1732,6 +2214,7 @@ final class PlayerController: ObservableObject {
         activeLoadToken = UUID()
         activeSeekToken = UUID()
         isSeeking = false
+        wantsPlayback = false
         isRecoveringError = false
         resumeAfterInterruption = false
         pendingInitialSeekMs = nil
@@ -1739,8 +2222,10 @@ final class PlayerController: ObservableObject {
         lastRecoveryStartPositionMs = 0
         activeStreamSourceId = nil
         activeResolvedTrackId = nil
+        activeResolvedPlatformCode = nil
         activeCacheKey = nil
-        failedSourceIdsForCurrentTrack.removeAll()
+        failedSourcePlatformsForCurrentTrack.removeAll()
+        failedSourceTracksForCurrentTrack.removeAll()
         failedTrackIdsForCurrentTrack.removeAll()
         runtimeRetryCount = 0
         consecutiveAutoSkipCount = 0

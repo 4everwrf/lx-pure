@@ -115,12 +115,14 @@ enum PlaybackRecoveryPolicy {
         kind: PlaybackErrorKind,
         retryAttemptIndex: Int,
         primaryTrackId: String,
-        resolvedTrackId: String?
+        resolvedTrackId: String?,
+        wasReady: Bool = true
     ) -> PlaybackRecoveryPlan {
         let isCrossPlatformAlternate = !(resolvedTrackId ?? "").isEmpty && resolvedTrackId != primaryTrackId
         switch kind {
         case .transientNetwork:
-            if retryAttemptIndex <= 1 {
+            let keepSameSource = wasReady ? (retryAttemptIndex <= 1) : (retryAttemptIndex == 0)
+            if keepSameSource {
                 return PlaybackRecoveryPlan(
                     kind: kind,
                     excludeCurrentSource: false,
@@ -128,7 +130,7 @@ enum PlaybackRecoveryPolicy {
                     evictStreamCache: false,
                     preferSameSourceFirst: true,
                     preservePosition: true,
-                    backoffMs: retryAttemptIndex == 0 ? 1_200 : 2_500
+                    backoffMs: retryAttemptIndex == 0 ? (wasReady ? 1_200 : 800) : 2_500
                 )
             } else {
                 return PlaybackRecoveryPlan(
@@ -138,12 +140,12 @@ enum PlaybackRecoveryPolicy {
                     evictStreamCache: false,
                     preferSameSourceFirst: false,
                     preservePosition: true,
-                    backoffMs: 1_500
+                    backoffMs: wasReady ? 1_500 : 1_000
                 )
             }
 
         case .expiredOrDeniedUrl:
-            if retryAttemptIndex == 0 {
+            if retryAttemptIndex == 0 && wasReady {
                 return PlaybackRecoveryPlan(
                     kind: kind,
                     excludeCurrentSource: false,
@@ -161,7 +163,7 @@ enum PlaybackRecoveryPolicy {
                     evictStreamCache: true,
                     preferSameSourceFirst: false,
                     preservePosition: true,
-                    backoffMs: 300
+                    backoffMs: 200
                 )
             }
 

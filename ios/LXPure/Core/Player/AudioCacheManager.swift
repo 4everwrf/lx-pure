@@ -10,6 +10,7 @@ final class AudioCacheManager: @unchecked Sendable {
     private let lock = NSLock()
     private var activeCacheTasks: [String: URLSessionDownloadTask] = [:]
     private var activeTaskTokens: [String: UUID] = [:]
+    private var keyGenerations: [String: UInt64] = [:]
     private var cacheGeneration: UInt64 = 0
 
     init(session: URLSession, cacheDirectory: URL? = nil) {
@@ -25,10 +26,29 @@ final class AudioCacheManager: @unchecked Sendable {
     }
 
     static func cacheKey(trackId: String, quality: AudioQuality) -> String {
-        let safe = "\(trackId)_\(quality.lxType)"
+        cacheKey(
+            trackId: trackId,
+            resolvedTrackId: nil,
+            sourceId: nil,
+            sourceRevision: nil,
+            quality: quality
+        )
+    }
+
+    static func cacheKey(
+        trackId: String,
+        resolvedTrackId: String?,
+        sourceId: String?,
+        sourceRevision: String? = nil,
+        quality: AudioQuality
+    ) -> String {
+        let resolvedPart = (resolvedTrackId?.isEmpty == false) ? resolvedTrackId! : trackId
+        let sourcePart = (sourceId?.isEmpty == false) ? sourceId! : "default"
+        let revPart = (sourceRevision?.isEmpty == false) ? "_\(sourceRevision!)" : ""
+        let raw = "\(trackId)_\(resolvedPart)_\(sourcePart)\(revPart)_\(quality.lxType)"
+        return raw
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
-        return safe
     }
 
     func cachedFileURL(for cacheKey: String) -> URL? {
@@ -61,21 +81,32 @@ final class AudioCacheManager: @unchecked Sendable {
     }
 
     func cacheInBackground(remoteUrlString: String, cacheKey: String, quality: AudioQuality) {
-        guard let remoteUrl = URL(string: remoteUrlString) else { return }
+        guard let remoteUrl = LxJsRuntime.parseLenientURL(remoteUrlString) else { return }
+
+        lock.lock()
+        let scheduledGen = cacheGeneration
+        let scheduledKeyGen = keyGenerations[cacheKey] ?? 0
+        lock.unlock()
 
         ioQueue.async { [weak self] in
             guard let self else { return }
             if self.findCachedFileOnIOQueue(for: cacheKey) != nil { return }
 
             var req = URLRequest(url: remoteUrl)
-            req.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64)", forHTTPHeaderField: "User-Agent")
+            req.setValue(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                forHTTPHeaderField: "User-Agent"
+            )
 
             var tasksToCancel: [URLSessionDownloadTask] = []
             let taskToken = UUID()
-            var expectedGen: UInt64 = 0
             var createdTask: URLSessionDownloadTask?
 
             self.lock.lock()
+            if self.cacheGeneration != scheduledGen || (self.keyGenerations[cacheKey] ?? 0) != scheduledKeyGen {
+                self.lock.unlock()
+                return
+            }
             if self.activeCacheTasks[cacheKey] != nil {
                 self.lock.unlock()
                 return
@@ -86,14 +117,15 @@ final class AudioCacheManager: @unchecked Sendable {
                 self.activeCacheTasks.removeAll()
                 self.activeTaskTokens.removeAll()
             }
-            expectedGen = self.cacheGeneration
 
             let task = self.session.downloadTask(with: req) { [weak self] tempUrl, response, error in
                 guard let self else { return }
 
                 var stillValid = false
                 self.lock.lock()
-                if self.cacheGeneration == expectedGen && self.activeTaskTokens[cacheKey] == taskToken {
+                if self.cacheGeneration == scheduledGen &&
+                    (self.keyGenerations[cacheKey] ?? 0) == scheduledKeyGen &&
+                    self.activeTaskTokens[cacheKey] == taskToken {
                     self.activeCacheTasks.removeValue(forKey: cacheKey)
                     self.activeTaskTokens.removeValue(forKey: cacheKey)
                     stillValid = true
@@ -135,7 +167,8 @@ final class AudioCacheManager: @unchecked Sendable {
                 // Move synchronously inside URLSession's background callback before iOS deletes tempUrl
                 self.ioQueue.sync {
                     self.lock.lock()
-                    let genMatches = (self.cacheGeneration == expectedGen)
+                    let genMatches = (self.cacheGeneration == scheduledGen &&
+                        (self.keyGenerations[cacheKey] ?? 0) == scheduledKeyGen)
                     self.lock.unlock()
                     guard genMatches else { return }
 
@@ -161,6 +194,7 @@ final class AudioCacheManager: @unchecked Sendable {
 
     func evict(cacheKey: String) {
         lock.lock()
+        keyGenerations[cacheKey] = (keyGenerations[cacheKey] ?? 0) &+ 1
         let task = activeCacheTasks.removeValue(forKey: cacheKey)
         activeTaskTokens.removeValue(forKey: cacheKey)
         lock.unlock()
@@ -294,7 +328,7 @@ final class AudioCacheManager: @unchecked Sendable {
 
     static func inferExtension(urlString: String, contentType: String?, quality: AudioQuality) -> String {
         // 1. Trust explicit URL path extension first (CDNs frequently downgrade lossless requests to MP3/M4A)
-        if let pathExt = URL(string: urlString)?.pathExtension.lowercased(), !pathExt.isEmpty {
+        if let pathExt = LxJsRuntime.parseLenientURL(urlString)?.pathExtension.lowercased(), !pathExt.isEmpty {
             switch pathExt {
             case "flac": return "flac"
             case "m4a", "mp4": return "m4a"

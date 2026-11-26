@@ -22,6 +22,7 @@ import com.lxpure.music.data.local.SettingsDataStore
 import com.lxpure.music.data.repository.LibraryRepository
 import okhttp3.Cache
 import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -32,30 +33,60 @@ class AppContainer(application: Application) {
         maxSize = 12L * 1024L * 1024L // 12 MB API metadata cache
     )
 
+    private val apiDispatcher: Dispatcher = Dispatcher().apply {
+        maxRequests = 64
+        maxRequestsPerHost = 12
+    }
+
+    private val streamDispatcher: Dispatcher = Dispatcher().apply {
+        maxRequests = 16
+        maxRequestsPerHost = 6
+    }
+
+    private val imageDispatcher: Dispatcher = Dispatcher().apply {
+        maxRequests = 24
+        maxRequestsPerHost = 6
+    }
+
     val httpClient: OkHttpClient = OkHttpClient.Builder()
         .cache(httpDiskCache)
-        .connectionPool(ConnectionPool(5, 2, TimeUnit.MINUTES))
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(18, TimeUnit.SECONDS)
+        .dispatcher(apiDispatcher)
+        .connectionPool(ConnectionPool(10, 2, TimeUnit.MINUTES))
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
 
-    // Dedicated audio streaming client: bypasses the 12 MB API metadata cache (audio uses 300 MB SimpleCache)
-    // and allows longer CDN read windows + automatic TCP reconnects across network hiccups.
-    val streamHttpClient: OkHttpClient = httpClient.newBuilder()
+    // Dedicated audio streaming client with isolated Dispatcher & ConnectionPool so concurrent
+    // source resolution / cover loading never starves ExoPlayer, and dead CDNs fail fast.
+    val streamHttpClient: OkHttpClient = OkHttpClient.Builder()
         .cache(null)
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .dispatcher(streamDispatcher)
+        .connectionPool(ConnectionPool(6, 2, TimeUnit.MINUTES))
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 
     val imageLoader: ImageLoader = ImageLoader.Builder(application)
-        // Avoid double disk caching (Coil maintains its own 64 MB DiskCache; keep http_cache exclusively for API metadata)
-        .okHttpClient(httpClient.newBuilder().cache(null).build())
+        // Avoid double disk caching & isolate image loading from API/stream HTTP pools
+        .okHttpClient(
+            OkHttpClient.Builder()
+                .cache(null)
+                .dispatcher(imageDispatcher)
+                .connectionPool(ConnectionPool(6, 2, TimeUnit.MINUTES))
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build()
+        )
         .components {
             add(LocalAudioArtFetcher.Factory(application))
         }

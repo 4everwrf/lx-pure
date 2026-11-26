@@ -35,9 +35,7 @@ enum class AudioQuality(val lxType: String, val label: String, val badge: String
             entries.firstOrNull { it.lxType.equals(type, ignoreCase = true) } ?: Q320K
 
         fun fallbackChain(preferred: AudioQuality): List<AudioQuality> {
-            val lowerOrEqual = entries.filter { it.priority <= preferred.priority }.sortedByDescending { it.priority }
-            val higher = entries.filter { it.priority > preferred.priority }.sortedBy { it.priority }
-            return lowerOrEqual + higher
+            return entries.filter { it.priority <= preferred.priority }.sortedByDescending { it.priority }
         }
     }
 }

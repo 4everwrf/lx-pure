@@ -215,6 +215,9 @@ struct RootView: View {
                     onOpenQueue: { showQueueSheet = true },
                     onSelectQuality: { playerController.changePreferredQuality($0) },
                     onSetSleepTimer: { playerController.setSleepTimer(minutes: $0) },
+                    readySources: userApiManager.sources.filter { $0.enabled && $0.status == .ready },
+                    onSelectSource: { playerController.switchSource(sourceId: $0) },
+                    onSwitchAlternateSource: { playerController.switchToAlternateSource() },
                     onArtistClick: { artistName in
                         if isPlayerExpanded {
                             navigateToArtistSearch(artistName)
@@ -693,9 +696,18 @@ struct RootView: View {
                 isCheckingUpdate: isCheckingUpdate,
                 bottomInset: bottomContentInset,
                 onOpenSourceManager: { path.append(.sourceManager) },
-                onSelectQuality: { q in settingsStore.update { $0.preferredQuality = q } },
-                onToggleAutoFallback: { val in settingsStore.update { $0.autoFallbackSource = val } },
-                onToggleCellularDataSaver: { val in settingsStore.update { $0.wifiOnlyHighQuality = val } },
+                onSelectQuality: { q in
+                    settingsStore.update { $0.preferredQuality = q }
+                    playerController.invalidatePreload()
+                },
+                onToggleAutoFallback: { val in
+                    settingsStore.update { $0.autoFallbackSource = val }
+                    playerController.invalidatePreload()
+                },
+                onToggleCellularDataSaver: { val in
+                    settingsStore.update { $0.wifiOnlyHighQuality = val }
+                    playerController.invalidatePreload()
+                },
                 onSelectTheme: { mode in settingsStore.update { $0.themeMode = mode } },
                 onToggleFluidAmbient: { val in settingsStore.update { $0.fluidAmbientBackground = val } },
                 onToggleTranslation: { val in settingsStore.update { $0.showTranslationLyrics = val } },

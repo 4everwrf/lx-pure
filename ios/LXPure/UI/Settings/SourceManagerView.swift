@@ -313,6 +313,7 @@ struct SourceManagerView: View {
         let statusText: String = {
             switch source.status {
             case .ready:
+                if let err = source.errorMessage, !err.isEmpty { return err }
                 if let ms = source.latencyMs { return "就绪 · \(ms)ms" }
                 return "就绪"
             case .initializing: return "初始化中..."
@@ -391,7 +392,7 @@ struct SourceManagerView: View {
                     actionButton(
                         icon: "speedometer",
                         title: isTesting ? "测速中..." : "测速",
-                        disabled: isTesting || isUpdating || isUpdatingAll
+                        disabled: !source.enabled || isTesting || isUpdating || isUpdatingAll
                     ) {
                         guard !testingIds.contains(source.id) && !updatingIds.contains(source.id) else { return }
                         testingIds.insert(source.id)

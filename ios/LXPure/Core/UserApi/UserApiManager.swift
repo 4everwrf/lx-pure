@@ -9,6 +9,7 @@ struct ResolvedStream: Sendable {
     let providerName: String
     let switchedPlatform: Bool
     let switchedSource: Bool
+    let sourceRevision: String
 }
 
 struct SourceUpdateResult: Sendable {
@@ -53,10 +54,46 @@ struct BatchUpdateSummary: Sendable {
 final class UserApiManager: ObservableObject, @unchecked Sendable {
     @MainActor @Published private(set) var sources: [UserApiSource] = []
 
-    private static let scriptUrlTimeoutSec: Double = 4.5
-    private static let streamProbeTimeoutSec: Double = 2.5
+    private static let scriptUrlTimeoutSec: Double = 5.5
+    private static let streamProbeTimeoutSec: Double = 3.0
+    private static let resolveTotalBudgetSec: TimeInterval = 18.0
     private static let cooldownDurationSec: TimeInterval = 45.0
     private static let maxScriptDownloadBytes: Int = 2 * 1024 * 1024
+    private static let chromeUserAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    private static let searchablePlatformCodes: Set<String> = [
+        MusicSource.wy.code,
+        MusicSource.tx.code,
+        MusicSource.kw.code,
+        MusicSource.kg.code
+    ]
+    private static let healthProbeQueries = ["海阔天空", "起风了", "晴天"]
+
+    static func sourcePlatformKey(sourceId: String, platformCode: String) -> String {
+        "\(sourceId)_\(platformCode.lowercased())"
+    }
+
+    static func sourceTrackKey(sourceId: String, trackId: String) -> String {
+        "\(sourceId)_\(trackId)"
+    }
+
+    static func computeSourceRevision(for source: UserApiSource) -> String {
+        let seed = "\(source.version):\(source.script.trimmingCharacters(in: .whitespacesAndNewlines))"
+        return String(LxCrypto.md5Hex(seed).prefix(8))
+    }
+
+    static func isDeterministicTrackMiss(_ rawMessage: String?) -> Bool {
+        let lower = (rawMessage ?? "").lowercased()
+        guard !lower.isEmpty else { return false }
+        // Never include VIP / 403 here: many sources block FLAC/320k as VIP while 128k remains playable.
+        return lower.contains("无版权") ||
+            lower.contains("版权") ||
+            lower.contains("copyright") ||
+            lower.contains("下架") ||
+            lower.contains("不存在") ||
+            lower.contains("not found") ||
+            lower.contains("404")
+    }
 
     private let libraryStore: LibraryStore
     private let session: URLSession
@@ -105,14 +142,18 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
     /// Waits briefly on cold launch so tapping Play on a restored track immediately after
     /// opening the app lets custom JS source runtimes finish initializing.
-    func awaitInitialLoadIfNeeded(timeoutSec: Double = 4.0) async {
+    func awaitInitialLoadIfNeeded(timeoutSec: Double = 4.5, preferredSourceId: String? = nil) async {
         let deadline = Date().addingTimeInterval(timeoutSec)
         while Date() < deadline && !Task.isCancelled {
             let (loaded, list) = withLock { (hasCompletedInitialStoreLoad, sourcesSnapshot) }
             if loaded {
-                let hasReady = list.contains { $0.enabled && $0.status == .ready }
-                let hasInitializing = list.contains { $0.enabled && $0.status == .initializing }
-                if hasReady || !hasInitializing {
+                let enabled = list.filter(\.enabled).sorted { $0.priority < $1.priority }
+                if enabled.isEmpty { break }
+                let primary = preferredSourceId.flatMap { id in enabled.first(where: { $0.id == id }) } ?? enabled[0]
+                let primarySettled = primary.status != .initializing
+                let hasReady = enabled.contains { $0.status == .ready }
+                let hasInitializing = enabled.contains { $0.status == .initializing }
+                if (primarySettled && hasReady) || !hasInitializing {
                     break
                 }
             }
@@ -342,6 +383,9 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             return built
         }
 
+        // Bump generation before updating snapshot so an earlier finishing runtime for this id cannot clobber the import
+        _ = bumpGeneration(for: model.id)
+
         // Update only the imported source in memory so other healthy runtimes keep playing uninterrupted
         let nextList: [UserApiSource] = withLock {
             var copy = sourcesSnapshot
@@ -381,8 +425,12 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                 item.latencyMs = nil
             }
         } else {
+            clearCooldowns(forSourceId: id)
             await updateSourceState(id: id) { item in
                 item.enabled = true
+                item.status = .initializing
+                item.errorMessage = nil
+                item.latencyMs = nil
             }
             if let target = currentSources().first(where: { $0.id == id }) {
                 Task { await self.startRuntime(for: target) }
@@ -425,6 +473,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             return map
         }
         guard !reorderedPriorities.isEmpty else { return }
+        clearCooldowns(forSourceId: id)
 
         withLock {
             for i in sourcesSnapshot.indices {
@@ -595,6 +644,9 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         guard let source = currentSources().first(where: { $0.id == id }) else {
             return .failure(LxRuntimeError.message("音源不存在"))
         }
+        guard source.enabled else {
+            return .failure(LxRuntimeError.message("请先启用该音源后再测速"))
+        }
 
         var activeRuntime = withLock { runtimes[id] }
         if activeRuntime == nil {
@@ -605,17 +657,32 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             let errMsg = currentSources().first(where: { $0.id == id })?.errorMessage ?? "音源初始化失败"
             return .failure(LxRuntimeError.message(errMsg))
         }
+        let runtimeGen = currentGeneration(for: id)
 
         let currentMeta = currentSources().first(where: { $0.id == id })
         var seenPlatforms = Set<MusicSource>()
         let platformOrder = (currentMeta?.supportedPlatforms.keys.compactMap { code -> MusicSource? in
-            guard let parsed = MusicSource(rawValue: code.lowercased()), parsed != .local else { return nil }
+            let lower = code.lowercased()
+            guard Self.searchablePlatformCodes.contains(lower),
+                  let parsed = MusicSource(rawValue: lower) else { return nil }
             return seenPlatforms.insert(parsed).inserted ? parsed : nil
         } ?? [])
-            .sorted { MusicAggregator.platformPriority($0) > MusicAggregator.platformPriority($1) }
+            .sorted { lhs, rhs in
+                let rank: (MusicSource) -> Int = {
+                    switch $0 {
+                    case .kw: return 4
+                    case .kg: return 3
+                    case .tx: return 2
+                    case .wy: return 1
+                    default: return 0
+                    }
+                }
+                return rank(lhs) > rank(rhs)
+            }
         guard !platformOrder.isEmpty else {
             let msg = "音源未声明可用音乐平台"
-            await updateSourceState(id: id) {
+            await updateSourceState(id: id, expectedGeneration: runtimeGen) {
+                guard $0.enabled else { return }
                 $0.status = .error
                 $0.latencyMs = nil
                 $0.errorMessage = msg
@@ -623,55 +690,66 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             return .failure(LxRuntimeError.message(msg))
         }
 
-        var probeTrack: Track?
+        var lastFriendlyError: String?
+        var testedAnyTrack = false
+
         for platform in platformOrder {
             if Task.isCancelled { return .failure(CancellationError()) }
-            if let found = await aggregator.searchSinglePlatform(source: platform, query: "晴天", page: 1, limit: 3).first {
-                probeTrack = found
-                break
+            var probeTrack: Track?
+            for query in Self.healthProbeQueries {
+                if Task.isCancelled { return .failure(CancellationError()) }
+                if let found = await aggregator.searchSinglePlatform(source: platform, query: query, page: 1, limit: 3).first {
+                    probeTrack = found
+                    break
+                }
             }
-        }
-        guard !Task.isCancelled else { return .failure(CancellationError()) }
-        guard let probeTrack else {
-            let msg = "测试曲目检索失败，请检查网络"
-            await updateSourceState(id: id) {
-                $0.status = .error
-                $0.latencyMs = nil
-                $0.errorMessage = msg
-            }
-            return .failure(LxRuntimeError.message(msg))
-        }
+            guard let probeTrack else { continue }
+            testedAnyTrack = true
 
-        let start = Date()
-        let probeRes = await runtime.requestMusicUrl(track: probeTrack, quality: .q128k, timeoutSeconds: 6.0)
-        if Task.isCancelled { return .failure(CancellationError()) }
-        let elapsed = max(Int64(Date().timeIntervalSince(start) * 1000.0), 1)
-
-        if case .success(let url) = probeRes, await verifyPlayableAudioUrl(url) {
-            clearCooldowns(forSourceId: id)
-            await updateSourceState(id: id) {
-                $0.latencyMs = elapsed
-                $0.status = .ready
-                $0.errorMessage = nil
-            }
-            return .success(elapsed)
-        } else {
+            let start = Date()
+            let probeRes = await runtime.requestMusicUrl(track: probeTrack, quality: .q128k, timeoutSeconds: 6.0)
             if Task.isCancelled { return .failure(CancellationError()) }
-            let rawErr: String
-            if case .failure(let err) = probeRes {
-                rawErr = err.localizedDescription
+            let elapsed = max(Int64(Date().timeIntervalSince(start) * 1000.0), 1)
+
+            if case .success(let url) = probeRes, await verifyPlayableAudioUrl(url) {
+                if currentGeneration(for: id) == runtimeGen {
+                    clearCooldowns(forSourceId: id)
+                    await updateSourceState(id: id, expectedGeneration: runtimeGen) {
+                        guard $0.enabled else { return }
+                        $0.latencyMs = elapsed
+                        $0.status = .ready
+                        $0.errorMessage = nil
+                    }
+                }
+                return .success(elapsed)
             } else {
-                rawErr = "返回链接不可播放"
+                if Task.isCancelled { return .failure(CancellationError()) }
+                let rawErr: String
+                if case .failure(let err) = probeRes {
+                    rawErr = err.localizedDescription
+                } else {
+                    rawErr = "返回链接不可播放"
+                }
+                lastFriendlyError = LxJsRuntime.formatFriendlyError(rawErr)
+                if currentGeneration(for: id) == runtimeGen {
+                    markCooldown(sourceId: id, platformCode: probeTrack.source.code)
+                }
             }
-            let friendly = LxJsRuntime.formatFriendlyError(rawErr)
-            markCooldown(sourceId: id, platformCode: probeTrack.source.code)
-            await updateSourceState(id: id) {
-                $0.status = .error
-                $0.latencyMs = nil
-                $0.errorMessage = "测速失败：\(friendly)"
-            }
-            return .failure(LxRuntimeError.message(friendly))
         }
+
+        guard !Task.isCancelled else { return .failure(CancellationError()) }
+        let finalMsg = !testedAnyTrack
+            ? "测试曲目检索失败，请检查网络"
+            : (lastFriendlyError ?? "当前各平台测试曲目均未返回可播链接")
+        // Keep an initialized runtime .ready so a temporary health-probe miss never bricks playback;
+        // surface a soft warning message on the card instead.
+        await updateSourceState(id: id, expectedGeneration: runtimeGen) {
+            guard $0.enabled else { return }
+            $0.status = .ready
+            $0.latencyMs = nil
+            $0.errorMessage = "测速未通过：\(finalMsg)"
+        }
+        return .failure(LxRuntimeError.message(finalMsg))
     }
 
     func resolveStream(
@@ -680,11 +758,14 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         allowCrossPlatformFallback: Bool = true,
         preferredSourceId: String? = nil,
         excludedSourceIds: Set<String> = [],
-        excludedTrackIds: Set<String> = []
+        excludedTrackIds: Set<String> = [],
+        excludedSourcePlatforms: Set<String> = [],
+        excludedSourceTracks: Set<String> = []
     ) async -> Result<ResolvedStream, Error> {
-        await awaitInitialLoadIfNeeded()
+        await awaitInitialLoadIfNeeded(preferredSourceId: preferredSourceId)
         if Task.isCancelled { return .failure(CancellationError()) }
 
+        let deadline = Date().addingTimeInterval(Self.resolveTotalBudgetSec)
         let allSources = currentSources()
         let readySources = allSources
             .filter { $0.enabled && $0.status == .ready && !excludedSourceIds.contains($0.id) }
@@ -707,66 +788,136 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             return .failure(LxRuntimeError.message(msg))
         }
 
-        let prunedBox = PrunedSetBox()
+        let prunedPlatformsBox = PrunedSetBox(initial: excludedSourcePlatforms)
+        let prunedTracksBox = PrunedSetBox(initial: excludedSourceTracks)
+        let missCounterBox = MissCounterBox()
 
-        // 1. Primary track
+        var attemptedTrackIds = excludedTrackIds
+        let attachedAlts = allowCrossPlatformFallback
+            ? track.alternates
+                .filter { !excludedTrackIds.contains($0.id) }
+                .sorted { MusicAggregator.platformPriority($0.source) > MusicAggregator.platformPriority($1.source) }
+            : []
+
+        // Phase A: Healthy (non-cooling) sources — Primary -> Attached Alts -> Dynamic Alts
         if !excludedTrackIds.contains(track.id) {
-            if let resolved = await tryResolveTracksByQualityTiers(
+            attemptedTrackIds.insert(track.id)
+            if let resolved = await tryResolveTracks(
                 tracks: [track],
                 preferredQuality: preferredQuality,
                 sources: readySources,
                 switchedPlatform: false,
                 preferredSourceId: preferredSourceId,
-                prunedBox: prunedBox
+                prunedPlatformsBox: prunedPlatformsBox,
+                prunedTracksBox: prunedTracksBox,
+                missCounterBox: missCounterBox,
+                includeCooling: false,
+                deadline: deadline
             ) {
                 return .success(resolved)
             }
         }
         if Task.isCancelled { return .failure(CancellationError()) }
 
-        // 2. Cross-platform fallback
-        if allowCrossPlatformFallback {
-            let attachedAlts = track.alternates
-                .filter { !excludedTrackIds.contains($0.id) }
-                .sorted { MusicAggregator.platformPriority($0.source) > MusicAggregator.platformPriority($1.source) }
-            if !attachedAlts.isEmpty,
-               let resolved = await tryResolveTracksByQualityTiers(
-                   tracks: attachedAlts,
+        var dynamicCandidates: [Track] = []
+        if allowCrossPlatformFallback && Date() < deadline {
+            if !attachedAlts.isEmpty {
+                attachedAlts.forEach { attemptedTrackIds.insert($0.id) }
+                if let resolved = await tryResolveTracks(
+                    tracks: attachedAlts,
+                    preferredQuality: preferredQuality,
+                    sources: readySources,
+                    switchedPlatform: true,
+                    preferredSourceId: preferredSourceId,
+                    prunedPlatformsBox: prunedPlatformsBox,
+                    prunedTracksBox: prunedTracksBox,
+                    missCounterBox: missCounterBox,
+                    includeCooling: false,
+                    deadline: deadline
+                ) {
+                    return .success(resolved)
+                }
+            }
+            if Task.isCancelled { return .failure(CancellationError()) }
+
+            if Date() < deadline {
+                let triedCodes = Set(([track] + attachedAlts).map { $0.source.code.lowercased() })
+                let searchableSupported = Set(
+                    readySources
+                        .flatMap { $0.supportedPlatforms.keys }
+                        .map { $0.lowercased() }
+                        .filter { Self.searchablePlatformCodes.contains($0) }
+                )
+                let remainingCodes = searchableSupported.subtracting(triedCodes)
+                let searchCodes = remainingCodes.isEmpty ? searchableSupported : remainingCodes
+
+                let searchBudget = min(3.5, max(deadline.timeIntervalSinceNow, 0.5))
+                let rawDynamicAlts: [Track] = searchCodes.isEmpty ? [] : (
+                    await Self.withTimeoutOrNil(seconds: searchBudget) {
+                        await self.aggregator.findAlternativeTracks(for: track, allowedPlatformCodes: searchCodes)
+                    } ?? []
+                )
+                if Task.isCancelled { return .failure(CancellationError()) }
+
+                let dynamicAlts = rawDynamicAlts.filter { !attemptedTrackIds.contains($0.id) }
+                if !dynamicAlts.isEmpty {
+                    var seenPlatforms = Set<MusicSource>()
+                    dynamicCandidates = Array(dynamicAlts.filter { seenPlatforms.insert($0.source).inserted }.prefix(3))
+                    dynamicCandidates.forEach { attemptedTrackIds.insert($0.id) }
+                    if let resolved = await tryResolveTracks(
+                        tracks: dynamicCandidates,
+                        preferredQuality: preferredQuality,
+                        sources: readySources,
+                        switchedPlatform: true,
+                        preferredSourceId: preferredSourceId,
+                        prunedPlatformsBox: prunedPlatformsBox,
+                        prunedTracksBox: prunedTracksBox,
+                        missCounterBox: missCounterBox,
+                        includeCooling: false,
+                        deadline: deadline
+                    ) {
+                        return .success(resolved)
+                    }
+                }
+            }
+        }
+        if Task.isCancelled { return .failure(CancellationError()) }
+
+        // Phase B: Cooling sources fallback ONLY after healthy primary & cross-platform alternates are exhausted
+        if Date() < deadline {
+            if !excludedTrackIds.contains(track.id),
+               let resolved = await tryResolveTracks(
+                   tracks: [track],
                    preferredQuality: preferredQuality,
                    sources: readySources,
-                   switchedPlatform: true,
+                   switchedPlatform: false,
                    preferredSourceId: preferredSourceId,
-                   prunedBox: prunedBox
+                   prunedPlatformsBox: prunedPlatformsBox,
+                   prunedTracksBox: prunedTracksBox,
+                   missCounterBox: missCounterBox,
+                   includeCooling: true,
+                   deadline: deadline
                ) {
                 return .success(resolved)
             }
             if Task.isCancelled { return .failure(CancellationError()) }
 
-            // 3. Dynamic fuzzy search across remaining platforms (bounded by 3.5s timeout for Android parity)
-            let triedCodes = Set(([track] + attachedAlts).map(\.source.code))
-            let allSupported = Set(readySources.flatMap { $0.supportedPlatforms.keys })
-            let remainingCodes = allSupported.subtracting(triedCodes)
-            let searchCodes = remainingCodes.isEmpty ? allSupported : remainingCodes
-
-            let rawDynamicAlts = await Self.withTimeoutOrNil(seconds: 3.5) {
-                await self.aggregator.findAlternativeTracks(for: track, allowedPlatformCodes: searchCodes)
-            } ?? []
-            if Task.isCancelled { return .failure(CancellationError()) }
-
-            let dynamicAlts = rawDynamicAlts.filter { !excludedTrackIds.contains($0.id) }
-            if !dynamicAlts.isEmpty {
-                var seenPlatforms = Set<MusicSource>()
-                let bestPerPlatform = dynamicAlts.filter { seenPlatforms.insert($0.source).inserted }.prefix(3)
-                if let resolved = await tryResolveTracksByQualityTiers(
-                    tracks: Array(bestPerPlatform),
-                    preferredQuality: preferredQuality,
-                    sources: readySources,
-                    switchedPlatform: true,
-                    preferredSourceId: preferredSourceId,
-                    prunedBox: prunedBox
-                ) {
-                    return .success(resolved)
-                }
+            var seenAltIds = Set<String>()
+            let allAlts = (attachedAlts + dynamicCandidates).filter { seenAltIds.insert($0.id).inserted }
+            if allowCrossPlatformFallback && !allAlts.isEmpty && Date() < deadline,
+               let resolved = await tryResolveTracks(
+                   tracks: allAlts,
+                   preferredQuality: preferredQuality,
+                   sources: readySources,
+                   switchedPlatform: true,
+                   preferredSourceId: preferredSourceId,
+                   prunedPlatformsBox: prunedPlatformsBox,
+                   prunedTracksBox: prunedTracksBox,
+                   missCounterBox: missCounterBox,
+                   includeCooling: true,
+                   deadline: deadline
+               ) {
+                return .success(resolved)
             }
         }
 
@@ -792,35 +943,142 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func tryResolveTracksByQualityTiers(
+    private func tryResolveTracks(
         tracks: [Track],
         preferredQuality: AudioQuality,
         sources: [UserApiSource],
         switchedPlatform: Bool,
         preferredSourceId: String?,
-        prunedBox: PrunedSetBox
+        prunedPlatformsBox: PrunedSetBox,
+        prunedTracksBox: PrunedSetBox,
+        missCounterBox: MissCounterBox,
+        includeCooling: Bool,
+        deadline: Date
     ) async -> ResolvedStream? {
         let qualityChain = AudioQuality.fallbackChain(preferred: preferredQuality)
 
-        for includeCooling in [false, true] {
-            for quality in qualityChain {
-                if Task.isCancelled { return nil }
-                let candidates = buildTierCandidates(
+        // When user explicitly chose a source, honor it across its full downward quality chain first
+        // (bypassing cooldown in Phase A so explicit manual picks always try the chosen source).
+        if let preferredSourceId, !preferredSourceId.isEmpty {
+            let preferredSources = sources.filter { $0.id == preferredSourceId }
+            let otherSources = sources.filter { $0.id != preferredSourceId }
+            if !preferredSources.isEmpty {
+                if !includeCooling {
+                    for quality in qualityChain {
+                        if Task.isCancelled || Date() >= deadline { return nil }
+                        let candidates = buildTierCandidates(
+                            tracks: tracks,
+                            quality: quality,
+                            sources: preferredSources,
+                            switchedPlatform: switchedPlatform,
+                            prunedPlatformsBox: prunedPlatformsBox,
+                            prunedTracksBox: prunedTracksBox,
+                            missCounterBox: missCounterBox,
+                            includeCooling: false,
+                            ignoreCooldown: true
+                        )
+                        if candidates.isEmpty { continue }
+                        if let winner = await raceFirstValid(
+                            candidates: candidates,
+                            prunedPlatformsBox: prunedPlatformsBox,
+                            prunedTracksBox: prunedTracksBox,
+                            missCounterBox: missCounterBox,
+                            switchedSourceOnWin: false,
+                            deadline: deadline
+                        ) {
+                            return winner
+                        }
+                    }
+                }
+                if otherSources.isEmpty || Task.isCancelled || Date() >= deadline { return nil }
+                return await tryResolveQualityTiersOrdered(
                     tracks: tracks,
-                    quality: quality,
-                    sources: sources,
+                    qualityChain: qualityChain,
+                    sources: otherSources,
                     switchedPlatform: switchedPlatform,
-                    prunedBox: prunedBox,
-                    includeCooling: includeCooling
+                    prunedPlatformsBox: prunedPlatformsBox,
+                    prunedTracksBox: prunedTracksBox,
+                    missCounterBox: missCounterBox,
+                    includeCooling: includeCooling,
+                    initialSwitched: true,
+                    deadline: deadline
                 )
-                if candidates.isEmpty { continue }
-                if let winner = await raceTier(
-                    candidates: candidates,
-                    preferredSourceId: preferredSourceId,
-                    prunedBox: prunedBox
+            }
+        }
+
+        return await tryResolveQualityTiersOrdered(
+            tracks: tracks,
+            qualityChain: qualityChain,
+            sources: sources,
+            switchedPlatform: switchedPlatform,
+            prunedPlatformsBox: prunedPlatformsBox,
+            prunedTracksBox: prunedTracksBox,
+            missCounterBox: missCounterBox,
+            includeCooling: includeCooling,
+            initialSwitched: false,
+            deadline: deadline
+        )
+    }
+
+    private func tryResolveQualityTiersOrdered(
+        tracks: [Track],
+        qualityChain: [AudioQuality],
+        sources: [UserApiSource],
+        switchedPlatform: Bool,
+        prunedPlatformsBox: PrunedSetBox,
+        prunedTracksBox: PrunedSetBox,
+        missCounterBox: MissCounterBox,
+        includeCooling: Bool,
+        initialSwitched: Bool,
+        deadline: Date
+    ) async -> ResolvedStream? {
+        for quality in qualityChain {
+            if Task.isCancelled || Date() >= deadline { return nil }
+            let candidates = buildTierCandidates(
+                tracks: tracks,
+                quality: quality,
+                sources: sources,
+                switchedPlatform: switchedPlatform,
+                prunedPlatformsBox: prunedPlatformsBox,
+                prunedTracksBox: prunedTracksBox,
+                missCounterBox: missCounterBox,
+                includeCooling: includeCooling
+            )
+            if candidates.isEmpty { continue }
+
+            if tracks.count == 1 && candidates.count > 1 {
+                let primary = candidates[0]
+                let backups = Array(candidates.dropFirst())
+                if let winner = await raceFirstValid(
+                    candidates: [primary],
+                    prunedPlatformsBox: prunedPlatformsBox,
+                    prunedTracksBox: prunedTracksBox,
+                    missCounterBox: missCounterBox,
+                    switchedSourceOnWin: initialSwitched,
+                    deadline: deadline
                 ) {
                     return winner
                 }
+                if Task.isCancelled || Date() >= deadline { return nil }
+                if let winner = await raceInBalancedWaves(
+                    candidates: backups,
+                    prunedPlatformsBox: prunedPlatformsBox,
+                    prunedTracksBox: prunedTracksBox,
+                    missCounterBox: missCounterBox,
+                    initialSwitched: true,
+                    deadline: deadline
+                ) {
+                    return winner
+                }
+            } else if let winner = await raceInBalancedWaves(
+                candidates: candidates,
+                prunedPlatformsBox: prunedPlatformsBox,
+                prunedTracksBox: prunedTracksBox,
+                missCounterBox: missCounterBox,
+                initialSwitched: initialSwitched,
+                deadline: deadline
+            ) {
+                return winner
             }
         }
         return nil
@@ -831,22 +1089,32 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         quality: AudioQuality,
         sources: [UserApiSource],
         switchedPlatform: Bool,
-        prunedBox: PrunedSetBox,
-        includeCooling: Bool
+        prunedPlatformsBox: PrunedSetBox,
+        prunedTracksBox: PrunedSetBox,
+        missCounterBox: MissCounterBox,
+        includeCooling: Bool,
+        ignoreCooldown: Bool = false
     ) -> [ResolveCandidate] {
         var result: [ResolveCandidate] = []
         for track in tracks {
-            let platformCode = track.source.code
+            let platformCode = track.source.code.lowercased()
             for source in sources {
                 guard let supportedQualities = source.supportedPlatforms[platformCode] else { continue }
                 let supportsTier = supportedQualities.contains(quality.lxType) ||
                     (supportedQualities.isEmpty && quality == .q128k)
                 if !supportsTier { continue }
 
-                let key = cooldownKey(sourceId: source.id, platformCode: platformCode)
-                if prunedBox.contains(key) { continue }
-                let cooling = isInCooldown(key: key)
-                if includeCooling != cooling { continue }
+                let platKey = Self.sourcePlatformKey(sourceId: source.id, platformCode: platformCode)
+                if prunedPlatformsBox.contains(platKey) { continue }
+                let trackKey = Self.sourceTrackKey(sourceId: source.id, trackId: track.id)
+                if prunedTracksBox.contains(trackKey) { continue }
+                // Skip redundant intermediate tiers (e.g. 320k after FLAC24 + FLAC both missed),
+                // but NEVER skip .q128k fallback which is frequently the only free/playable tier.
+                if quality != .q128k && missCounterBox.count(for: trackKey) >= 2 { continue }
+                if !ignoreCooldown {
+                    let cooling = isInCooldown(key: platKey)
+                    if includeCooling != cooling { continue }
+                }
 
                 let runtime = withLock { runtimes[source.id] }
                 result.append(ResolveCandidate(
@@ -861,55 +1129,27 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         return result
     }
 
-    private func raceTier(
-        candidates: [ResolveCandidate],
-        preferredSourceId: String?,
-        prunedBox: PrunedSetBox
-    ) async -> ResolvedStream? {
-        guard !candidates.isEmpty, !Task.isCancelled else { return nil }
-        if let preferredSourceId, !preferredSourceId.isEmpty {
-            let preferred = candidates.filter { $0.source.id == preferredSourceId }
-            let others = candidates.filter { $0.source.id != preferredSourceId }
-            if !preferred.isEmpty {
-                if let winner = await raceFirstValid(
-                    candidates: preferred,
-                    prunedBox: prunedBox,
-                    switchedSourceOnWin: false
-                ) {
-                    return winner
-                }
-                if !others.isEmpty && !Task.isCancelled {
-                    return await raceInBalancedWaves(
-                        candidates: others,
-                        prunedBox: prunedBox,
-                        initialSwitched: true
-                    )
-                }
-                return nil
-            }
-        }
-        return await raceInBalancedWaves(
-            candidates: candidates,
-            prunedBox: prunedBox,
-            initialSwitched: false
-        )
-    }
-
     private func raceInBalancedWaves(
         candidates: [ResolveCandidate],
-        prunedBox: PrunedSetBox,
-        initialSwitched: Bool
+        prunedPlatformsBox: PrunedSetBox,
+        prunedTracksBox: PrunedSetBox,
+        missCounterBox: MissCounterBox,
+        initialSwitched: Bool,
+        deadline: Date
     ) async -> ResolvedStream? {
         let waveSize = networkAdvisor.isMeteredNetwork() ? 2 : 3
         let waves = stride(from: 0, to: candidates.count, by: waveSize).map {
             Array(candidates[$0..<min($0 + waveSize, candidates.count)])
         }
         for (waveIdx, wave) in waves.enumerated() {
-            if Task.isCancelled { return nil }
+            if Task.isCancelled || Date() >= deadline { return nil }
             if let winner = await raceFirstValid(
                 candidates: wave,
-                prunedBox: prunedBox,
-                switchedSourceOnWin: initialSwitched || waveIdx > 0
+                prunedPlatformsBox: prunedPlatformsBox,
+                prunedTracksBox: prunedTracksBox,
+                missCounterBox: missCounterBox,
+                switchedSourceOnWin: initialSwitched || waveIdx > 0,
+                deadline: deadline
             ) {
                 return winner
             }
@@ -919,16 +1159,21 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
     private func raceFirstValid(
         candidates: [ResolveCandidate],
-        prunedBox: PrunedSetBox,
-        switchedSourceOnWin: Bool
+        prunedPlatformsBox: PrunedSetBox,
+        prunedTracksBox: PrunedSetBox,
+        missCounterBox: MissCounterBox,
+        switchedSourceOnWin: Bool,
+        deadline: Date
     ) async -> ResolvedStream? {
-        guard !candidates.isEmpty, !Task.isCancelled else { return nil }
+        let remainingSec = deadline.timeIntervalSinceNow
+        guard !candidates.isEmpty, !Task.isCancelled, remainingSec > 0.25 else { return nil }
         return await withTaskGroup(of: ResolvedStream?.self) { group in
             for candidate in candidates {
                 group.addTask { [weak self] in
                     guard let self, !Task.isCancelled else { return nil }
-                    let platformCode = candidate.track.source.code
-                    let key = self.cooldownKey(sourceId: candidate.source.id, platformCode: platformCode)
+                    let platformCode = candidate.track.source.code.lowercased()
+                    let platKey = Self.sourcePlatformKey(sourceId: candidate.source.id, platformCode: platformCode)
+                    let trackKey = Self.sourceTrackKey(sourceId: candidate.source.id, trackId: candidate.track.id)
                     let start = Date()
 
                     let activeRuntime: LxJsRuntime?
@@ -940,15 +1185,16 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                     if Task.isCancelled { return nil }
 
                     guard let runtime = activeRuntime else {
-                        prunedBox.insert(key)
+                        prunedPlatformsBox.insert(platKey)
                         self.markCooldown(sourceId: candidate.source.id, platformCode: platformCode)
                         return nil
                     }
 
+                    let reqTimeout = min(Self.scriptUrlTimeoutSec, max(deadline.timeIntervalSinceNow, 0.5))
                     let res = await runtime.requestMusicUrl(
                         track: candidate.track,
                         quality: candidate.quality,
-                        timeoutSeconds: Self.scriptUrlTimeoutSec
+                        timeoutSeconds: reqTimeout
                     )
                     if Task.isCancelled { return nil }
 
@@ -958,10 +1204,11 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                         if Task.isCancelled { return nil }
                         if playable {
                             let elapsed = max(Int64(Date().timeIntervalSince(start) * 1000.0), 1)
-                            self.clearCooldown(key: key)
+                            self.clearCooldown(key: platKey)
                             await self.updateSourceState(id: candidate.source.id) { item in
                                 if item.status == .ready {
                                     item.latencyMs = elapsed
+                                    item.errorMessage = nil
                                 }
                             }
                             return ResolvedStream(
@@ -971,19 +1218,31 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                                 sourceId: candidate.source.id,
                                 providerName: candidate.source.name,
                                 switchedPlatform: candidate.switchedPlatform,
-                                switchedSource: switchedSourceOnWin
+                                switchedSource: switchedSourceOnWin,
+                                sourceRevision: Self.computeSourceRevision(for: candidate.source)
                             )
                         }
-                        // Non-playable URL on a higher tier should allow 320k/128k fallback without banning source
+                        _ = missCounterBox.increment(trackKey)
+                        if candidate.quality == .q128k {
+                            prunedTracksBox.insert(trackKey)
+                        }
                         return nil
 
                     case .failure(let error):
                         if error is CancellationError || Task.isCancelled {
                             return nil
                         }
-                        if Self.isTransportOrRuntimeFailure(error.localizedDescription) {
-                            prunedBox.insert(key)
+                        let msg = error.localizedDescription
+                        if Self.isTransportOrRuntimeFailure(msg) {
+                            prunedPlatformsBox.insert(platKey)
                             self.markCooldown(sourceId: candidate.source.id, platformCode: platformCode)
+                        } else if Self.isDeterministicTrackMiss(msg) {
+                            prunedTracksBox.insert(trackKey)
+                        } else {
+                            _ = missCounterBox.increment(trackKey)
+                            if candidate.quality == .q128k {
+                                prunedTracksBox.insert(trackKey)
+                            }
                         }
                         return nil
                     }
@@ -1000,36 +1259,63 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         }
     }
 
+    private enum ProbeOutcome { case playable, retryWithoutRange, rejected }
+
     /// Header-only live stream probe using `URLSession.bytes(for:)` so CDNs ignoring `Range`
-    /// and returning `200 OK` never download 30-80MB audio files into RAM or time out.
+    /// never download 30-80MB audio files into RAM, with automatic HEAD fallback on 416/501.
     private func verifyPlayableAudioUrl(_ urlString: String) async -> Bool {
         guard !Task.isCancelled, let url = LxJsRuntime.parseLenientURL(urlString) else { return false }
+        let rangeOutcome = await executeProbeRequest(url: url, useRange: true)
+        if rangeOutcome == .playable { return true }
+        if rangeOutcome == .retryWithoutRange {
+            return await executeProbeRequest(url: url, useRange: false) == .playable
+        }
+        return false
+    }
+
+    private func executeProbeRequest(url: URL, useRange: Bool) async -> ProbeOutcome {
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.streamProbeTimeoutSec)
-        req.httpMethod = "GET"
-        req.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
-        req.setValue("bytes=0-127", forHTTPHeaderField: "Range")
+        req.httpMethod = useRange ? "GET" : "HEAD"
+        req.setValue(Self.chromeUserAgent, forHTTPHeaderField: "User-Agent")
+        if useRange {
+            req.setValue("bytes=0-127", forHTTPHeaderField: "Range")
+        }
 
         do {
-            let (bytes, response) = try await probeSession.bytes(for: req)
-            _ = bytes
-            if Task.isCancelled { return false }
-            guard let httpResp = response as? HTTPURLResponse,
-                  httpResp.statusCode == 200 || httpResp.statusCode == 206 else {
-                return false
+            let response: URLResponse
+            if useRange {
+                let (bytes, resp) = try await probeSession.bytes(for: req)
+                _ = bytes
+                response = resp
+            } else {
+                let (_, resp) = try await probeSession.data(for: req)
+                response = resp
+            }
+            if Task.isCancelled { return .rejected }
+            guard let httpResp = response as? HTTPURLResponse else { return .rejected }
+            if useRange && (httpResp.statusCode == 416 || httpResp.statusCode == 501) {
+                return .retryWithoutRange
+            }
+            guard httpResp.statusCode == 200 || httpResp.statusCode == 206 else {
+                return .rejected
             }
             let contentType = (httpResp.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
             if contentType.contains("text/html") ||
                 contentType.contains("application/json") ||
-                contentType.contains("text/plain") {
-                return false
+                contentType.contains("application/xml") ||
+                contentType.contains("text/xml") ||
+                contentType.contains("application/javascript") ||
+                contentType.hasPrefix("image/") {
+                return .rejected
             }
             if let lenStr = httpResp.value(forHTTPHeaderField: "Content-Length"),
-               let len = Int64(lenStr), len == 0 {
-                return false
+               let len = Int64(lenStr) {
+                if len == 0 { return .rejected }
+                if httpResp.statusCode == 200 && len < 1024 { return .rejected }
             }
-            return true
+            return .playable
         } catch {
-            return false
+            return .rejected
         }
     }
 
@@ -1181,7 +1467,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         withLock { _ = platformCooldowns.removeValue(forKey: key) }
     }
 
-    private func clearCooldowns(forSourceId sourceId: String) {
+    func clearCooldowns(forSourceId sourceId: String) {
         let prefix = "\(sourceId)_"
         withLock {
             for key in Array(platformCooldowns.keys) where key.hasPrefix(prefix) {
@@ -1236,7 +1522,11 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
 private final class PrunedSetBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var items = Set<String>()
+    private var items: Set<String>
+
+    init(initial: Set<String> = []) {
+        self.items = initial
+    }
 
     func insert(_ key: String) {
         lock.lock()
@@ -1248,5 +1538,24 @@ private final class PrunedSetBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return items.contains(key)
+    }
+}
+
+private final class MissCounterBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+
+    func increment(_ key: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let next = (counts[key] ?? 0) + 1
+        counts[key] = next
+        return next
+    }
+
+    func count(for key: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[key] ?? 0
     }
 }

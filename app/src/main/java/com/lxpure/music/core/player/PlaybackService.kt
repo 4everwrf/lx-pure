@@ -7,22 +7,42 @@ import android.os.Looper
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.DeviceInfo
 import androidx.media3.common.ForwardingPlayer
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Metadata
+import androidx.media3.common.ParserException
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
+import androidx.media3.common.TrackSelectionParameters
+import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
+import androidx.media3.common.text.Cue
+import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSourceException
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.Loader
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.lxpure.music.LxPureApp
 import com.lxpure.music.MainActivity
+import com.lxpure.music.core.userapi.LxQuickJsRuntime
+import java.io.FileNotFoundException
 
 class PlaybackService : MediaSessionService() {
     companion object {
+        internal const val HINT_INTERNAL_CONTROLLER = "com.lxpure.music.INTERNAL_CONTROLLER"
         private val mainHandler = Handler(Looper.getMainLooper())
 
         @Volatile
@@ -35,8 +55,11 @@ class PlaybackService : MediaSessionService() {
          */
         fun silenceForTransition() {
             val runSilence = {
-                activeInstance?.exoPlayerRef?.let { player ->
-                    if (player.playWhenReady) {
+                val service = activeInstance
+                val transitioning = (service?.application as? LxPureApp)
+                    ?.container?.playerController?.isTransitioningOrRecovering() == true
+                service?.exoPlayerRef?.let { player ->
+                    if (transitioning && player.playWhenReady) {
                         player.pause()
                     }
                 }
@@ -90,15 +113,15 @@ class PlaybackService : MediaSessionService() {
         val app = application as LxPureApp
 
         val okHttpFactory = OkHttpDataSource.Factory(app.container.streamHttpClient)
-            .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .setUserAgent(LxQuickJsRuntime.CHROME_USER_AGENT)
         val upstreamFactory = DefaultDataSource.Factory(this, okHttpFactory)
         // Disk-backed 300 MB LRU cache: replays, loops, and seek-backs consume 0 mobile data
         val cachedDataSourceFactory = app.container.mediaCacheManager.wrapWithAudioCache(upstreamFactory)
 
-        // Allow up to 5 internal ExoPlayer load retries (1s..5s backoff) to smoothly absorb
-        // brief Wi-Fi <-> 5G handoffs or transient CDN resets without interrupting playback.
+        // Fail immediately on deterministic HTTP 401/403/404/410/416 and cap transient network retries
+        // to 2 fast attempts (0.5s, 1.0s) so dead CDNs trigger source fallback in <2s instead of stalling 10-90s.
         val mediaSourceFactory = DefaultMediaSourceFactory(cachedDataSourceFactory)
-            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(5))
+            .setLoadErrorHandlingPolicy(FastFailLoadErrorHandlingPolicy())
 
         // Balanced load control: 1.5s fast start, 15s-30s anti-jitter buffer, capped at 10 MB RAM
         val loadControl = DefaultLoadControl.Builder()
@@ -159,11 +182,10 @@ class PlaybackService : MediaSessionService() {
             override fun addListener(listener: Player.Listener) {
                 val proxy = synchronized(wrappedListeners) {
                     wrappedListeners.getOrPut(listener) {
-                        object : Player.Listener by listener {
-                            override fun onAvailableCommandsChanged(availableCommands: Player.Commands) {
-                                listener.onAvailableCommandsChanged(computeForwardingCommands(availableCommands))
-                            }
-                        }
+                        CommandOverridingPlayerListener(
+                            delegate = listener,
+                            transformCommands = ::computeForwardingCommands
+                        )
                     }
                 }
                 super.addListener(proxy)
@@ -194,8 +216,34 @@ class PlaybackService : MediaSessionService() {
             override fun hasNextMediaItem(): Boolean = app.container.playerController.hasNext()
             override fun hasPreviousMediaItem(): Boolean = app.container.playerController.hasPrevious()
 
+            override fun prepare() {
+                if (app.container.playerController.shouldDeferPrepareOrSeekToPlay()) return
+                super.prepare()
+            }
+
+            override fun seekToDefaultPosition() {
+                if (app.container.playerController.shouldDeferPrepareOrSeekToPlay()) return
+                super.seekToDefaultPosition()
+            }
+
+            override fun setPlayWhenReady(playWhenReady: Boolean) {
+                if (playWhenReady) {
+                    play()
+                } else {
+                    pause()
+                }
+            }
+
             override fun pause() {
-                app.container.playerController.onExternalPauseRequested()
+                val session = mediaSession
+                val caller = session?.controllerForCurrentRequest
+                val isInternalAppController = caller != null &&
+                    caller.uid == android.os.Process.myUid() &&
+                    caller.connectionHints.getBoolean(HINT_INTERNAL_CONTROLLER, false) &&
+                    !session.isMediaNotificationController(caller)
+                if (!isInternalAppController) {
+                    app.container.playerController.onExternalPauseRequested()
+                }
                 super.pause()
             }
 
@@ -251,6 +299,18 @@ class PlaybackService : MediaSessionService() {
 
         mediaSession = MediaSession.Builder(this, forwardingPlayer)
             .setSessionActivity(sessionActivityIntent)
+            .setCallback(object : MediaSession.Callback {
+                @OptIn(UnstableApi::class)
+                override fun onPlaybackResumption(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo
+                ): com.google.common.util.concurrent.ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+                    if (app.container.playerController.hasQueue()) {
+                        app.container.playerController.resumeOrReloadCurrent()
+                    }
+                    return super.onPlaybackResumption(mediaSession, controller)
+                }
+            })
             .build()
     }
 
@@ -303,5 +363,192 @@ class PlaybackService : MediaSessionService() {
         }
         mediaSession = null
         super.onDestroy()
+    }
+}
+
+/**
+ * Explicit forwarding proxy for [Player.Listener].
+ *
+ * IMPORTANT: Do NOT replace with Kotlin `by delegate`! Every method on Java interface
+ * [Player.Listener] is a Java 8 `default` no-op method, and Kotlin interface delegation does NOT
+ * generate forwarding stubs for Java `default` methods — using `by` silently swallows every
+ * ExoPlayer callback (`onIsPlayingChanged`, `onPlaybackStateChanged`, `onMediaItemTransition`,
+ * `onPlayerError`, etc.) except overridden ones.
+ */
+internal class CommandOverridingPlayerListener(
+    private val delegate: Player.Listener,
+    private val transformCommands: (Player.Commands) -> Player.Commands
+) : Player.Listener {
+
+    override fun onEvents(player: Player, events: Player.Events) =
+        delegate.onEvents(player, events)
+
+    override fun onTimelineChanged(timeline: Timeline, reason: Int) =
+        delegate.onTimelineChanged(timeline, reason)
+
+    override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) =
+        delegate.onMediaItemTransition(mediaItem, reason)
+
+    override fun onTracksChanged(tracks: Tracks) =
+        delegate.onTracksChanged(tracks)
+
+    override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) =
+        delegate.onMediaMetadataChanged(mediaMetadata)
+
+    override fun onPlaylistMetadataChanged(mediaMetadata: MediaMetadata) =
+        delegate.onPlaylistMetadataChanged(mediaMetadata)
+
+    override fun onIsLoadingChanged(isLoading: Boolean) =
+        delegate.onIsLoadingChanged(isLoading)
+
+    @Deprecated("Deprecated in Java")
+    @Suppress("DEPRECATION")
+    override fun onLoadingChanged(isLoading: Boolean) =
+        delegate.onLoadingChanged(isLoading)
+
+    override fun onAvailableCommandsChanged(availableCommands: Player.Commands) =
+        delegate.onAvailableCommandsChanged(transformCommands(availableCommands))
+
+    override fun onTrackSelectionParametersChanged(parameters: TrackSelectionParameters) =
+        delegate.onTrackSelectionParametersChanged(parameters)
+
+    @Deprecated("Deprecated in Java")
+    @Suppress("DEPRECATION")
+    override fun onPlayerStateChanged(playWhenReady: Boolean, playbackState: Int) =
+        delegate.onPlayerStateChanged(playWhenReady, playbackState)
+
+    override fun onPlaybackStateChanged(playbackState: Int) =
+        delegate.onPlaybackStateChanged(playbackState)
+
+    override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) =
+        delegate.onPlayWhenReadyChanged(playWhenReady, reason)
+
+    override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) =
+        delegate.onPlaybackSuppressionReasonChanged(playbackSuppressionReason)
+
+    override fun onIsPlayingChanged(isPlaying: Boolean) =
+        delegate.onIsPlayingChanged(isPlaying)
+
+    override fun onRepeatModeChanged(repeatMode: Int) =
+        delegate.onRepeatModeChanged(repeatMode)
+
+    override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) =
+        delegate.onShuffleModeEnabledChanged(shuffleModeEnabled)
+
+    override fun onPlayerError(error: PlaybackException) =
+        delegate.onPlayerError(error)
+
+    override fun onPlayerErrorChanged(error: PlaybackException?) =
+        delegate.onPlayerErrorChanged(error)
+
+    @Deprecated("Deprecated in Java")
+    @Suppress("DEPRECATION")
+    override fun onPositionDiscontinuity(reason: Int) =
+        delegate.onPositionDiscontinuity(reason)
+
+    override fun onPositionDiscontinuity(
+        oldPosition: Player.PositionInfo,
+        newPosition: Player.PositionInfo,
+        reason: Int
+    ) = delegate.onPositionDiscontinuity(oldPosition, newPosition, reason)
+
+    override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) =
+        delegate.onPlaybackParametersChanged(playbackParameters)
+
+    override fun onSeekBackIncrementChanged(seekBackIncrementMs: Long) =
+        delegate.onSeekBackIncrementChanged(seekBackIncrementMs)
+
+    override fun onSeekForwardIncrementChanged(seekForwardIncrementMs: Long) =
+        delegate.onSeekForwardIncrementChanged(seekForwardIncrementMs)
+
+    override fun onMaxSeekToPreviousPositionChanged(maxSeekToPreviousPositionMs: Long) =
+        delegate.onMaxSeekToPreviousPositionChanged(maxSeekToPreviousPositionMs)
+
+    @OptIn(UnstableApi::class)
+    override fun onAudioSessionIdChanged(audioSessionId: Int) =
+        delegate.onAudioSessionIdChanged(audioSessionId)
+
+    override fun onAudioAttributesChanged(audioAttributes: AudioAttributes) =
+        delegate.onAudioAttributesChanged(audioAttributes)
+
+    override fun onVolumeChanged(volume: Float) =
+        delegate.onVolumeChanged(volume)
+
+    override fun onSkipSilenceEnabledChanged(skipSilenceEnabled: Boolean) =
+        delegate.onSkipSilenceEnabledChanged(skipSilenceEnabled)
+
+    override fun onDeviceInfoChanged(deviceInfo: DeviceInfo) =
+        delegate.onDeviceInfoChanged(deviceInfo)
+
+    override fun onDeviceVolumeChanged(volume: Int, muted: Boolean) =
+        delegate.onDeviceVolumeChanged(volume, muted)
+
+    override fun onVideoSizeChanged(videoSize: VideoSize) =
+        delegate.onVideoSizeChanged(videoSize)
+
+    override fun onSurfaceSizeChanged(width: Int, height: Int) =
+        delegate.onSurfaceSizeChanged(width, height)
+
+    override fun onRenderedFirstFrame() =
+        delegate.onRenderedFirstFrame()
+
+    @Deprecated("Deprecated in Java")
+    @Suppress("DEPRECATION")
+    override fun onCues(cues: MutableList<Cue>) =
+        delegate.onCues(cues)
+
+    override fun onCues(cueGroup: CueGroup) =
+        delegate.onCues(cueGroup)
+
+    @OptIn(UnstableApi::class)
+    override fun onMetadata(metadata: Metadata) =
+        delegate.onMetadata(metadata)
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is CommandOverridingPlayerListener) return false
+        return delegate == other.delegate
+    }
+
+    override fun hashCode(): Int = delegate.hashCode()
+}
+
+@OptIn(UnstableApi::class)
+internal class FastFailLoadErrorHandlingPolicy : DefaultLoadErrorHandlingPolicy(MAX_TRANSIENT_RETRIES) {
+    override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+        if (isNonRetryableLoadException(loadErrorInfo.exception)) {
+            return C.TIME_UNSET
+        }
+        if (loadErrorInfo.errorCount > MAX_TRANSIENT_RETRIES) {
+            return C.TIME_UNSET
+        }
+        return minOf(loadErrorInfo.errorCount * 500L, 1_000L)
+    }
+
+    companion object {
+        internal const val MAX_TRANSIENT_RETRIES = 2
+        private val deterministicHttpCodes = setOf(400, 401, 403, 404, 410, 416, 422, 451, 501)
+
+        internal fun isNonRetryableLoadException(ex: Throwable?): Boolean {
+            var cur = ex
+            var depth = 0
+            while (cur != null && depth < 6) {
+                when (cur) {
+                    is HttpDataSource.CleartextNotPermittedException,
+                    is ParserException,
+                    is FileNotFoundException,
+                    is Loader.UnexpectedLoaderException -> return true
+                    is HttpDataSource.InvalidResponseCodeException -> {
+                        if (cur.responseCode in deterministicHttpCodes) return true
+                    }
+                    is DataSourceException -> {
+                        if (cur.reason == PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE) return true
+                    }
+                }
+                cur = cur.cause
+                depth++
+            }
+            return false
+        }
     }
 }

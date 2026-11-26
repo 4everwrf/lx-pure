@@ -116,12 +116,14 @@ object PlaybackRecoveryPolicy {
         kind: PlaybackErrorKind,
         retryAttemptIndex: Int,
         primaryTrackId: String,
-        resolvedTrackId: String?
+        resolvedTrackId: String?,
+        wasReady: Boolean = true
     ): PlaybackRecoveryPlan {
         val isCrossPlatformAlternate = !resolvedTrackId.isNullOrBlank() && resolvedTrackId != primaryTrackId
         return when (kind) {
             PlaybackErrorKind.TRANSIENT_NETWORK -> {
-                if (retryAttemptIndex <= 1) {
+                val keepSameSource = if (wasReady) retryAttemptIndex <= 1 else retryAttemptIndex == 0
+                if (keepSameSource) {
                     PlaybackRecoveryPlan(
                         kind = kind,
                         excludeCurrentSource = false,
@@ -129,7 +131,7 @@ object PlaybackRecoveryPolicy {
                         evictStreamCache = false,
                         preferSameSourceFirst = true,
                         preservePosition = true,
-                        backoffMs = if (retryAttemptIndex == 0) 1_200L else 2_500L
+                        backoffMs = if (retryAttemptIndex == 0) (if (wasReady) 1_200L else 800L) else 2_500L
                     )
                 } else {
                     PlaybackRecoveryPlan(
@@ -139,12 +141,14 @@ object PlaybackRecoveryPolicy {
                         evictStreamCache = false,
                         preferSameSourceFirst = false,
                         preservePosition = true,
-                        backoffMs = 1_500L
+                        backoffMs = if (wasReady) 1_500L else 1_000L
                     )
                 }
             }
             PlaybackErrorKind.EXPIRED_OR_DENIED_URL -> {
-                if (retryAttemptIndex == 0) {
+                // Only refresh the exact same source first when a URL expired mid-song (wasReady == true).
+                // If a freshly resolved URL immediately returned 401/403/410 at startup, switch source right away.
+                if (retryAttemptIndex == 0 && wasReady) {
                     PlaybackRecoveryPlan(
                         kind = kind,
                         excludeCurrentSource = false,
@@ -162,7 +166,7 @@ object PlaybackRecoveryPolicy {
                         evictStreamCache = true,
                         preferSameSourceFirst = false,
                         preservePosition = true,
-                        backoffMs = 300L
+                        backoffMs = 200L
                     )
                 }
             }

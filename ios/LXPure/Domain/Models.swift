@@ -82,9 +82,7 @@ enum AudioQuality: String, Codable, CaseIterable, Identifiable, Hashable, Sendab
     }
 
     static func fallbackChain(preferred: AudioQuality) -> [AudioQuality] {
-        let lowerOrEqual = allCases.filter { $0.priority <= preferred.priority }.sorted { $0.priority > $1.priority }
-        let higher = allCases.filter { $0.priority > preferred.priority }.sorted { $0.priority < $1.priority }
-        return lowerOrEqual + higher
+        allCases.filter { $0.priority <= preferred.priority }.sorted { $0.priority > $1.priority }
     }
 }
 

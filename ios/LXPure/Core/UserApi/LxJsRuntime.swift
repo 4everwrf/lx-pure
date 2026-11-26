@@ -654,7 +654,10 @@ final class LxJsRuntime: @unchecked Sendable {
             if isBinary {
                 bodyPayload = bodyData.base64EncodedString()
             } else {
-                let text = Self.decodeTextData(bodyData, encodingName: httpResp?.textEncodingName)
+                var text = Self.decodeTextData(bodyData, encodingName: httpResp?.textEncodingName)
+                if text.unicodeScalars.first == "\u{FEFF}" {
+                    text = String(text.unicodeScalars.dropFirst())
+                }
                 let contentType = (httpResp?.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 let shouldParseJson = contentType.contains("json") ||
@@ -801,9 +804,12 @@ final class LxJsRuntime: @unchecked Sendable {
         case .success(let resultObj):
             if let dict = resultObj as? [String: Any],
                let dataDict = dict["data"] as? [String: Any],
-               let url = dataDict["url"] as? String,
-               url.hasPrefix("http") {
-                return .success(url)
+               let rawUrl = dataDict["url"] as? String {
+                let trimmedUrl = rawUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+                let lower = trimmedUrl.lowercased()
+                if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+                    return .success(trimmedUrl)
+                }
             }
             return .failure(LxRuntimeError.message("未返回有效音频直链"))
         case .failure(let error):
@@ -881,11 +887,27 @@ final class LxJsRuntime: @unchecked Sendable {
     }
 
     private func completePendingAction(requestKey: String, result: Result<Any?, Error>) {
+        let shouldCancelOrphans: Bool
+        if case .failure = result {
+            shouldCancelOrphans = true
+        } else {
+            shouldCancelOrphans = false
+        }
+
         stateLock.lock()
         let cont = pendingActions.removeValue(forKey: requestKey)
         let timeoutWork = pendingTimeouts.removeValue(forKey: requestKey)
+        var orphanedTasks: [URLSessionDataTask] = []
+        if shouldCancelOrphans && pendingActions.isEmpty && initResultCached != nil {
+            for (k, task) in activeTasks {
+                cancelledRequests.insert(k)
+                orphanedTasks.append(task)
+            }
+            activeTasks.removeAll()
+        }
         stateLock.unlock()
         timeoutWork?.cancel()
+        orphanedTasks.forEach { $0.cancel() }
         cont?.resume(returning: result)
     }
 

@@ -54,6 +54,7 @@ struct RootView: View {
     @State private var activeTab: BottomTab = .library
     @State private var visitedTabs: Set<BottomTab> = [.library]
     @State private var path: [AppRoute] = []
+    @StateObject private var discoverState = DiscoverState()
     @State private var isPlayerExpanded = false
     @State private var showQueueSheet = false
     @State private var actionSheetTrack: Track?
@@ -432,6 +433,7 @@ struct RootView: View {
 
             if visitedTabs.contains(.discover) {
                 DiscoverView(
+                    state: discoverState,
                     aggregator: container.musicAggregator,
                     bottomInset: bottomContentInset,
                     onOpenPlaylist: { path.append(.onlinePlaylist($0)) },

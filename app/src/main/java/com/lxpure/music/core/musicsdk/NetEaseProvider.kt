@@ -129,21 +129,7 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
     suspend fun getPlaylistDetail(rawIdOrUrl: String): Result<PlaylistDetailResult> = withContext(Dispatchers.IO) {
         suspendRunCatching {
             val playlistId = extractPlaylistId(rawIdOrUrl) ?: error("无法识别网易云歌单 ID")
-            val linuxPayload = buildJsonObject {
-                put("method", "POST")
-                put("url", "https://music.163.com/api/v3/playlist/detail")
-                put("params", buildJsonObject {
-                    put("id", playlistId)
-                    put("n", 100000)
-                    put("s", 8)
-                })
-            }.toString()
-
-            val body = postForm("https://music.163.com/api/linux/forward", NetEaseCrypto.linuxApi(linuxPayload))
-                ?: error("获取网易云歌单失败，请检查网络连接")
-            val root = json.parseToJsonElement(body).asJsonObjectOrNull()
-                ?: error("网易云歌单数据格式异常")
-            if (root["code"].asIntOrNull() != 200) error("网易云歌单接口暂时不可用")
+            val root = fetchPlaylistDetailRoot(playlistId)
 
             val playlistObj = root["playlist"].asJsonObjectOrNull() ?: error("歌单不存在或暂无访问权限")
             val meta = OnlinePlaylist(
@@ -205,6 +191,36 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
         }
     }
 
+    private suspend fun fetchPlaylistDetailRoot(playlistId: String): JsonObject {
+        val payload = buildJsonObject {
+            put("id", playlistId)
+            put("n", 100000)
+            put("s", 8)
+        }.toString()
+        val endpoints = listOf(
+            "https://interface.music.163.com/eapi/v6/playlist/detail" to "/api/v6/playlist/detail",
+            "https://interface.music.163.com/eapi/v3/playlist/detail" to "/api/v3/playlist/detail"
+        )
+        var lastError: Throwable? = null
+        for ((url, eapiPath) in endpoints) {
+            val attempt = suspendRunCatching {
+                val body = postForm(url, NetEaseCrypto.eapi(eapiPath, payload))
+                    ?: error("获取网易云歌单失败，请检查网络连接")
+                val root = runCatching { json.parseToJsonElement(body).asJsonObjectOrNull() }.getOrNull()
+                    ?: error("网易云歌单数据格式异常")
+                if (root["code"].asIntOrNull() != 200) error("网易云歌单接口暂时不可用")
+                root
+            }
+            val root = attempt.getOrNull()
+            if (root != null) return root
+            lastError = attempt.exceptionOrNull()
+        }
+        if (lastError is IllegalStateException) {
+            throw lastError
+        }
+        error("获取网易云歌单失败，请检查网络连接")
+    }
+
     private suspend fun fetchSongsByIdsWithRetry(ids: List<String>, maxAttempts: Int = 2): List<Track> {
         repeat(maxAttempts) {
             val res = suspendRunCatching { fetchSongsByIds(ids) }.getOrDefault(emptyList())
@@ -222,9 +238,7 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
             put("ids", idsParam)
         }.toString()
 
-        val body = postForm("https://music.163.com/weapi/v3/song/detail", NetEaseCrypto.weapi(payload)) ?: return emptyList()
-        val root = json.parseToJsonElement(body).asJsonObjectOrNull() ?: return emptyList()
-        if (root["code"].asIntOrNull() != 200) return emptyList()
+        val root = fetchSongDetailRoot(payload) ?: return emptyList()
         val songs = root["songs"].asJsonArrayOrNull() ?: return emptyList()
         val privMap = buildMap<String, JsonObject> {
             root["privileges"].asJsonArrayOrNull()?.forEach { el ->
@@ -241,6 +255,24 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
                 parseSongObj(obj, privMap[id])
             }.getOrNull()
         }
+    }
+
+    private suspend fun fetchSongDetailRoot(payload: String): JsonObject? {
+        val attempts: List<suspend () -> String?> = listOf(
+            { postForm("https://music.163.com/weapi/v3/song/detail", NetEaseCrypto.weapi(payload)) },
+            { postForm("https://interface.music.163.com/eapi/v3/song/detail", NetEaseCrypto.eapi("/api/v3/song/detail", payload)) }
+        )
+        for (call in attempts) {
+            val root = suspendRunCatching {
+                val body = call() ?: return@suspendRunCatching null
+                val parsed = runCatching { json.parseToJsonElement(body).asJsonObjectOrNull() }.getOrNull()
+                    ?: return@suspendRunCatching null
+                if (parsed["code"].asIntOrNull() != 200) return@suspendRunCatching null
+                parsed
+            }.getOrNull()
+            if (root != null) return root
+        }
+        return null
     }
 
     suspend fun getLyric(songmid: String): ParsedLyrics = withContext(Dispatchers.IO) {

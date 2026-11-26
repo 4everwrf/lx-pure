@@ -63,6 +63,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -86,6 +87,7 @@ import com.lxpure.music.domain.model.AppSettings
 import com.lxpure.music.domain.model.ArtistParser
 import com.lxpure.music.domain.model.DownloadStatus
 import com.lxpure.music.domain.model.LeaderboardItem
+import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.OnlinePlaylist
 import com.lxpure.music.domain.model.PlaybackQueueSource
 import com.lxpure.music.domain.model.QueueSourceType
@@ -97,7 +99,9 @@ import com.lxpure.music.ui.components.AppUpdateDialog
 import com.lxpure.music.ui.components.FloatingMiniPlayer
 import com.lxpure.music.ui.components.TrackActionSheet
 import com.lxpure.music.ui.discover.DiscoverScreen
+import com.lxpure.music.ui.discover.DiscoverSessionState
 import com.lxpure.music.ui.discover.OnlinePlaylistDetailScreen
+import com.lxpure.music.ui.discover.normalizeDiscoverSource
 import com.lxpure.music.ui.library.CollectionDetailScreen
 import com.lxpure.music.ui.library.DownloadsDetailScreen
 import com.lxpure.music.ui.library.LibraryCollectionType
@@ -177,6 +181,10 @@ private fun LxPureRoot(container: AppContainer) {
     val updateState by container.appUpdateManager.state.collectAsState()
 
     var activeTab by remember { mutableStateOf(BottomTab.LIBRARY) }
+    var discoverSource by rememberSaveable { mutableStateOf(MusicSource.WY) }
+    var discoverSession by remember {
+        mutableStateOf(DiscoverSessionState(selectedSource = normalizeDiscoverSource(discoverSource)))
+    }
     val backStack = remember { mutableStateListOf<SubRoute>() }
     var isPlayerExpanded by remember { mutableStateOf(false) }
     var showQueueSheet by remember { mutableStateOf(false) }
@@ -557,6 +565,22 @@ private fun LxPureRoot(container: AppContainer) {
 
                     BottomTab.DISCOVER -> DiscoverScreen(
                         aggregator = container.musicAggregator,
+                        discoverState = discoverSession,
+                        onSelectSource = { source ->
+                            val next = discoverSession.selectSource(source)
+                            discoverSession = next
+                            discoverSource = next.activeSource
+                        },
+                        onRetryLoad = {
+                            discoverSession = discoverSession.requestRefresh()
+                        },
+                        onCommitPlaylists = { targetSource, requestGeneration, playlists ->
+                            discoverSession = discoverSession.commitFetchedPlaylists(
+                                targetSource = targetSource,
+                                requestGeneration = requestGeneration,
+                                playlists = playlists
+                            )
+                        },
                         bottomPadding = contentBottomPadding,
                         onOpenPlaylist = { pl -> backStack.add(SubRoute.OnlinePlaylistDetail(pl)) },
                         onOpenLeaderboard = { board -> backStack.add(SubRoute.LeaderboardDetail(board)) }

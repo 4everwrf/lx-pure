@@ -110,27 +110,18 @@ final class NetEaseProvider: Sendable {
 
     func getPlaylistDetail(rawIdOrUrl: String) async -> Result<PlaylistDetailResult, Error> {
         guard let playlistId = await extractPlaylistId(rawIdOrUrl) else {
+            if Task.isCancelled {
+                return .failure(CancellationError())
+            }
             return .failure(LxRuntimeError.message("无法识别网易云歌单 ID"))
         }
 
-        let linuxPayload = JsonSafe.stringify([
-            "method": "POST",
-            "url": "https://music.163.com/api/v3/playlist/detail",
-            "params": [
-                "id": playlistId,
-                "n": 100000,
-                "s": 8
-            ] as [String: Any]
-        ])
-
-        guard let body = await postForm(url: "https://music.163.com/api/linux/forward", params: NetEaseCrypto.linuxApi(jsonBody: linuxPayload)) else {
-            return .failure(LxRuntimeError.message("获取网易云歌单失败，请检查网络连接"))
-        }
-        guard let root = JsonSafe.parseObject(body) else {
-            return .failure(LxRuntimeError.message("网易云歌单数据格式异常"))
-        }
-        guard JsonSafe.asInt(root["code"]) == 200 else {
-            return .failure(LxRuntimeError.message("网易云歌单接口暂时不可用"))
+        let root: [String: Any]
+        switch await fetchPlaylistDetailJson(playlistId: playlistId) {
+        case .success(let obj):
+            root = obj
+        case .failure(let err):
+            return .failure(err)
         }
         guard let playlistObj = JsonSafe.asObject(root["playlist"]) else {
             return .failure(LxRuntimeError.message("歌单不存在或暂无访问权限"))
@@ -224,6 +215,47 @@ final class NetEaseProvider: Sendable {
         return .success(PlaylistDetailResult(playlist: finalMeta, tracks: finalTracks))
     }
 
+    private func fetchPlaylistDetailJson(playlistId: String) async -> Result<[String: Any], Error> {
+        let payload = JsonSafe.stringify([
+            "id": playlistId,
+            "n": 100000,
+            "s": 8
+        ])
+        let endpoints: [(path: String, url: String)] = [
+            ("/api/v6/playlist/detail", "https://interface.music.163.com/eapi/v6/playlist/detail"),
+            ("/api/v3/playlist/detail", "https://interface.music.163.com/eapi/v3/playlist/detail")
+        ]
+
+        var lastError: Error = LxRuntimeError.message("获取网易云歌单失败，请检查网络连接")
+        for endpoint in endpoints {
+            if Task.isCancelled {
+                return .failure(CancellationError())
+            }
+            let params = NetEaseCrypto.eapi(path: endpoint.path, jsonBody: payload)
+            guard let body = await postForm(url: endpoint.url, params: params) else {
+                if Task.isCancelled {
+                    return .failure(CancellationError())
+                }
+                lastError = LxRuntimeError.message("获取网易云歌单失败，请检查网络连接")
+                continue
+            }
+            guard let root = JsonSafe.parseObject(body) else {
+                lastError = LxRuntimeError.message("网易云歌单数据格式异常")
+                continue
+            }
+            guard JsonSafe.asInt(root["code"]) == 200 else {
+                lastError = LxRuntimeError.message("网易云歌单接口暂时不可用")
+                continue
+            }
+            return .success(root)
+        }
+
+        if Task.isCancelled {
+            return .failure(CancellationError())
+        }
+        return .failure(lastError)
+    }
+
     private func fetchSongsByIdsWithRetry(_ ids: [String], maxAttempts: Int = 2) async -> [Track] {
         for _ in 0..<maxAttempts {
             if Task.isCancelled { return [] }
@@ -234,14 +266,36 @@ final class NetEaseProvider: Sendable {
     }
 
     private func fetchSongsByIds(_ ids: [String]) async -> [Track] {
-        guard !ids.isEmpty else { return [] }
+        guard !ids.isEmpty, !Task.isCancelled else { return [] }
         let cParam = "[" + ids.map { "{\"id\":\($0)}" }.joined(separator: ",") + "]"
         let idsParam = "[" + ids.joined(separator: ",") + "]"
         let payload = JsonSafe.stringify(["c": cParam, "ids": idsParam])
 
-        guard let body = await postForm(url: "https://music.163.com/weapi/v3/song/detail", params: NetEaseCrypto.weapi(jsonBody: payload)),
-              let root = JsonSafe.parseObject(body),
-              JsonSafe.asInt(root["code"]) == 200,
+        var resolvedRoot: [String: Any]?
+        if let weapiBody = await postForm(
+            url: "https://music.163.com/weapi/v3/song/detail",
+            params: NetEaseCrypto.weapi(jsonBody: payload)
+        ),
+           let weapiRoot = JsonSafe.parseObject(weapiBody),
+           JsonSafe.asInt(weapiRoot["code"]) == 200,
+           JsonSafe.asArray(weapiRoot["songs"]) != nil {
+            resolvedRoot = weapiRoot
+        }
+
+        if resolvedRoot == nil, !Task.isCancelled {
+            if let eapiBody = await postForm(
+                url: "https://interface.music.163.com/eapi/v3/song/detail",
+                params: NetEaseCrypto.eapi(path: "/api/v3/song/detail", jsonBody: payload)
+            ),
+               let eapiRoot = JsonSafe.parseObject(eapiBody),
+               JsonSafe.asInt(eapiRoot["code"]) == 200,
+               JsonSafe.asArray(eapiRoot["songs"]) != nil {
+                resolvedRoot = eapiRoot
+            }
+        }
+
+        guard !Task.isCancelled,
+              let root = resolvedRoot,
               let songs = JsonSafe.asArray(root["songs"]) else {
             return []
         }

@@ -1090,4 +1090,315 @@ final class PlayerAndRacingTests: XCTestCase {
             "Pending JS timer for cancelled parent request must be cancelled and never fire"
         )
     }
+
+    func testNetEasePlaylistAndLeaderboardUseEapiAndSurviveLinuxForward502() async {
+        let playlistJson = """
+        {
+          "code": 200,
+          "playlist": {
+            "id": 19723756,
+            "name": "飙升榜",
+            "coverImgUrl": "http://p1.music.126.net/cover.jpg",
+            "playCount": 1234567,
+            "description": "每日飙升",
+            "trackCount": 1,
+            "creator": { "nickname": "网易云音乐" },
+            "tracks": [
+              {
+                "id": 1001,
+                "name": "飙升测试曲",
+                "ar": [{ "name": "歌手甲" }],
+                "al": { "id": 2001, "name": "专辑A", "picUrl": "http://p2.music.126.net/song.jpg" },
+                "dt": 210000,
+                "l": { "size": 3200000 },
+                "h": { "size": 8400000 }
+              }
+            ],
+            "trackIds": [{ "id": 1001 }]
+          },
+          "privileges": [
+            { "id": 1001, "maxbr": 320000, "maxBrLevel": "exhigh" }
+          ]
+        }
+        """
+
+        MockURLProtocol.configure { req in
+            let url = req.url?.absoluteString ?? ""
+            if url.contains("linux/forward") {
+                return MockHttpStub(statusCode: 502, body: Data("502 Bad Gateway".utf8))
+            }
+            if url.contains("/eapi/v6/playlist/detail") {
+                return MockHttpStub(statusCode: 200, body: Data(playlistJson.utf8))
+            }
+            return MockHttpStub(statusCode: 404, body: Data())
+        }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: cfg)
+        let aggregator = MusicAggregator(session: session)
+
+        let board = aggregator.getLeaderboards(source: .wy)[0]
+        let result = await aggregator.getLeaderboardDetail(board: board)
+
+        switch result {
+        case .success(let detail):
+            XCTAssertEqual(detail.playlist.id, "19723756")
+            XCTAssertEqual(detail.playlist.name, "飙升榜")
+            XCTAssertEqual(detail.playlist.coverUrl, "https://p1.music.126.net/cover.jpg")
+            XCTAssertEqual(detail.tracks.count, 1)
+            XCTAssertEqual(detail.tracks[0].id, "wy_1001")
+            XCTAssertEqual(detail.tracks[0].coverUrl, "https://p2.music.126.net/song.jpg")
+        case .failure(let error):
+            XCTFail("Expected eapi/v6 leaderboard load to succeed, got error: \(error)")
+        }
+
+        let requested = MockURLProtocol.requestedURLs
+        XCTAssertTrue(requested.contains { $0.contains("/eapi/v6/playlist/detail") })
+        XCTAssertFalse(requested.contains { $0.contains("linux/forward") })
+    }
+
+    func testNetEasePlaylistDetailFallsBackToEapiV3AndSongDetailHydration() async {
+        let v3PlaylistJson = """
+        {
+          "code": 200,
+          "playlist": {
+            "id": 18428485896,
+            "name": "回退测试歌单",
+            "coverImgUrl": "http://p1.music.126.net/pl.jpg",
+            "playCount": 5000,
+            "description": "v3 fallback",
+            "trackCount": 2,
+            "creator": { "nickname": "测试用户" },
+            "tracks": [
+              {
+                "id": 1001,
+                "name": "直出曲目",
+                "ar": [{ "name": "歌手1" }],
+                "al": { "id": 2001, "name": "专辑1", "picUrl": "http://p2.music.126.net/a1.jpg" },
+                "dt": 180000
+              }
+            ],
+            "trackIds": [{ "id": 1001 }, { "id": 1002 }]
+          },
+          "privileges": [
+            { "id": 1001, "maxbr": 320000, "maxBrLevel": "exhigh" }
+          ]
+        }
+        """
+        let eapiSongDetailJson = """
+        {
+          "code": 200,
+          "songs": [
+            {
+              "id": 1002,
+              "name": "补全曲目",
+              "ar": [{ "name": "歌手2" }],
+              "al": { "id": 2002, "name": "专辑2", "picUrl": "http://p2.music.126.net/a2.jpg" },
+              "dt": 200000
+            }
+          ],
+          "privileges": [
+            { "id": 1002, "maxbr": 999000, "maxBrLevel": "lossless" }
+          ]
+        }
+        """
+
+        MockURLProtocol.configure { req in
+            let url = req.url?.absoluteString ?? ""
+            if url.contains("linux/forward") {
+                return MockHttpStub(statusCode: 502, body: Data("502 Bad Gateway".utf8))
+            }
+            if url.contains("/eapi/v6/playlist/detail") {
+                return MockHttpStub(statusCode: 502, body: Data("502".utf8))
+            }
+            if url.contains("/eapi/v3/playlist/detail") {
+                return MockHttpStub(statusCode: 200, body: Data(v3PlaylistJson.utf8))
+            }
+            if url.contains("/weapi/v3/song/detail") {
+                return MockHttpStub(statusCode: 502, body: Data("502".utf8))
+            }
+            if url.contains("/eapi/v3/song/detail") {
+                return MockHttpStub(statusCode: 200, body: Data(eapiSongDetailJson.utf8))
+            }
+            return MockHttpStub(statusCode: 404, body: Data())
+        }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: cfg)
+        let aggregator = MusicAggregator(session: session)
+
+        let successResult = await aggregator.getPlaylistDetail(source: .wy, idOrUrl: "18428485896")
+        switch successResult {
+        case .success(let detail):
+            XCTAssertEqual(detail.tracks.map(\.songmid), ["1001", "1002"])
+            XCTAssertEqual(detail.playlist.trackCount, 2)
+        case .failure(let error):
+            XCTFail("Expected v3 playlist + eapi song hydration fallback to succeed, got \(error)")
+        }
+
+        let requested = MockURLProtocol.requestedURLs
+        XCTAssertTrue(requested.contains { $0.contains("/eapi/v6/playlist/detail") })
+        XCTAssertTrue(requested.contains { $0.contains("/eapi/v3/playlist/detail") })
+        XCTAssertTrue(requested.contains { $0.contains("/weapi/v3/song/detail") })
+        XCTAssertTrue(requested.contains { $0.contains("/eapi/v3/song/detail") })
+        XCTAssertFalse(requested.contains { $0.contains("linux/forward") })
+
+        // Verify clean failure when both v6 (non-200 code) and v3 (502) fail
+        MockURLProtocol.configure { req in
+            let url = req.url?.absoluteString ?? ""
+            if url.contains("/eapi/v6/playlist/detail") {
+                return MockHttpStub(statusCode: 200, body: Data(#"{"code":500}"#.utf8))
+            }
+            return MockHttpStub(statusCode: 502, body: Data())
+        }
+        let failResult = await aggregator.getPlaylistDetail(source: .wy, idOrUrl: "18428485896")
+        if case .success = failResult {
+            XCTFail("Expected failure when both eapi v6 and v3 fail")
+        }
+    }
+
+    @MainActor
+    func testDiscoverStatePreservesSelectedPlatformAndCacheAcrossBackNavigation() async {
+        let wyHotJson = """
+        {
+          "code": 200,
+          "playlists": [
+            {
+              "id": "wy_p1",
+              "name": "网易热歌",
+              "coverImgUrl": "http://p1.music.126.net/wy.jpg",
+              "playCount": 10000,
+              "description": "",
+              "trackCount": 10,
+              "creator": { "nickname": "WY" }
+            }
+          ]
+        }
+        """
+        let txHotJson = """
+        {
+          "playlist": {
+            "data": {
+              "v_playlist": [
+                {
+                  "tid": "tx_p1",
+                  "title": "QQ热歌",
+                  "cover_url_medium": "http://y.qq.com/tx.jpg",
+                  "access_num": 50000,
+                  "desc": "",
+                  "creator_info": { "nick": "TX" },
+                  "song_ids": [1, 2]
+                }
+              ]
+            }
+          }
+        }
+        """
+        let kwHotJson = """
+        {
+          "data": {
+            "data": [
+              {
+                "id": "kw_p1",
+                "name": "酷我热歌",
+                "img": "http://img.kuwo.cn/kw.jpg",
+                "uname": "KW",
+                "listencnt": 20000,
+                "desc": "",
+                "total": 15
+              }
+            ]
+          }
+        }
+        """
+
+        MockURLProtocol.configure { req in
+            let url = req.url?.absoluteString ?? ""
+            if url.contains("music.163.com/weapi/playlist/list") {
+                return MockHttpStub(statusCode: 200, body: Data(wyHotJson.utf8))
+            }
+            if url.contains("u.y.qq.com/cgi-bin/musicu.fcg") {
+                return MockHttpStub(statusCode: 200, body: Data(txHotJson.utf8))
+            }
+            if url.contains("wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList") {
+                return MockHttpStub(statusCode: 200, body: Data(kwHotJson.utf8))
+            }
+            return MockHttpStub(statusCode: 404, body: Data())
+        }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: cfg)
+        let aggregator = MusicAggregator(session: session)
+        let state = DiscoverState()
+
+        XCTAssertEqual(state.selectedSource, .wy)
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["wy_p1"])
+        XCTAssertFalse(state.isLoading)
+
+        // Switch to QQ Music (.tx), load, then simulate pop-back re-entry (force: false)
+        state.selectSource(.tx)
+        XCTAssertEqual(state.selectedSource, .tx)
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["tx_p1"])
+        let qqRequestsBeforePop = MockURLProtocol.requestedURLs.filter { $0.contains("u.y.qq.com") }.count
+
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator, force: false)
+        XCTAssertEqual(state.selectedSource, .tx)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["tx_p1"])
+        let qqRequestsAfterPop = MockURLProtocol.requestedURLs.filter { $0.contains("u.y.qq.com") }.count
+        XCTAssertEqual(qqRequestsAfterPop, qqRequestsBeforePop, "Pop-back re-entry must reuse cached QQ playlists without duplicate HTTP requests")
+
+        // Switch to Kuwo (.kw), load, simulate pop-back re-entry (force: false)
+        state.selectSource(.kw)
+        XCTAssertEqual(state.selectedSource, .kw)
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["kw_p1"])
+        let kwRequestsBeforePop = MockURLProtocol.requestedURLs.filter { $0.contains("wapi.kuwo.cn") }.count
+
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator, force: false)
+        XCTAssertEqual(state.selectedSource, .kw)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["kw_p1"])
+        let kwRequestsAfterPop = MockURLProtocol.requestedURLs.filter { $0.contains("wapi.kuwo.cn") }.count
+        XCTAssertEqual(kwRequestsAfterPop, kwRequestsBeforePop, "Pop-back re-entry must reuse cached Kuwo playlists without duplicate HTTP requests")
+
+        // Switch back to .tx -> cached immediately; manual force reload refreshes without resetting selectedSource
+        state.selectSource(.tx)
+        XCTAssertEqual(state.selectedSource, .tx)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["tx_p1"])
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator, force: true)
+        XCTAssertEqual(state.selectedSource, .tx)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["tx_p1"])
+        let qqRequestsAfterForce = MockURLProtocol.requestedURLs.filter { $0.contains("u.y.qq.com") }.count
+        XCTAssertEqual(qqRequestsAfterForce, qqRequestsBeforePop + 1)
+
+        // Unsupported source normalizes to .wy
+        state.selectSource(.kg)
+        XCTAssertEqual(state.selectedSource, .wy)
+
+        // Stale async response guard: slow .wy load must not overwrite .tx selection/cache
+        MockURLProtocol.configure { req in
+            let url = req.url?.absoluteString ?? ""
+            if url.contains("music.163.com/weapi/playlist/list") {
+                return MockHttpStub(statusCode: 200, body: Data(wyHotJson.utf8), delaySeconds: 0.25)
+            }
+            if url.contains("u.y.qq.com/cgi-bin/musicu.fcg") {
+                return MockHttpStub(statusCode: 200, body: Data(txHotJson.utf8))
+            }
+            return MockHttpStub(statusCode: 404, body: Data())
+        }
+        let raceState = DiscoverState()
+        let slowTask = Task { @MainActor in
+            await raceState.loadHotPlaylistsIfNeeded(aggregator: aggregator, force: true)
+        }
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        raceState.selectSource(.tx)
+        await raceState.loadHotPlaylistsIfNeeded(aggregator: aggregator)
+        await slowTask.value
+        XCTAssertEqual(raceState.selectedSource, .tx)
+        XCTAssertEqual(raceState.hotPlaylists.map(\.id), ["tx_p1"])
+    }
 }

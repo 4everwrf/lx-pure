@@ -1,20 +1,83 @@
 import SwiftUI
 
+@MainActor
+final class DiscoverState: ObservableObject {
+    static let supportedSources: [MusicSource] = [.wy, .tx, .kw]
+
+    @Published var selectedSource: MusicSource = .wy
+    @Published private(set) var hotPlaylistsBySource: [MusicSource: [OnlinePlaylist]] = [:]
+    @Published private(set) var isLoading = false
+
+    private var loadGeneration: Int = 0
+
+    var hotPlaylists: [OnlinePlaylist] {
+        hotPlaylistsBySource[selectedSource] ?? []
+    }
+
+    init(initialSource: MusicSource = .wy) {
+        self.selectedSource = Self.normalizeSource(initialSource)
+    }
+
+    static func normalizeSource(_ source: MusicSource) -> MusicSource {
+        supportedSources.contains(source) ? source : .wy
+    }
+
+    func selectSource(_ source: MusicSource) {
+        let normalized = Self.normalizeSource(source)
+        guard normalized != selectedSource else { return }
+        selectedSource = normalized
+        loadGeneration += 1
+        isLoading = false
+    }
+
+    func loadHotPlaylistsIfNeeded(aggregator: MusicAggregator, force: Bool = false) async {
+        let targetSource = selectedSource
+        if !force, let cached = hotPlaylistsBySource[targetSource], !cached.isEmpty {
+            isLoading = false
+            return
+        }
+        if Task.isCancelled {
+            return
+        }
+
+        loadGeneration += 1
+        let requestGeneration = loadGeneration
+        isLoading = true
+
+        let fetched = await aggregator.getHotPlaylists(source: targetSource)
+
+        guard loadGeneration == requestGeneration, selectedSource == targetSource else {
+            return
+        }
+        isLoading = false
+        guard !Task.isCancelled else {
+            return
+        }
+
+        var seen = Set<String>()
+        let deduped = fetched.filter { seen.insert("\($0.source.code)_\($0.id)").inserted }
+        if !deduped.isEmpty {
+            hotPlaylistsBySource[targetSource] = deduped
+        } else if force {
+            hotPlaylistsBySource.removeValue(forKey: targetSource)
+        }
+    }
+}
+
 struct DiscoverView: View {
+    @ObservedObject var state: DiscoverState
     let aggregator: MusicAggregator
     let bottomInset: CGFloat
     let onOpenPlaylist: (OnlinePlaylist) -> Void
     let onOpenLeaderboard: (LeaderboardItem) -> Void
 
     @Environment(\.lxPalette) private var lx
-    private let platforms: [MusicSource] = [.wy, .tx, .kw]
-    @State private var selectedSource: MusicSource = .wy
-    @State private var hotPlaylists: [OnlinePlaylist] = []
-    @State private var isLoading = false
+    private let platforms: [MusicSource] = DiscoverState.supportedSources
     @State private var retryNonce = 0
+    @State private var lastConsumedRetryNonce = 0
 
     private var leaderboards: [LeaderboardItem] {
-        aggregator.getLeaderboards(source: selectedSource)
+        aggregator.getLeaderboards(source: state.selectedSource)
     }
 
     var body: some View {
@@ -27,9 +90,9 @@ struct DiscoverView: View {
 
                     HStack(spacing: 10) {
                         ForEach(platforms) { source in
-                            let active = source == selectedSource
+                            let active = source == state.selectedSource
                             Button {
-                                selectedSource = source
+                                state.selectSource(source)
                             } label: {
                                 Text(source.displayName)
                                     .font(.system(size: 12, weight: .semibold))
@@ -53,14 +116,14 @@ struct DiscoverView: View {
                         .foregroundColor(lx.textPrimary)
                         .padding(.horizontal, 20)
 
-                    if isLoading {
+                    if state.isLoading {
                         HStack {
                             Spacer()
                             ProgressView().tint(lx.accent)
                             Spacer()
                         }
                         .frame(height: 170)
-                    } else if hotPlaylists.isEmpty {
+                    } else if state.hotPlaylists.isEmpty {
                         VStack(alignment: .leading, spacing: 10) {
                             Text("歌单加载失败或网络不可达，可重试或切换平台")
                                 .font(.system(size: 13))
@@ -85,7 +148,7 @@ struct DiscoverView: View {
                     } else {
                         ScrollView(.horizontal, showsIndicators: false) {
                             LazyHStack(alignment: .top, spacing: 14) {
-                                ForEach(Array(hotPlaylists.enumerated()), id: \.offset) { _, playlist in
+                                ForEach(Array(state.hotPlaylists.enumerated()), id: \.offset) { _, playlist in
                                     Button {
                                         onOpenPlaylist(playlist)
                                     } label: {
@@ -116,7 +179,7 @@ struct DiscoverView: View {
                             }
                             .padding(.horizontal, 18)
                         }
-                        .id(selectedSource)
+                        .id(state.selectedSource)
                     }
                 }
 
@@ -167,15 +230,10 @@ struct DiscoverView: View {
             }
             .padding(.bottom, bottomInset)
         }
-        .task(id: "\(selectedSource.rawValue)_\(retryNonce)") {
-            let targetSource = selectedSource
-            isLoading = true
-            hotPlaylists = []
-            let fetched = await aggregator.getHotPlaylists(source: targetSource)
-            guard !Task.isCancelled, selectedSource == targetSource else { return }
-            var seen = Set<String>()
-            hotPlaylists = fetched.filter { seen.insert("\($0.source.code)_\($0.id)").inserted }
-            isLoading = false
+        .task(id: "\(state.selectedSource.rawValue)_\(retryNonce)") {
+            let shouldForce = retryNonce != lastConsumedRetryNonce
+            lastConsumedRetryNonce = retryNonce
+            await state.loadHotPlaylistsIfNeeded(aggregator: aggregator, force: shouldForce)
         }
     }
 }

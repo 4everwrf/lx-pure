@@ -45,6 +45,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -69,41 +70,112 @@ import com.lxpure.music.ui.components.TrackListFastScroller
 import com.lxpure.music.ui.components.TrackListItem
 import com.lxpure.music.ui.theme.LocalLxColors
 
+val DISCOVER_SUPPORTED_SOURCES: List<MusicSource> = listOf(MusicSource.WY, MusicSource.TX, MusicSource.KW)
+
+fun normalizeDiscoverSource(source: MusicSource): MusicSource =
+    if (source in DISCOVER_SUPPORTED_SOURCES) source else MusicSource.WY
+
+data class DiscoverSessionState(
+    val selectedSource: MusicSource = MusicSource.WY,
+    val playlistsBySource: Map<MusicSource, List<OnlinePlaylist>> = emptyMap(),
+    val generation: Long = 0L,
+    val refreshNonce: Int = 0,
+    val refreshTargetSource: MusicSource? = null
+) {
+    val activeSource: MusicSource
+        get() = normalizeDiscoverSource(selectedSource)
+
+    val currentPlaylists: List<OnlinePlaylist>
+        get() = playlistsBySource[activeSource].orEmpty()
+
+    fun hasCachedPlaylists(source: MusicSource = activeSource): Boolean =
+        !playlistsBySource[normalizeDiscoverSource(source)].isNullOrEmpty()
+
+    fun shouldFetchForCurrentState(): Boolean =
+        !hasCachedPlaylists(activeSource) || (refreshTargetSource == activeSource && refreshNonce > 0)
+
+    fun selectSource(source: MusicSource): DiscoverSessionState {
+        val normalized = normalizeDiscoverSource(source)
+        if (normalized == activeSource) return this
+        return copy(
+            selectedSource = normalized,
+            generation = generation + 1L,
+            refreshTargetSource = null
+        )
+    }
+
+    fun requestRefresh(): DiscoverSessionState = copy(
+        generation = generation + 1L,
+        refreshNonce = refreshNonce + 1,
+        refreshTargetSource = activeSource
+    )
+
+    fun commitFetchedPlaylists(
+        targetSource: MusicSource,
+        requestGeneration: Long,
+        playlists: List<OnlinePlaylist>
+    ): DiscoverSessionState {
+        val normalized = normalizeDiscoverSource(targetSource)
+        if (normalized != activeSource || requestGeneration != generation) {
+            return this
+        }
+        val deduplicated = playlists.distinctBy { "${it.source.code}_${it.id}" }
+        val updatedCache = playlistsBySource.toMutableMap()
+        if (deduplicated.isNotEmpty()) {
+            updatedCache[normalized] = deduplicated
+        } else {
+            updatedCache.remove(normalized)
+        }
+        return copy(
+            playlistsBySource = updatedCache,
+            refreshTargetSource = null
+        )
+    }
+}
+
 @Composable
 fun DiscoverScreen(
     aggregator: MusicAggregator,
+    discoverState: DiscoverSessionState,
+    onSelectSource: (MusicSource) -> Unit,
+    onRetryLoad: () -> Unit,
+    onCommitPlaylists: (targetSource: MusicSource, requestGeneration: Long, playlists: List<OnlinePlaylist>) -> Unit,
     bottomPadding: Dp,
     onOpenPlaylist: (OnlinePlaylist) -> Unit,
     onOpenLeaderboard: (LeaderboardItem) -> Unit
 ) {
     val lxColors = LocalLxColors.current
     val onPrimaryColor = MaterialTheme.colorScheme.onPrimary
-    val platforms = remember { listOf(MusicSource.WY, MusicSource.TX, MusicSource.KW) }
-    var selectedSource by remember { mutableStateOf(MusicSource.WY) }
-    var hotPlaylists by remember { mutableStateOf<List<OnlinePlaylist>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(false) }
-    var retryNonce by remember { mutableIntStateOf(0) }
-    var loadGen by remember { mutableLongStateOf(0L) }
+    val platforms = DISCOVER_SUPPORTED_SOURCES
+    val selectedSource = discoverState.activeSource
+    val hotPlaylists = discoverState.currentPlaylists
+    val latestDiscoverState by rememberUpdatedState(discoverState)
+    var isLoading by remember(selectedSource) { mutableStateOf(!discoverState.hasCachedPlaylists(selectedSource)) }
 
     val leaderboards = remember(selectedSource) { aggregator.getLeaderboards(selectedSource) }
 
-    LaunchedEffect(selectedSource, retryNonce) {
-        val gen = ++loadGen
+    LaunchedEffect(selectedSource, discoverState.refreshNonce) {
+        val snapshot = latestDiscoverState
+        if (!snapshot.shouldFetchForCurrentState()) {
+            isLoading = false
+            return@LaunchedEffect
+        }
+        val targetSource = snapshot.activeSource
+        val reqGen = snapshot.generation
         isLoading = true
-        hotPlaylists = emptyList()
         try {
-            val fetched = aggregator.getHotPlaylists(selectedSource).distinctBy { "${it.source.code}_${it.id}" }
-            if (loadGen == gen) {
-                hotPlaylists = fetched
+            val fetched = aggregator.getHotPlaylists(targetSource)
+            if (latestDiscoverState.generation == reqGen && latestDiscoverState.activeSource == targetSource) {
+                onCommitPlaylists(targetSource, reqGen, fetched)
             }
         } catch (ce: CancellationException) {
             throw ce
         } catch (_: Throwable) {
-            if (loadGen == gen) {
-                hotPlaylists = emptyList()
+            if (latestDiscoverState.generation == reqGen && latestDiscoverState.activeSource == targetSource) {
+                onCommitPlaylists(targetSource, reqGen, emptyList())
             }
         } finally {
-            if (loadGen == gen) {
+            if (latestDiscoverState.generation == reqGen && latestDiscoverState.activeSource == targetSource) {
                 isLoading = false
             }
         }
@@ -132,7 +204,7 @@ fun DiscoverScreen(
                     platforms.forEach { source ->
                         val active = source == selectedSource
                         Surface(
-                            onClick = { selectedSource = source },
+                            onClick = { onSelectSource(source) },
                             shape = RoundedCornerShape(50),
                             color = if (active) lxColors.accent else lxColors.surfaceElevated
                         ) {
@@ -182,7 +254,7 @@ fun DiscoverScreen(
                             modifier = Modifier.weight(1f)
                         )
                         OutlinedButton(
-                            onClick = { retryNonce++ },
+                            onClick = onRetryLoad,
                             shape = RoundedCornerShape(50),
                             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                         ) {

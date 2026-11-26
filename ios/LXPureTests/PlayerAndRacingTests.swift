@@ -755,12 +755,24 @@ final class PlayerAndRacingTests: XCTestCase {
 
     @MainActor
     func testPreResolutionCacheHitAndSourceRevisionIsolation() async throws {
-        MockURLProtocol.configure { _ in
-            MockHttpStub(statusCode: 500, body: Data())
+        MockURLProtocol.configure { req in
+            let url = req.url?.absoluteString ?? ""
+            if url.contains("/v1/resolve") {
+                let body = Data(#"{"url":"https://mock.cache.test/v1/stream.mp3"}"#.utf8)
+                return MockHttpStub(statusCode: 200, body: body)
+            }
+            if url.contains("/v1/stream.mp3") {
+                return MockHttpStub(
+                    statusCode: 206,
+                    headers: ["Content-Type": "audio/mpeg", "Content-Length": "4096"],
+                    body: Data(repeating: 0x55, count: 128)
+                )
+            }
+            return MockHttpStub(statusCode: 500, body: Data())
         }
 
         let env = try await makeTestEnvironment()
-        let scriptV1 = makeHttpScript(name: "CacheSource", version: "1.0.0", requestUrlExpr: "'https://mock.cache.test/v1'")
+        let scriptV1 = makeHttpScript(name: "CacheSource", version: "1.0.0", requestUrlExpr: "'https://mock.cache.test/v1/resolve'")
         let sourceV1 = try await importAndWaitReady(scriptV1, into: env.userApi)
         let rev1 = UserApiManager.computeSourceRevision(for: sourceV1)
 
@@ -775,18 +787,24 @@ final class PlayerAndRacingTests: XCTestCase {
         let cacheDir = env.tempDir.appendingPathComponent("cache", isDirectory: true)
         try Data(repeating: 0x55, count: 8_192).write(to: cacheDir.appendingPathComponent("\(keyV1).mp3"))
 
-        // With valid v1 cache and failing network, pre-resolution cache hit succeeds with zero network requests
+        // With valid v1 cache, pre-resolution cache hit succeeds without invoking JS or stream probing
+        // (unrelated background cover/lyric metadata fetches via MusicAggregator's shared session are ignored)
         env.player.playTracks([track], startIndex: 0)
         let hitCache = await waitUntilOnMain(timeoutSeconds: 2.0) {
             env.player.state.activeQualityBadge == "HQ · 缓存"
         }
         XCTAssertTrue(hitCache)
         XCTAssertEqual(env.player.state.activeProviderName, sourceV1.name)
-        XCTAssertTrue(MockURLProtocol.requestedURLs.isEmpty, "Pre-resolution cache hit must skip JS & HTTP probe")
+        XCTAssertEqual(env.player.state.activeStreamSourceId, sourceV1.id)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(
+            MockURLProtocol.requestedURLs.contains { $0.contains("mock.cache.test") },
+            "Pre-resolution cache hit must skip JS & HTTP probe"
+        )
         env.player.clearQueue()
 
         // Updating the source script changes sourceRevision -> stale v1 cache MUST NOT be reused
-        let scriptV2 = makeHttpScript(name: "CacheSource", version: "2.0.0", requestUrlExpr: "'https://mock.cache.test/v2'")
+        let scriptV2 = makeHttpScript(name: "CacheSource", version: "2.0.0", requestUrlExpr: "'https://mock.cache.test/v2/resolve'")
         let sourceV2 = try await importAndWaitReady(scriptV2, into: env.userApi)
         let rev2 = UserApiManager.computeSourceRevision(for: sourceV2)
         XCTAssertNotEqual(rev1, rev2)

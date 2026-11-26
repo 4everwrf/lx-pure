@@ -1039,4 +1039,261 @@ final class CoreProtocolTests: XCTestCase {
         let containing = await store.playlistIdsContainingAsync(trackId: "wy_r5_b")
         XCTAssertEqual(containing, [plId])
     }
+
+    func testArtistParserAndLayoutPlannerHandleMultiArtistAndOverflowEdgeCases() {
+        // Placeholders & empty strings (including \u{200B}, \u{0000}, N/A, 本地音频)
+        XCTAssertTrue(ArtistParser.parseRawString("").isEmpty)
+        XCTAssertTrue(ArtistParser.parseRawString("   \u{200B} ").isEmpty)
+        XCTAssertTrue(ArtistParser.parseRawString("未知歌手").isEmpty)
+        XCTAssertTrue(ArtistParser.parseRawString("本地音频").isEmpty)
+        XCTAssertTrue(ArtistParser.parseRawString("<unknown>").isEmpty)
+        XCTAssertTrue(ArtistParser.parseRawString("Unknown Artist").isEmpty)
+        XCTAssertTrue(ArtistParser.parseRawString("Unknown\u{3000}Artist").isEmpty)
+        XCTAssertTrue(ArtistParser.parseRawString("N/A").isEmpty)
+        XCTAssertEqual(ArtistParser.parseRawString("周杰伦 / N/A / 陈奕迅"), ["周杰伦", "陈奕迅"])
+        XCTAssertTrue(ArtistParser.parseRawString(" / / & , ").isEmpty)
+        XCTAssertEqual(ArtistParser.fallbackDisplayName(" / / & , "), "未知歌手")
+        XCTAssertEqual(ArtistParser.fallbackDisplayName("本地音频"), "本地音频")
+
+        // Multi-artist delimiters, NUL/newline, Kuwo pre-transformed bands, protected bands & ZWJ emoji
+        XCTAssertEqual(ArtistParser.parseRawString("周杰伦 / 费玉清"), ["周杰伦", "费玉清"])
+        XCTAssertEqual(ArtistParser.parseRawString("周杰伦、温岚、弹头"), ["周杰伦", "温岚", "弹头"])
+        XCTAssertEqual(ArtistParser.parseRawString("林俊杰&蔡卓妍"), ["林俊杰", "蔡卓妍"])
+        XCTAssertEqual(ArtistParser.parseRawString("陈奕迅；王菲"), ["陈奕迅", "王菲"])
+        XCTAssertEqual(ArtistParser.parseRawString("周杰伦 × 五月天"), ["周杰伦", "五月天"])
+        XCTAssertEqual(ArtistParser.parseRawString("周杰伦\u{3000}×\u{3000}五月天"), ["周杰伦", "五月天"])
+        XCTAssertEqual(ArtistParser.parseRawString("SPY×FAMILY"), ["SPY×FAMILY"])
+        XCTAssertEqual(ArtistParser.parseRawString("AC/DC / Metallica"), ["AC/DC", "Metallica"])
+        XCTAssertEqual(ArtistParser.parseRawString("K/DA / (G)I-DLE"), ["K/DA", "(G)I-DLE"])
+        XCTAssertEqual(ArtistParser.parseRawString("10,000 Maniacs"), ["10,000 Maniacs"])
+        XCTAssertEqual(ArtistParser.parseRawString("Tyler, The Creator / Kali Uchis"), ["Tyler, The Creator", "Kali Uchis"])
+        XCTAssertEqual(ArtistParser.parseRawString("Simon & Garfunkel"), ["Simon & Garfunkel"])
+        XCTAssertEqual(ArtistParser.parseRawString("Simon  /  Garfunkel"), ["Simon & Garfunkel"])
+        XCTAssertEqual(ArtistParser.parseRawString("Earth, Wind & Fire & The Emotions"), ["Earth, Wind & Fire", "The Emotions"])
+        XCTAssertEqual(ArtistParser.parseRawString("Daft Punk"), ["Daft Punk"])
+        XCTAssertEqual(ArtistParser.parseRawString("Taylor Swift"), ["Taylor Swift"])
+        XCTAssertEqual(ArtistParser.parseRawString("Artist A / Ft. Worth"), ["Artist A", "Ft. Worth"])
+        XCTAssertEqual(ArtistParser.parseRawString("Jay Chou (feat. Lara & Gary)"), ["Jay Chou", "Lara", "Gary"])
+        XCTAssertEqual(ArtistParser.parseRawString("陈奕迅 (feat. 王菲 (Live))"), ["陈奕迅", "王菲 (Live)"])
+        XCTAssertEqual(ArtistParser.parseRawString("A (feat.)"), ["A"])
+        XCTAssertEqual(ArtistParser.parseRawString("Artist A\u{0000}Artist B"), ["Artist A", "Artist B"])
+        XCTAssertEqual(ArtistParser.parseRawString("👩‍🎤 DJ"), ["👩‍🎤 DJ"])
+        XCTAssertEqual(ArtistParser.parseRawString("周杰伦 / 未知歌手 / 周杰伦 / 费玉清"), ["周杰伦", "费玉清"])
+        XCTAssertEqual(KuwoProvider.parseKuwoArtist("Simon &amp; Garfunkel").1, ["Simon & Garfunkel"])
+        XCTAssertEqual(KuwoProvider.parseKuwoArtist("&amp;").0, "未知歌手")
+
+        // Structured artistNames precedence, newlines, HTML entity safety, & legacy JSON compatibility
+        let structuredTrack = Track(
+            id: "wy_band",
+            title: "Test",
+            artist: "Custom/Band / Foo & Bar",
+            artistNames: ["Custom/Band", "Foo & Bar", "O'Connor &amp; Co."]
+        )
+        XCTAssertEqual(ArtistParser.extractArtists(from: structuredTrack), ["Custom/Band", "Foo & Bar", "O'Connor &amp; Co."])
+        XCTAssertEqual(ArtistParser.extractArtists(rawArtist: "", structuredArtists: ["Artist A\nArtist B"]), ["Artist A", "Artist B"])
+
+        let legacyData = Data(#"{"id":"wy_legacy","title":"千里之外","artist":"周杰伦 / 费玉清","album":"依然范特西"}"#.utf8)
+        let decoded = try? JSONDecoder().decode(Track.self, from: legacyData)
+        XCTAssertNotNil(decoded)
+        XCTAssertEqual(decoded?.artistNames ?? [], [])
+        XCTAssertEqual(ArtistParser.extractArtists(from: decoded!), ["周杰伦", "费玉清"])
+
+        // ReDoS safety: pathological unclosed featuring must stay linear
+        let unclosedStart = Date()
+        _ = ArtistParser.parseRawString("(feat." + String(repeating: " ", count: 10_000) + "x")
+        XCTAssertLessThan(Date().timeIntervalSince(unclosedStart), 0.2)
+
+        // Overflow layout planner: 70-artist chorus stops lazily and keeps badge visible
+        var measureCalls = 0
+        let chorusPlan = ArtistRowLayoutPlanner.plan(
+            artistCount: 70,
+            maxWidth: 240,
+            artistWidthAt: { _ in
+                measureCalls += 1
+                return 80
+            },
+            separatorWidth: 6,
+            singleArtistChevronWidth: 14,
+            overflowBadgeWidthForHidden: { _ in 56 },
+            albumFullWidth: 90,
+            minAlbumDisplayWidth: 60,
+            minTruncatedArtistWidth: 56
+        )
+        XCTAssertEqual(chorusPlan.visibleCount, 2)
+        XCTAssertEqual(chorusPlan.hiddenCount, 68)
+        XCTAssertFalse(chorusPlan.showAlbum)
+        XCTAssertLessThanOrEqual(measureCalls, 4)
+
+        // Long single artist + album: never crushed below 60%
+        let balancedSingle = ArtistRowLayoutPlanner.plan(
+            artistCount: 1,
+            maxWidth: 300,
+            artistWidthAt: { _ in 260 },
+            separatorWidth: 6,
+            singleArtistChevronWidth: 14,
+            overflowBadgeWidthForHidden: { _ in 50 },
+            albumFullWidth: 210,
+            minAlbumDisplayWidth: 60,
+            minTruncatedArtistWidth: 56
+        )
+        XCTAssertTrue(balancedSingle.showAlbum)
+        XCTAssertTrue(balancedSingle.truncateSingleVisibleArtist)
+        XCTAssertGreaterThanOrEqual(balancedSingle.singleArtistMaxWidth ?? 0, 180)
+
+        // NaN / invalid maxWidth handled safely
+        let nanPlan = ArtistRowLayoutPlanner.plan(
+            artistCount: 5,
+            maxWidth: .nan,
+            artistWidthAt: { _ in 80 },
+            separatorWidth: 6,
+            singleArtistChevronWidth: 14,
+            overflowBadgeWidthForHidden: { _ in 52 },
+            albumFullWidth: 80,
+            minAlbumDisplayWidth: 60,
+            minTruncatedArtistWidth: 56
+        )
+        XCTAssertEqual(nanPlan.visibleCount, 0)
+        XCTAssertFalse(nanPlan.showAlbum)
+
+        // Absurdly narrow viewport -> compact summary pill only
+        let tinyPlan = ArtistRowLayoutPlanner.plan(
+            artistCount: 5,
+            maxWidth: 90,
+            artistWidthAt: { _ in 120 },
+            separatorWidth: 6,
+            singleArtistChevronWidth: 14,
+            overflowBadgeWidthForHidden: { _ in 52 },
+            albumFullWidth: 0,
+            minAlbumDisplayWidth: 60,
+            minTruncatedArtistWidth: 56
+        )
+        XCTAssertEqual(tinyPlan.visibleCount, 0)
+        XCTAssertEqual(tinyPlan.hiddenCount, 5)
+        XCTAssertTrue(tinyPlan.showCompactSummaryOnly)
+    }
+
+    private struct SeededRNG: RandomNumberGenerator {
+        private var state: UInt64
+        init(seed: UInt64) { self.state = seed == 0 ? 0x9E3779B97F4A7C15 : seed }
+        mutating func next() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state
+        }
+    }
+
+    func testRepeatModeFourWayCycleAndQueueNavigatorBoundaries() {
+        XCTAssertEqual(RepeatMode.listLoop.next(), .sequential)
+        XCTAssertEqual(RepeatMode.sequential.next(), .shuffle)
+        XCTAssertEqual(RepeatMode.shuffle.next(), .singleLoop)
+        XCTAssertEqual(RepeatMode.singleLoop.next(), .listLoop)
+        XCTAssertEqual(RepeatMode.sequential.label, "顺序播放")
+
+        // Sequential boundaries
+        let nav = QueueNavigator(rng: SeededRNG(seed: 42))
+        nav.onQueueReplaced(queueSize: 3, startIndex: 0, mode: .sequential)
+        XCTAssertFalse(nav.canSkipPrevious(queueSize: 3, currentIndex: 0, mode: .sequential))
+        XCTAssertTrue(nav.canSkipNext(queueSize: 3, currentIndex: 0, mode: .sequential))
+        XCTAssertEqual(
+            nav.navigatePrevious(queueSize: 3, currentIndex: 0, mode: .sequential, positionMs: 5_001),
+            .restartCurrent(message: nil)
+        )
+        XCTAssertEqual(
+            nav.navigatePrevious(queueSize: 3, currentIndex: 0, mode: .sequential, positionMs: 5_000),
+            .restartCurrent(message: "已是第一首，已重新播放")
+        )
+        XCTAssertEqual(
+            nav.navigateNext(queueSize: 3, currentIndex: 2, mode: .sequential, isAutoAdvance: false),
+            .stayAtBoundary(message: "已是最后一首")
+        )
+        XCTAssertEqual(
+            nav.navigateNext(queueSize: 3, currentIndex: 2, mode: .sequential, isAutoAdvance: true),
+            .stopAtEnd(message: "顺序播放已结束")
+        )
+        XCTAssertFalse(nav.willAutoAdvanceOnEnd(queueSize: 3, currentIndex: 2, mode: .sequential))
+        XCTAssertNil(nav.peekNextIndexForAutoAdvance(queueSize: 3, currentIndex: 2, mode: .sequential))
+
+        // ListLoop & SingleLoop
+        XCTAssertEqual(
+            nav.navigatePrevious(queueSize: 4, currentIndex: 0, mode: .listLoop, positionMs: 0),
+            .switchTo(3)
+        )
+        XCTAssertEqual(
+            nav.navigateNext(queueSize: 4, currentIndex: 3, mode: .listLoop, isAutoAdvance: true),
+            .switchTo(0)
+        )
+        XCTAssertEqual(
+            nav.navigateNext(queueSize: 4, currentIndex: 2, mode: .singleLoop, isAutoAdvance: true),
+            .restartCurrent(message: nil)
+        )
+        XCTAssertEqual(
+            nav.navigateNext(queueSize: 4, currentIndex: 2, mode: .singleLoop, isAutoAdvance: false),
+            .switchTo(3)
+        )
+
+        // Single-track queue
+        for mode in RepeatMode.allCases {
+            nav.onQueueReplaced(queueSize: 1, startIndex: 0, mode: mode)
+            XCTAssertFalse(nav.canSkipPrevious(queueSize: 1, currentIndex: 0, mode: mode))
+            XCTAssertFalse(nav.canSkipNext(queueSize: 1, currentIndex: 0, mode: mode))
+            XCTAssertNil(nav.peekNextIndexForAutoAdvance(queueSize: 1, currentIndex: 0, mode: mode))
+            XCTAssertEqual(nav.willAutoAdvanceOnEnd(queueSize: 1, currentIndex: 0, mode: mode), mode != .sequential)
+        }
+
+        // Shuffle no-repeat cycle, back/forward history, playNext, and cursor-0 removal safety
+        let shuffleNav = QueueNavigator(rng: SeededRNG(seed: 12345))
+        var cur = 1
+        shuffleNav.onQueueReplaced(queueSize: 6, startIndex: cur, mode: .shuffle)
+        XCTAssertFalse(shuffleNav.canSkipPrevious(queueSize: 6, currentIndex: cur, mode: .shuffle))
+        var visited = [cur]
+        for _ in 0..<5 {
+            let peek = shuffleNav.peekNextIndexForAutoAdvance(queueSize: 6, currentIndex: cur, mode: .shuffle)
+            guard case .switchTo(let nextIdx) = shuffleNav.navigateNext(queueSize: 6, currentIndex: cur, mode: .shuffle, isAutoAdvance: false) else {
+                XCTFail("Expected switchTo in shuffle")
+                return
+            }
+            XCTAssertEqual(peek, nextIdx)
+            XCTAssertNotEqual(cur, nextIdx)
+            cur = nextIdx
+            visited.append(cur)
+        }
+        XCTAssertEqual(Set(visited), Set(0..<6))
+        // Back one step returns to visited[4], forward replays visited[5]
+        XCTAssertEqual(
+            shuffleNav.navigatePrevious(queueSize: 6, currentIndex: cur, mode: .shuffle, positionMs: 0),
+            .switchTo(visited[4])
+        )
+        XCTAssertEqual(
+            shuffleNav.navigateNext(queueSize: 6, currentIndex: visited[4], mode: .shuffle, isAutoAdvance: false),
+            .switchTo(visited[5])
+        )
+
+        // Removing track at cursor 0 must not leak future unplayed track into previous history
+        let removeNav = QueueNavigator(rng: SeededRNG(seed: 77))
+        removeNav.onQueueReplaced(queueSize: 3, startIndex: 0, mode: .shuffle)
+        removeNav.onTrackRemovedFromQueue(removedIndex: 0, newCurrentIndex: 0, newQueueSize: 2, mode: .shuffle)
+        XCTAssertFalse(removeNav.canSkipPrevious(queueSize: 2, currentIndex: 0, mode: .shuffle))
+
+        // iOS 16-safe SF Symbol for sequential mode + resilient RepeatMode & cursor decoding
+        XCTAssertEqual(RepeatMode.sequential.sfSymbol, "arrow.right.to.line")
+        let uppercaseCursorJson = Data(#"{"currentIndex":2,"currentTrackId":"wy_2","positionMs":42000,"repeatMode":"SEQUENTIAL"}"#.utf8)
+        let decodedUppercase = try? JSONDecoder().decode(PlaybackCursorSnapshot.self, from: uppercaseCursorJson)
+        XCTAssertEqual(decodedUppercase?.repeatMode, .sequential)
+        XCTAssertEqual(decodedUppercase?.currentIndex, 2)
+        XCTAssertEqual(decodedUppercase?.positionMs, 42_000)
+
+        let unknownCursorJson = Data(#"{"currentIndex":3,"currentTrackId":"wy_3","positionMs":15000,"repeatMode":"future_mode_v9"}"#.utf8)
+        let decodedUnknown = try? JSONDecoder().decode(PlaybackCursorSnapshot.self, from: unknownCursorJson)
+        XCTAssertEqual(decodedUnknown?.repeatMode, .listLoop)
+        XCTAssertEqual(decodedUnknown?.currentIndex, 3)
+        XCTAssertEqual(decodedUnknown?.positionMs, 15_000)
+
+        // Hardening guards: degenerate append, OOB remove, redundant shuffle mode change
+        let hardNav = QueueNavigator(rng: SeededRNG(seed: 9))
+        hardNav.onQueueReplaced(queueSize: 1, startIndex: 0, mode: .shuffle)
+        hardNav.onTrackAppendedToQueue(appendedIndex: 0, currentIndex: 0, newQueueSize: 1, mode: .shuffle)
+        hardNav.onTrackAppendedToQueue(appendedIndex: 1, currentIndex: 0, newQueueSize: 2, mode: .shuffle)
+        XCTAssertEqual(hardNav.peekNextIndexForAutoAdvance(queueSize: 2, currentIndex: 0, mode: .shuffle), 1)
+        hardNav.onTrackRemovedFromQueue(removedIndex: -1, newCurrentIndex: 0, newQueueSize: 2, mode: .shuffle)
+        XCTAssertEqual(hardNav.peekNextIndexForAutoAdvance(queueSize: 2, currentIndex: 0, mode: .shuffle), 1)
+    }
 }

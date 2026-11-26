@@ -33,6 +33,8 @@ struct PlayerState: Equatable {
     var isLoadingLyrics: Bool = false
     var ambientPalette: AmbientPalette = .default
     var sleepTimerRemainingMs: Int64? = nil
+    var canSkipPrevious: Bool = false
+    var canSkipNext: Bool = false
 
     var currentTrack: Track? {
         guard currentIndex >= 0 && currentIndex < queue.count else { return nil }
@@ -79,6 +81,7 @@ final class PlayerController: ObservableObject {
     private static let cursorPersistIntervalSec: TimeInterval = 10.0
 
     private let player = AVPlayer()
+    private let queueNavigator = QueueNavigator()
     private let networkAdvisor: NetworkQualityAdvisor
     private let audioCacheManager: AudioCacheManager
     private let settingsStore: SettingsStore
@@ -176,6 +179,11 @@ final class PlayerController: ObservableObject {
             self.lastPersistedQueueCount = restored.queue.count
             self.lastPersistedSliceStart = 0
             self.lastPersistedSliceCount = restored.queue.count
+            self.queueNavigator.onQueueReplaced(
+                queueSize: restored.queue.count,
+                startIndex: restored.currentIndex,
+                mode: restored.repeatMode
+            )
             self.progress.positionMs = restored.positionMs
             self.progress.durationMs = restored.durationMs
             self.progress.sleepTimerRemainingMs = nil
@@ -193,8 +201,19 @@ final class PlayerController: ObservableObject {
                 lyrics: ParsedLyrics(),
                 isLoadingLyrics: true,
                 ambientPalette: .default,
-                sleepTimerRemainingMs: nil
+                sleepTimerRemainingMs: nil,
+                canSkipPrevious: self.queueNavigator.canSkipPrevious(
+                    queueSize: restored.queue.count,
+                    currentIndex: restored.currentIndex,
+                    mode: restored.repeatMode
+                ),
+                canSkipNext: self.queueNavigator.canSkipNext(
+                    queueSize: restored.queue.count,
+                    currentIndex: restored.currentIndex,
+                    mode: restored.repeatMode
+                )
             )
+            self.syncNavigationCapabilities()
             self.loadMetadataAndVisuals(for: track)
             self.updateNowPlayingInfo()
         }
@@ -319,6 +338,28 @@ final class PlayerController: ObservableObject {
 
     // MARK: - Public Controls
 
+    private func syncNavigationCapabilities() {
+        let prev = queueNavigator.canSkipPrevious(
+            queueSize: state.queue.count,
+            currentIndex: state.currentIndex,
+            mode: state.repeatMode
+        )
+        let next = queueNavigator.canSkipNext(
+            queueSize: state.queue.count,
+            currentIndex: state.currentIndex,
+            mode: state.repeatMode
+        )
+        if state.canSkipPrevious != prev {
+            state.canSkipPrevious = prev
+        }
+        if state.canSkipNext != next {
+            state.canSkipNext = next
+        }
+        let center = MPRemoteCommandCenter.shared()
+        center.previousTrackCommand.isEnabled = !state.queue.isEmpty
+        center.nextTrackCommand.isEnabled = next
+    }
+
     func playTrack(_ track: Track, inQueue queue: [Track]? = nil, queueSource: PlaybackQueueSource? = nil) {
         if let queue, !queue.isEmpty {
             let idx = queue.firstIndex(where: { $0.id == track.id }) ?? 0
@@ -334,14 +375,38 @@ final class PlayerController: ObservableObject {
         let safeIndex = min(max(startIndex, 0), tracks.count - 1)
         consecutiveAutoSkipCount = 0
         pendingQualityOverride = nil
+        clearPreloadedNext()
+        queueNavigator.onQueueReplaced(queueSize: tracks.count, startIndex: safeIndex, mode: state.repeatMode)
         state.queue = tracks
         state.currentIndex = safeIndex
         state.queueSource = queueSource
         state.positionMs = 0
         state.durationMs = tracks[safeIndex].durationMs
+        syncNavigationCapabilities()
         progress.positionMs = 0
         progress.durationMs = tracks[safeIndex].durationMs
         persistQueueAndCursor()
+        loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+    }
+
+    func selectQueueIndex(_ index: Int) {
+        guard index >= 0 && index < state.queue.count else { return }
+        hasUserInitiatedPlayback = true
+        consecutiveAutoSkipCount = 0
+        pendingQualityOverride = nil
+        clearPreloadedNext()
+        queueNavigator.onManualSelectIndex(
+            queueSize: state.queue.count,
+            targetIndex: index,
+            mode: state.repeatMode
+        )
+        state.currentIndex = index
+        state.positionMs = 0
+        state.durationMs = state.queue[index].durationMs
+        syncNavigationCapabilities()
+        progress.positionMs = 0
+        progress.durationMs = state.queue[index].durationMs
+        persistCursor(force: true)
         loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
     }
 
@@ -352,8 +417,12 @@ final class PlayerController: ObservableObject {
             return
         }
         var updated = state.queue
-        if let existingIdx = updated.firstIndex(where: { $0.id == track.id }) {
-            if existingIdx == state.currentIndex { return }
+        let existingIdx = updated.firstIndex(where: { $0.id == track.id })
+        if existingIdx == state.currentIndex {
+            events.send(PlayerUiEvent(message: "《\(track.title)》正在播放"))
+            return
+        }
+        if let existingIdx {
             updated.remove(at: existingIdx)
             if existingIdx < state.currentIndex {
                 state.currentIndex -= 1
@@ -362,6 +431,14 @@ final class PlayerController: ObservableObject {
         let insertIdx = min(state.currentIndex + 1, updated.count)
         updated.insert(track, at: insertIdx)
         state.queue = updated
+        queueNavigator.onTrackInsertedAsPlayNext(
+            oldRemovedIndex: existingIdx,
+            insertedIndex: insertIdx,
+            newCurrentIndex: state.currentIndex,
+            newQueueSize: updated.count,
+            mode: state.repeatMode
+        )
+        syncNavigationCapabilities()
         clearPreloadedNext()
         persistQueueAndCursor()
         events.send(PlayerUiEvent(message: "已将《\(track.title)》设为下一首播放"))
@@ -374,14 +451,23 @@ final class PlayerController: ObservableObject {
             return
         }
         if !state.queue.contains(where: { $0.id == track.id }) {
-            let wasSingleTrack = state.queue.count == 1
+            let wasAtQueueTail = (state.currentIndex == state.queue.count - 1)
             state.queue.append(track)
-            if wasSingleTrack {
+            queueNavigator.onTrackAppendedToQueue(
+                appendedIndex: state.queue.count - 1,
+                currentIndex: state.currentIndex,
+                newQueueSize: state.queue.count,
+                mode: state.repeatMode
+            )
+            if wasAtQueueTail || state.repeatMode == .shuffle {
                 clearPreloadedNext()
             }
+            syncNavigationCapabilities()
             persistQueueAndCursor()
+            events.send(PlayerUiEvent(message: "已加入播放队列"))
+        } else {
+            events.send(PlayerUiEvent(message: "《\(track.title)》已在播放队列中"))
         }
-        events.send(PlayerUiEvent(message: "已加入播放队列"))
     }
 
     func removeFromQueue(at index: Int) {
@@ -397,6 +483,13 @@ final class PlayerController: ObservableObject {
         }
         if index < state.currentIndex {
             state.currentIndex -= 1
+            queueNavigator.onTrackRemovedFromQueue(
+                removedIndex: index,
+                newCurrentIndex: state.currentIndex,
+                newQueueSize: state.queue.count,
+                mode: state.repeatMode
+            )
+            syncNavigationCapabilities()
             persistQueueAndCursor()
         } else if removingCurrent {
             let nextIdx = min(index, state.queue.count - 1)
@@ -404,11 +497,25 @@ final class PlayerController: ObservableObject {
             state.currentIndex = nextIdx
             state.positionMs = 0
             state.durationMs = state.queue[nextIdx].durationMs
+            queueNavigator.onTrackRemovedFromQueue(
+                removedIndex: index,
+                newCurrentIndex: nextIdx,
+                newQueueSize: state.queue.count,
+                mode: state.repeatMode
+            )
+            syncNavigationCapabilities()
             progress.positionMs = 0
             progress.durationMs = state.queue[nextIdx].durationMs
             persistQueueAndCursor()
             loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
         } else {
+            queueNavigator.onTrackRemovedFromQueue(
+                removedIndex: index,
+                newCurrentIndex: state.currentIndex,
+                newQueueSize: state.queue.count,
+                mode: state.repeatMode
+            )
+            syncNavigationCapabilities()
             persistQueueAndCursor()
         }
     }
@@ -443,6 +550,8 @@ final class PlayerController: ObservableObject {
         }
         if state.isPlaying || player.timeControlStatus == .waitingToPlayAtSpecifiedRate {
             resumeAfterInterruption = false
+            activeSeekToken = UUID()
+            isSeeking = false
             player.pause()
             state.isPlaying = false
             state.isBuffering = false
@@ -491,13 +600,25 @@ final class PlayerController: ObservableObject {
         hasUserInitiatedPlayback = true
         if !isAutoAdvance { consecutiveAutoSkipCount = 0 }
 
-        // Check preloaded next first (including shuffle mode where nextIdx was already chosen during preload)
+        // Check preloaded next first only if it matches QueueNavigator's exact peeked next index
+        let expectedPeek: Int? = (preloadedNext != nil && state.repeatMode != .singleLoop)
+            ? queueNavigator.peekNextIndexForAutoAdvance(
+                queueSize: state.queue.count,
+                currentIndex: state.currentIndex,
+                mode: state.repeatMode
+            )
+            : nil
         if let preloaded = preloadedNext,
            preloaded.forTrackId == state.currentTrack?.id,
+           preloaded.nextIndex == expectedPeek,
            preloaded.nextIndex >= 0,
            preloaded.nextIndex < state.queue.count,
-           preloaded.track.id == state.queue[preloaded.nextIndex].id,
-           (state.repeatMode != .singleLoop || !isAutoAdvance) {
+           preloaded.track.id == state.queue[preloaded.nextIndex].id {
+            queueNavigator.onPromotedPreloadedNext(
+                queueSize: state.queue.count,
+                promotedIndex: preloaded.nextIndex,
+                mode: state.repeatMode
+            )
             resolveTask?.cancel()
             resolveTask = nil
             recoveryTask?.cancel()
@@ -516,6 +637,7 @@ final class PlayerController: ObservableObject {
 
             state.currentIndex = preloaded.nextIndex
             state.positionMs = 0
+            syncNavigationCapabilities()
             progress.positionMs = 0
             progress.durationMs = preloaded.track.durationMs
             persistCursor(force: true)
@@ -534,44 +656,171 @@ final class PlayerController: ObservableObject {
             return
         }
 
-        guard let nextIdx = computeNextIndex(forceAdvance: !isAutoAdvance) else { return }
-        pendingQualityOverride = nil
-        state.currentIndex = nextIdx
-        state.positionMs = 0
-        progress.positionMs = 0
-        progress.durationMs = state.queue[nextIdx].durationMs
-        persistCursor(force: true)
-        loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+        let outcome = queueNavigator.navigateNext(
+            queueSize: state.queue.count,
+            currentIndex: state.currentIndex,
+            mode: state.repeatMode,
+            isAutoAdvance: isAutoAdvance
+        )
+        switch outcome {
+        case .switchTo(let nextIdx):
+            pendingQualityOverride = nil
+            state.currentIndex = nextIdx
+            state.positionMs = 0
+            syncNavigationCapabilities()
+            progress.positionMs = 0
+            progress.durationMs = state.queue[nextIdx].durationMs
+            persistCursor(force: true)
+            loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+        case .restartCurrent(let msg):
+            restartCurrentTrack(forcePlay: isAutoAdvance || msg != nil, message: msg)
+        case .stayAtBoundary(let msg):
+            events.send(PlayerUiEvent(message: msg))
+        case .stopAtEnd(let msg):
+            stopAtQueueEnd(message: msg)
+        case .noOp:
+            break
+        }
     }
 
     func previous() {
         guard !state.queue.isEmpty else { return }
         hasUserInitiatedPlayback = true
-        consecutiveAutoSkipCount = 0
-        if progress.positionMs > 4_000 {
-            seek(to: 0)
+        let outcome = queueNavigator.navigatePrevious(
+            queueSize: state.queue.count,
+            currentIndex: state.currentIndex,
+            mode: state.repeatMode,
+            positionMs: progress.positionMs
+        )
+        switch outcome {
+        case .switchTo(let prevIdx):
+            consecutiveAutoSkipCount = 0
+            pendingQualityOverride = nil
+            state.currentIndex = prevIdx
+            state.positionMs = 0
+            syncNavigationCapabilities()
+            progress.positionMs = 0
+            progress.durationMs = state.queue[prevIdx].durationMs
+            persistCursor(force: true)
+            loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+        case .restartCurrent(let msg):
+            consecutiveAutoSkipCount = 0
+            restartCurrentTrack(forcePlay: msg != nil, message: msg)
+        case .stayAtBoundary(let msg):
+            events.send(PlayerUiEvent(message: msg))
+        case .stopAtEnd(let msg):
+            stopAtQueueEnd(message: msg)
+        case .noOp:
+            break
+        }
+    }
+
+    private func restartCurrentTrack(forcePlay: Bool, message: String?) {
+        guard state.currentTrack != nil else { return }
+        let alreadyLoadingFromStart = resolveTask != nil &&
+            !isRecoveringError &&
+            pendingResumePositionMs == 0 &&
+            pendingInitialSeekMs == nil
+        lastRecoveryStartPositionMs = 0
+        pendingResumePositionMs = 0
+
+        if resolveTask != nil || recoveryTask != nil || isRecoveringError {
+            progress.positionMs = 0
+            state.positionMs = 0
+            pendingInitialSeekMs = nil
+            if forcePlay && !alreadyLoadingFromStart {
+                loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+            }
+            if let message, !message.isEmpty {
+                events.send(PlayerUiEvent(message: message))
+            }
             return
         }
-        let prevIdx: Int
-        if state.repeatMode == .shuffle && state.queue.count > 1 {
-            prevIdx = randomOtherIndex()
+
+        clearPreloadedNext()
+        if let item = player.currentItem, item.status != .failed {
+            let shouldPlay = forcePlay || state.isPlaying
+            progress.positionMs = 0
+            state.positionMs = 0
+            pendingInitialSeekMs = nil
+            let token = UUID()
+            activeSeekToken = token
+            isSeeking = true
+            player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] _ in
+                Task { @MainActor in
+                    guard let self, self.activeSeekToken == token else { return }
+                    self.isSeeking = false
+                    guard let item, self.player.currentItem == item else { return }
+                    self.progress.positionMs = 0
+                    self.state.positionMs = 0
+                    self.pendingResumePositionMs = 0
+                    if shouldPlay {
+                        self.activateAudioSession()
+                        self.player.play()
+                        self.state.isPlaying = true
+                    }
+                    self.updateNowPlayingInfo()
+                }
+            }
+            persistCursor(force: true)
+        } else if forcePlay || state.isPlaying {
+            loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
         } else {
-            prevIdx = (state.currentIndex - 1 + state.queue.count) % state.queue.count
+            progress.positionMs = 0
+            state.positionMs = 0
+            pendingInitialSeekMs = nil
+            persistCursor(force: true)
+            updateNowPlayingInfo()
         }
-        pendingQualityOverride = nil
-        state.currentIndex = prevIdx
-        state.positionMs = 0
+
+        if let message, !message.isEmpty {
+            events.send(PlayerUiEvent(message: message))
+        }
+    }
+
+    private func stopAtQueueEnd(message: String?) {
+        resolveTask?.cancel()
+        resolveTask = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        clearPreloadedNext()
+        activeLoadToken = UUID()
+        activeSeekToken = UUID()
+        isSeeking = false
+        isRecoveringError = false
+        resumeAfterInterruption = false
+        pendingInitialSeekMs = nil
+        pendingResumePositionMs = 0
+        lastRecoveryStartPositionMs = 0
+        consecutiveAutoSkipCount = 0
+
+        // Detach the ended item cleanly instead of issuing an unguarded async seek(to: .zero),
+        // eliminating timeObserver/timeControl races and expired-URL auto-recovery.
+        detachCurrentPlayerItem()
         progress.positionMs = 0
-        progress.durationMs = state.queue[prevIdx].durationMs
+        state.positionMs = 0
+        state.isPlaying = false
+        state.isBuffering = false
+        syncNavigationCapabilities()
         persistCursor(force: true)
-        loadAndPlayCurrent(resetRecoveryState: true, seekToMs: 0)
+        updateNowPlayingInfo()
+        if let message, !message.isEmpty {
+            events.send(PlayerUiEvent(message: message))
+        }
     }
 
     func cycleRepeatMode() {
-        state.repeatMode = state.repeatMode.next()
+        let nextMode = state.repeatMode.next()
+        state.repeatMode = nextMode
+        queueNavigator.onModeChanged(
+            queueSize: state.queue.count,
+            currentIndex: state.currentIndex,
+            newMode: nextMode
+        )
+        syncNavigationCapabilities()
         clearPreloadedNext()
         persistCursor(force: true)
-        events.send(PlayerUiEvent(message: "播放模式：\(state.repeatMode.label)"))
+        events.send(PlayerUiEvent(message: "已切换为\(nextMode.label)"))
     }
 
     func changePreferredQuality(_ quality: AudioQuality) {
@@ -909,9 +1158,13 @@ final class PlayerController: ObservableObject {
 
         events.send(PlayerUiEvent(message: message))
 
-        // Auto-skip next if in a multi-track queue (never loop infinitely onto the same broken track in singleLoop)
-        if state.queue.count > 1 &&
-            state.repeatMode != .singleLoop &&
+        // Auto-skip next if in a multi-track queue and another track exists (never skip past SEQUENTIAL end or loop singleLoop)
+        if state.repeatMode != .singleLoop &&
+            queueNavigator.canSkipNext(
+                queueSize: state.queue.count,
+                currentIndex: state.currentIndex,
+                mode: state.repeatMode
+            ) &&
             consecutiveAutoSkipCount < PlaybackRecoveryPolicy.maxConsecutiveAutoSkips {
             consecutiveAutoSkipCount += 1
             recoveryTask?.cancel()
@@ -927,6 +1180,15 @@ final class PlayerController: ObservableObject {
 
     private func handleRuntimePlaybackError(item: AVPlayerItem, error: Error?) {
         guard let track = state.currentTrack, !isRecoveringError else { return }
+        // Never auto-recover & unexpectedly resume playback if the player is explicitly paused/stopped
+        let isPlaybackActive = state.isPlaying || state.isBuffering || player.timeControlStatus != .paused
+        guard isPlaybackActive else {
+            detachCurrentPlayerItem()
+            state.isBuffering = false
+            state.isPlaying = false
+            updateNowPlayingInfo()
+            return
+        }
 
         let httpCode = item.errorLog()?.events.last?.errorStatusCode
         let normalizedCode = (httpCode != nil && httpCode! >= 400) ? httpCode : nil
@@ -957,7 +1219,7 @@ final class PlayerController: ObservableObject {
             failedTrackIdsForCurrentTrack.insert(rtid)
         }
 
-        let resumePos = plan.preservePosition ? max(progress.positionMs, pendingResumePositionMs) : 0
+        pendingResumePositionMs = plan.preservePosition ? max(progress.positionMs, pendingResumePositionMs) : 0
         let preferSource = plan.preferSameSourceFirst ? activeStreamSourceId : nil
         let backoffNs = UInt64(max(plan.backoffMs, 100)) * 1_000_000
 
@@ -966,9 +1228,11 @@ final class PlayerController: ObservableObject {
             try? await Task.sleep(nanoseconds: backoffNs)
             if Task.isCancelled { return }
             await MainActor.run {
-                self?.loadAndPlayCurrent(
+                guard let self else { return }
+                let targetResume = plan.preservePosition ? self.pendingResumePositionMs : 0
+                self.loadAndPlayCurrent(
                     resetRecoveryState: false,
-                    seekToMs: resumePos,
+                    seekToMs: targetResume,
                     preferredSourceId: preferSource
                 )
             }
@@ -980,12 +1244,17 @@ final class PlayerController: ObservableObject {
     private func maybePreloadNextTrack() {
         let curDur = max(progress.durationMs, state.durationMs)
         let curPos = progress.positionMs
+        let remainingMs = curDur - curPos
         guard let currentTrack = state.currentTrack,
               state.repeatMode != .singleLoop,
               curDur >= Self.minTrackDurationForPreloadMs,
-              (curDur - curPos) <= Self.preloadWindowMs,
+              remainingMs >= 1_000 && remainingMs <= Self.preloadWindowMs,
               preloadAttemptedForTrackId != currentTrack.id,
-              let nextIdx = computeNextIndex(forceAdvance: false),
+              let nextIdx = queueNavigator.peekNextIndexForAutoAdvance(
+                  queueSize: state.queue.count,
+                  currentIndex: state.currentIndex,
+                  mode: state.repeatMode
+              ),
               nextIdx != state.currentIndex,
               nextIdx < state.queue.count else {
             return
@@ -1004,6 +1273,12 @@ final class PlayerController: ObservableObject {
             func commitIfStillValid(_ item: PreloadedNextItem) {
                 guard !Task.isCancelled,
                       self.state.currentTrack?.id == forTrackId,
+                      self.state.repeatMode != .singleLoop,
+                      self.queueNavigator.peekNextIndexForAutoAdvance(
+                          queueSize: self.state.queue.count,
+                          currentIndex: self.state.currentIndex,
+                          mode: self.state.repeatMode
+                      ) == nextIdx,
                       nextIdx < self.state.queue.count,
                       self.state.queue[nextIdx].id == nextTrack.id else {
                     return
@@ -1173,7 +1448,8 @@ final class PlayerController: ObservableObject {
         let playToken = center.playCommand.addTarget { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                if !self.state.isPlaying { self.togglePlayPause() }
+                let isActivelyLoading = self.resolveTask != nil || self.recoveryTask != nil || self.isRecoveringError
+                if !self.state.isPlaying && !isActivelyLoading { self.togglePlayPause() }
             }
             return .success
         }
@@ -1183,7 +1459,8 @@ final class PlayerController: ObservableObject {
         let pauseToken = center.pauseCommand.addTarget { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                if self.state.isPlaying { self.togglePlayPause() }
+                let isActivelyLoading = self.resolveTask != nil || self.recoveryTask != nil || self.isRecoveringError
+                if self.state.isPlaying || isActivelyLoading { self.togglePlayPause() }
             }
             return .success
         }
@@ -1232,7 +1509,9 @@ final class PlayerController: ObservableObject {
                 case .waitingToPlayAtSpecifiedRate:
                     self.state.isBuffering = true
                 case .paused:
-                    self.state.isPlaying = false
+                    if self.pendingInitialSeekMs == nil {
+                        self.state.isPlaying = false
+                    }
                     if self.resolveTask == nil && !self.isRecoveringError && self.pendingInitialSeekMs == nil {
                         self.state.isBuffering = false
                     }
@@ -1250,7 +1529,7 @@ final class PlayerController: ObservableObject {
         let interval = CMTime(seconds: 0.4, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             MainActor.assumeIsolated {
-                guard let self else { return }
+                guard let self, self.player.currentItem != nil, self.resolveTask == nil, !self.isRecoveringError else { return }
                 var nextPos = self.progress.positionMs
                 var nextDur = max(self.progress.durationMs, self.state.durationMs)
                 let hadZeroDuration = (nextDur <= 0)
@@ -1346,22 +1625,7 @@ final class PlayerController: ObservableObject {
         ) { [weak self, weak item] _ in
             Task { @MainActor in
                 guard let self, let item, self.player.currentItem == item else { return }
-                if self.state.repeatMode == .singleLoop {
-                    self.lastRecoveryStartPositionMs = 0
-                    self.progress.positionMs = 0
-                    self.state.positionMs = 0
-                    self.pendingResumePositionMs = 0
-                    self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] _ in
-                        Task { @MainActor in
-                            guard let self, let item, self.player.currentItem == item else { return }
-                            self.player.play()
-                            self.state.isPlaying = true
-                            self.updateNowPlayingInfo()
-                        }
-                    }
-                } else {
-                    self.next(isAutoAdvance: true)
-                }
+                self.next(isAutoAdvance: true)
             }
         }
 
@@ -1448,29 +1712,8 @@ final class PlayerController: ObservableObject {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
-    private func computeNextIndex(forceAdvance: Bool) -> Int? {
-        guard !state.queue.isEmpty else { return nil }
-        if state.queue.count == 1 { return 0 }
-        switch state.repeatMode {
-        case .singleLoop:
-            return forceAdvance ? (state.currentIndex + 1) % state.queue.count : state.currentIndex
-        case .shuffle:
-            return randomOtherIndex()
-        case .listLoop:
-            return (state.currentIndex + 1) % state.queue.count
-        }
-    }
-
-    private func randomOtherIndex() -> Int {
-        guard state.queue.count > 1 else { return 0 }
-        var idx = Int.random(in: 0..<state.queue.count)
-        if idx == state.currentIndex {
-            idx = (idx + 1) % state.queue.count
-        }
-        return idx
-    }
-
     private func stopAndReset() {
+        queueNavigator.reset()
         resolveTask?.cancel()
         resolveTask = nil
         recoveryTask?.cancel()
@@ -1510,6 +1753,7 @@ final class PlayerController: ObservableObject {
         progress.durationMs = 0
         progress.sleepTimerRemainingMs = nil
         state = PlayerState(repeatMode: state.repeatMode)
+        syncNavigationCapabilities()
         playbackSessionStore.clear()
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }

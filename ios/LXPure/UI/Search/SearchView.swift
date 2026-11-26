@@ -1,5 +1,10 @@
 import SwiftUI
 
+struct PendingSearchRequest: Equatable, Identifiable, Sendable {
+    let id: Int64
+    let query: String
+}
+
 private enum SearchScope: String, CaseIterable, Identifiable {
     case all = "聚合去重"
     case wy = "网易云"
@@ -26,6 +31,8 @@ struct SearchView: View {
     let currentTrackId: String?
     let isPlaying: Bool
     let bottomInset: CGFloat
+    let pendingSearchRequest: PendingSearchRequest?
+    let onConsumeSearchRequest: (Int64) -> Void
     let onSaveSearchQuery: (String) -> Void
     let onClearSearchHistory: () -> Void
     let onPlayTracks: ([Track], Int) -> Void
@@ -39,6 +46,7 @@ struct SearchView: View {
     @State private var hasSearched = false
     @State private var searchTask: Task<Void, Never>?
     @State private var searchToken = UUID()
+    @State private var lastConsumedRequestId: Int64 = 0
     @FocusState private var isSearchFocused: Bool
 
     var body: some View {
@@ -90,25 +98,33 @@ struct SearchView: View {
                         .stroke(lx.hairline, lineWidth: 0.8)
                 )
 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(SearchScope.allCases) { item in
-                            let active = item == selectedScope
-                            Button {
-                                selectedScope = item
-                                if !query.trimmingCharacters(in: .whitespaces).isEmpty {
-                                    executeSearch(keyword: query, scope: item)
+                ScrollViewReader { scopeProxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(SearchScope.allCases) { item in
+                                let active = item == selectedScope
+                                Button {
+                                    selectedScope = item
+                                    if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                                        executeSearch(keyword: query, scope: item)
+                                    }
+                                } label: {
+                                    Text(item.rawValue)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundColor(active ? lx.onAccent : lx.textSecondary)
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 7)
+                                        .background(active ? lx.accent : lx.surfaceElevated)
+                                        .clipShape(Capsule())
                                 }
-                            } label: {
-                                Text(item.rawValue)
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundColor(active ? lx.onAccent : lx.textSecondary)
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 7)
-                                    .background(active ? lx.accent : lx.surfaceElevated)
-                                    .clipShape(Capsule())
+                                .buttonStyle(.plain)
+                                .id(item)
                             }
-                            .buttonStyle(.plain)
+                        }
+                    }
+                    .onChange(of: selectedScope) { newScope in
+                        if newScope == .all {
+                            scopeProxy.scrollTo(SearchScope.all, anchor: .leading)
                         }
                     }
                 }
@@ -220,16 +236,26 @@ struct SearchView: View {
                     }
                     .padding(.bottom, bottomInset)
                 }
+                .id(searchToken)
             }
         }
-        .onDisappear {
-            if searchTask != nil {
-                searchTask?.cancel()
-                searchTask = nil
-                searchToken = UUID()
-                isSearching = false
-            }
+        .onAppear {
+            consumePendingSearchIfNeeded()
         }
+        .onChange(of: pendingSearchRequest?.id) { _ in
+            consumePendingSearchIfNeeded()
+        }
+    }
+
+    private func consumePendingSearchIfNeeded() {
+        guard let req = pendingSearchRequest, req.id != lastConsumedRequestId else { return }
+        lastConsumedRequestId = req.id
+        onConsumeSearchRequest(req.id)
+        let trimmed = req.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        query = trimmed
+        selectedScope = .all
+        executeSearch(keyword: trimmed, scope: .all)
     }
 
     private func executeSearch(keyword: String, scope: SearchScope) {
@@ -241,6 +267,7 @@ struct SearchView: View {
         searchTask?.cancel()
         let token = UUID()
         searchToken = token
+        results = []
         isSearching = true
         hasSearched = true
 
@@ -254,6 +281,7 @@ struct SearchView: View {
             guard !Task.isCancelled, searchToken == token else { return }
             results = fetched
             isSearching = false
+            searchTask = nil
         }
     }
 }

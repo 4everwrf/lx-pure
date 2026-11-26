@@ -37,9 +37,12 @@ class KugouProvider(private val httpClient: OkHttpClient) {
                         .ifBlank { return@mapNotNull null }
                     val suffix = FormatUtils.decodeHtml(obj["Suffix"].asStringOrNull())
                     val title = if (suffix.isNotBlank()) "$baseName $suffix" else baseName
-                    val singers = obj["Singers"].asJsonArrayOrNull()?.mapNotNull {
-                        it.asJsonObjectOrNull()?.get("name").asNonBlankStringOrNull()?.let { n -> FormatUtils.decodeHtml(n) }
-                    }?.joinToString(" / ").orEmpty()
+                    val artistList = obj["Singers"].asJsonArrayOrNull()?.mapNotNull {
+                        it.asJsonObjectOrNull()?.get("name").asNonBlankStringOrNull()
+                            ?.let { n -> FormatUtils.decodeHtml(n).trim() }
+                            ?.takeIf { cleaned -> cleaned.isNotEmpty() }
+                    }.orEmpty()
+                    val singers = artistList.joinToString(" / ")
                         .ifBlank { FormatUtils.decodeHtml(obj["SingerName"].asStringOrNull()) }
                         .ifBlank { "未知歌手" }
 
@@ -70,7 +73,8 @@ class KugouProvider(private val httpClient: OkHttpClient) {
                         coverUrl = img,
                         albumId = obj["AlbumID"].asStringOrNull(),
                         hash = hash,
-                        qualities = qualities
+                        qualities = qualities,
+                        artistNames = artistList
                     )
                 }.getOrNull()
             }

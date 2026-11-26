@@ -65,6 +65,8 @@ struct RootView: View {
     @State private var cacheBytes: Int64 = 0
     @State private var shareFileItem: ShareFileItem?
     @State private var autoTriggeredIpaPath: String?
+    @State private var pendingSearchRequest: PendingSearchRequest?
+    @State private var searchRequestSeq: Int64 = 0
 
     @State private var activeToast: PlayerUiEvent?
     @State private var toastDismissTask: Task<Void, Never>?
@@ -149,7 +151,10 @@ struct RootView: View {
                         onTogglePlayPause: { playerController.togglePlayPause() },
                         onNext: { playerController.next() },
                         onPrevious: { playerController.previous() },
-                        onOpenQueue: { showQueueSheet = true }
+                        onOpenQueue: {
+                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                            showQueueSheet = true
+                        }
                     )
                 }
 
@@ -158,6 +163,7 @@ struct RootView: View {
                 }
             }
             .padding(.bottom, 8)
+            .ignoresSafeArea(.keyboard, edges: .bottom)
             .animation(.easeInOut(duration: 0.22), value: activeToast?.id)
         }
         .environment(\.lxPalette, effectivePalette)
@@ -170,6 +176,12 @@ struct RootView: View {
         }
         .onChange(of: activeTab) { newTab in
             if newTab != .search {
+                pendingSearchRequest = nil
+                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+            }
+        }
+        .onChange(of: isPlayerExpanded) { expanded in
+            if expanded {
                 UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
             }
         }
@@ -177,7 +189,7 @@ struct RootView: View {
             showQueueSheet = false
             playerAddToPlaylistTrack = nil
         }) {
-            ZStack(alignment: .bottom) {
+            ZStack(alignment: .top) {
                 FullPlayerView(
                     state: playerController.state,
                     progress: playerController.progress,
@@ -202,7 +214,12 @@ struct RootView: View {
                     onDownload: { triggerTrackDownload($0) },
                     onOpenQueue: { showQueueSheet = true },
                     onSelectQuality: { playerController.changePreferredQuality($0) },
-                    onSetSleepTimer: { playerController.setSleepTimer(minutes: $0) }
+                    onSetSleepTimer: { playerController.setSleepTimer(minutes: $0) },
+                    onArtistClick: { artistName in
+                        if isPlayerExpanded {
+                            navigateToArtistSearch(artistName)
+                        }
+                    }
                 )
                 .sheet(isPresented: $showQueueSheet) {
                     queueSheet
@@ -219,8 +236,10 @@ struct RootView: View {
                             }
                         } : nil
                     )
-                    .padding(.bottom, 76)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .environment(\.lxPalette, .dark)
+                    .padding(.top, 66)
+                    .allowsHitTesting(activeToast.openSourceManager)
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
             .animation(.easeInOut(duration: 0.22), value: activeToast?.id)
@@ -269,6 +288,9 @@ struct RootView: View {
             showToast(msg)
         }
         .onChange(of: path) { newPath in
+            if !newPath.isEmpty {
+                pendingSearchRequest = nil
+            }
             if newPath.last == .settings {
                 refreshStorageStats()
             }
@@ -425,6 +447,12 @@ struct RootView: View {
                     currentTrackId: playerController.state.currentTrack?.id,
                     isPlaying: playerController.state.isPlaying,
                     bottomInset: bottomContentInset,
+                    pendingSearchRequest: pendingSearchRequest,
+                    onConsumeSearchRequest: { consumedId in
+                        if pendingSearchRequest?.id == consumedId {
+                            pendingSearchRequest = nil
+                        }
+                    },
                     onSaveSearchQuery: { libraryStore.saveSearchQuery($0) },
                     onClearSearchHistory: { libraryStore.clearSearchHistory() },
                     onPlayTracks: { tracks, idx in
@@ -739,11 +767,7 @@ struct RootView: View {
             repeatMode: playerController.state.repeatMode,
             queueSource: playerController.state.queueSource,
             onSelectIndex: { idx in
-                playerController.playTracks(
-                    playerController.state.queue,
-                    startIndex: idx,
-                    queueSource: playerController.state.queueSource
-                )
+                playerController.selectQueueIndex(idx)
             },
             onRemoveIndex: { idx in
                 playerController.removeFromQueue(at: idx)
@@ -794,6 +818,23 @@ struct RootView: View {
         } else {
             showToast("未找到原歌单，当前队列曲目仍可继续播放")
         }
+    }
+
+    private func navigateToArtistSearch(_ artistName: String) {
+        let trimmed = artistName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !ArtistParser.isUnknownPlaceholder(trimmed) else { return }
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        showQueueSheet = false
+        playerAddToPlaylistTrack = nil
+        pendingAddToPlaylistTrack = nil
+        actionSheetTrack = nil
+        addToPlaylistTrack = nil
+        isPlayerExpanded = false
+        path.removeAll()
+        visitedTabs.insert(.search)
+        activeTab = .search
+        searchRequestSeq += 1
+        pendingSearchRequest = PendingSearchRequest(id: searchRequestSeq, query: trimmed)
     }
 
     private func triggerTrackDownload(_ track: Track) {

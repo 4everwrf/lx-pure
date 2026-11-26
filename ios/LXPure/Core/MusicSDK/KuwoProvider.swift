@@ -44,6 +44,13 @@ final class KuwoProvider: Sendable {
         return upgraded
     }
 
+    static func parseKuwoArtist(_ raw: String?) -> (String, [String]) {
+        let decoded = FormatUtils.decodeHtml(raw)
+        let parsed = ArtistParser.parseRawString(decoded)
+        let display = parsed.isEmpty ? ArtistParser.fallbackDisplayName(decoded) : parsed.joined(separator: " / ")
+        return (display, parsed)
+    }
+
     func search(query: String, page: Int = 1, limit: Int = 25) async -> [Track] {
         let encoded = urlEncodeFormComponent(query)
         let url = "http://search.kuwo.cn/r.s?client=kt&all=\(encoded)&pn=\(page - 1)&rn=\(limit)&uid=794762570&ver=kwplayer_ar_9.2.2.1&vipver=1&show_copyright_off=1&newver=1&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1&issubtitle=1"
@@ -60,8 +67,7 @@ final class KuwoProvider: Sendable {
             let name = FormatUtils.decodeHtml(JsonSafe.asNonBlankString(obj["SONGNAME"]) ?? JsonSafe.asNonBlankString(obj["NAME"]))
             guard !name.isEmpty else { return nil }
 
-            let artistRaw = FormatUtils.decodeHtml(JsonSafe.asString(obj["ARTIST"])).replacingOccurrences(of: "&", with: " / ")
-            let artist = artistRaw.isEmpty ? "未知歌手" : artistRaw
+            let (artist, artistNames) = Self.parseKuwoArtist(JsonSafe.asString(obj["ARTIST"]))
             let album = FormatUtils.decodeHtml(JsonSafe.asString(obj["ALBUM"]))
             let durationSec = JsonSafe.asInt64(obj["DURATION"]) ?? 0
             let rawPic = JsonSafe.asNonBlankString(obj["hts_MVPIC"])
@@ -78,7 +84,8 @@ final class KuwoProvider: Sendable {
                 durationMs: durationSec * 1000,
                 coverUrl: Self.normalizeKuwoImageUrl(rawPic),
                 albumId: JsonSafe.asString(obj["ALBUMID"]),
-                qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["N_MINFO"]) ?? JsonSafe.asNonBlankString(obj["n_minfo"]))
+                qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["N_MINFO"]) ?? JsonSafe.asNonBlankString(obj["n_minfo"])),
+                artistNames: artistNames
             )
         }
     }
@@ -153,18 +160,19 @@ final class KuwoProvider: Sendable {
                       let rid = JsonSafe.asNonBlankString(obj["id"]) else { continue }
                 let title = FormatUtils.decodeHtml(JsonSafe.asNonBlankString(obj["name"]))
                 guard !title.isEmpty else { continue }
-                let artistRaw = FormatUtils.decodeHtml(JsonSafe.asString(obj["artist"])).replacingOccurrences(of: "&", with: " / ")
+                let (artist, artistNames) = Self.parseKuwoArtist(JsonSafe.asString(obj["artist"]))
                 let track = Track(
                     id: "kw_\(rid)",
                     title: title,
-                    artist: artistRaw.isEmpty ? "未知歌手" : artistRaw,
+                    artist: artist,
                     album: FormatUtils.decodeHtml(JsonSafe.asString(obj["album"])),
                     source: .kw,
                     songmid: rid,
                     durationMs: (JsonSafe.asInt64(obj["duration"]) ?? 0) * 1000,
                     coverUrl: extractInlineCover(obj),
                     albumId: JsonSafe.asString(obj["albumid"]),
-                    qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["N_MINFO"]) ?? JsonSafe.asNonBlankString(obj["n_minfo"]))
+                    qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["N_MINFO"]) ?? JsonSafe.asNonBlankString(obj["n_minfo"])),
+                    artistNames: artistNames
                 )
                 if seenIds.insert(track.id).inserted {
                     allRawTracks.append(track)
@@ -208,18 +216,19 @@ final class KuwoProvider: Sendable {
                   let rid = JsonSafe.asNonBlankString(obj["id"]) else { return nil }
             let title = FormatUtils.decodeHtml(JsonSafe.asNonBlankString(obj["name"]))
             guard !title.isEmpty else { return nil }
-            let artistRaw = FormatUtils.decodeHtml(JsonSafe.asString(obj["artist"])).replacingOccurrences(of: "&", with: " / ")
+            let (artist, artistNames) = Self.parseKuwoArtist(JsonSafe.asString(obj["artist"]))
             return Track(
                 id: "kw_\(rid)",
                 title: title,
-                artist: artistRaw.isEmpty ? "未知歌手" : artistRaw,
+                artist: artist,
                 album: FormatUtils.decodeHtml(JsonSafe.asString(obj["album"])),
                 source: .kw,
                 songmid: rid,
                 durationMs: (JsonSafe.asInt64(obj["duration"]) ?? 0) * 1000,
                 coverUrl: extractInlineCover(obj),
                 albumId: JsonSafe.asString(obj["albumid"]),
-                qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["n_minfo"]) ?? JsonSafe.asNonBlankString(obj["N_MINFO"]))
+                qualities: parseMinfoQualities(JsonSafe.asNonBlankString(obj["n_minfo"]) ?? JsonSafe.asNonBlankString(obj["N_MINFO"])),
+                artistNames: artistNames
             )
         }
 

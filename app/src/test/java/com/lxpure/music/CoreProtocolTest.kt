@@ -1147,4 +1147,173 @@ class CoreProtocolTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun artistParserHandlesMultiArtistProtectedBandsFeatAndPlaceholders() {
+        val parser = com.lxpure.music.domain.model.ArtistParser
+
+        // Empty / unknown placeholders must produce empty list (non-clickable)
+        assertTrue(parser.parseRawString("").isEmpty())
+        assertTrue(parser.parseRawString("   \t\u200B  ").isEmpty())
+        assertTrue(parser.parseRawString("未知歌手").isEmpty())
+        assertTrue(parser.parseRawString("<unknown>").isEmpty())
+        assertTrue(parser.parseRawString("Unknown Artist").isEmpty())
+        assertTrue(parser.parseRawString(" / / & , ").isEmpty())
+
+        // Standard multi-artist delimiters across WY/TX/KW/KG/Local
+        assertEquals(listOf("周杰伦", "费玉清"), parser.parseRawString("周杰伦 / 费玉清"))
+        assertEquals(listOf("周杰伦", "温岚", "弹头"), parser.parseRawString("周杰伦、温岚、弹头"))
+        assertEquals(listOf("林俊杰", "蔡卓妍"), parser.parseRawString("林俊杰&蔡卓妍"))
+        assertEquals(listOf("陈奕迅", "王菲"), parser.parseRawString("陈奕迅；王菲"))
+        assertEquals(listOf("Drake", "Future", "Young Thug"), parser.parseRawString("Drake, Future, Young Thug"))
+        assertEquals(listOf("周杰伦", "五月天"), parser.parseRawString("周杰伦 × 五月天"))
+        assertEquals(listOf("SPY×FAMILY"), parser.parseRawString("SPY×FAMILY"))
+
+        // Protected atomic bands & aliases with dots/hyphens/parentheses
+        assertEquals(listOf("AC/DC"), parser.parseRawString("AC/DC"))
+        assertEquals(listOf("AC/DC", "Metallica"), parser.parseRawString("AC/DC / Metallica"))
+        assertEquals(listOf("Tyler, The Creator", "Kali Uchis"), parser.parseRawString("Tyler, The Creator / Kali Uchis"))
+        assertEquals(listOf("Simon & Garfunkel"), parser.parseRawString("Simon & Garfunkel"))
+        assertEquals(listOf("Earth, Wind & Fire", "The Emotions"), parser.parseRawString("Earth, Wind & Fire & The Emotions"))
+        assertEquals(listOf("G.E.M. 邓紫棋", "潘玮柏"), parser.parseRawString("G.E.M. 邓紫棋 / 潘玮柏"))
+        assertEquals(listOf("S.H.E"), parser.parseRawString("S.H.E"))
+        assertEquals(listOf("A-Lin"), parser.parseRawString("A-Lin"))
+        assertEquals(listOf("陈奕迅 (Eason Chan)"), parser.parseRawString("陈奕迅 (Eason Chan)"))
+
+        // Featuring annotations must split without breaking Daft Punk / Taylor Swift
+        assertEquals(listOf("Daft Punk"), parser.parseRawString("Daft Punk"))
+        assertEquals(listOf("Taylor Swift"), parser.parseRawString("Taylor Swift"))
+        assertEquals(listOf("Jay Chou", "Lara"), parser.parseRawString("Jay Chou feat. Lara"))
+        assertEquals(listOf("Jay Chou", "Lara", "Gary"), parser.parseRawString("Jay Chou (feat. Lara & Gary)"))
+        assertEquals(listOf("周杰伦", "温岚"), parser.parseRawString("周杰伦（ft. 温岚）"))
+
+        // Case-insensitive dedup + mixed placeholder filtering + NUL/newline tags
+        assertEquals(listOf("周杰伦", "费玉清"), parser.parseRawString("周杰伦 / 未知歌手 / 周杰伦 / 费玉清"))
+        assertEquals(listOf("Jay Chou", "Lara"), parser.parseRawString("Jay Chou / jay chou / Lara"))
+        assertEquals(listOf("Artist A", "Artist B"), parser.parseRawString("Artist A\u0000Artist B"))
+
+        // Structured artistNames takes precedence (preserves arbitrary slash/ampersand band names)
+        val structuredTrack = Track(
+            id = "wy_band",
+            title = "Test",
+            artist = "Custom/Band / Foo & Bar",
+            artistNames = listOf("Custom/Band", "Foo & Bar")
+        )
+        assertEquals(listOf("Custom/Band", "Foo & Bar"), parser.extractArtists(structuredTrack))
+
+        // Legacy persisted JSON without artistNames deserializes safely
+        val legacyJson = """{"id":"wy_legacy","title":"千里之外","artist":"周杰伦 / 费玉清","album":"依然范特西"}"""
+        val decoded = com.lxpure.music.data.local.roomJson.decodeFromString<Track>(legacyJson)
+        assertTrue(decoded.artistNames.isEmpty())
+        assertEquals(listOf("周杰伦", "费玉清"), parser.extractArtists(decoded))
+    }
+
+    @Test
+    fun artistRowLayoutPlannerHandlesSingleMultiOverflowAndExtremeWidths() {
+        val planner = com.lxpure.music.domain.model.ArtistRowLayoutPlanner
+
+        // 1. Single short artist + short album: both fit without truncation
+        val singleFit = planner.plan(
+            artistCount = 1,
+            maxWidth = 300f,
+            artistWidthAt = { 60f },
+            separatorWidth = 6f,
+            singleArtistChevronWidth = 20f,
+            overflowBadgeWidthForHidden = { 48f },
+            albumFullWidth = 70f,
+            minAlbumDisplayWidth = 60f,
+            minTruncatedArtistWidth = 56f
+        )
+        assertEquals(1, singleFit.visibleCount)
+        assertEquals(0, singleFit.hiddenCount)
+        assertTrue(singleFit.showAlbum)
+        assertFalse(singleFit.truncateSingleVisibleArtist)
+
+        // 2. Single short artist + very long album: artist NOT truncated, album shown & ellipsized
+        val singleLongAlbum = planner.plan(
+            artistCount = 1,
+            maxWidth = 300f,
+            artistWidthAt = { 60f },
+            separatorWidth = 6f,
+            singleArtistChevronWidth = 20f,
+            overflowBadgeWidthForHidden = { 48f },
+            albumFullWidth = 400f,
+            minAlbumDisplayWidth = 60f,
+            minTruncatedArtistWidth = 56f
+        )
+        assertEquals(1, singleLongAlbum.visibleCount)
+        assertTrue(singleLongAlbum.showAlbum)
+        assertFalse(singleLongAlbum.truncateSingleVisibleArtist)
+
+        // 3. Multi-artist all fitting + album
+        val twoFit = planner.plan(
+            artistCount = 2,
+            maxWidth = 300f,
+            artistWidthAt = { 70f },
+            separatorWidth = 6f,
+            singleArtistChevronWidth = 20f,
+            overflowBadgeWidthForHidden = { 48f },
+            albumFullWidth = 100f,
+            minAlbumDisplayWidth = 60f,
+            minTruncatedArtistWidth = 56f
+        )
+        assertEquals(2, twoFit.visibleCount)
+        assertEquals(0, twoFit.hiddenCount)
+        assertTrue(twoFit.showAlbum)
+
+        // 4. Huge 70-artist chorus: stops measuring lazily & shows first 2 + "+68" badge
+        var measureCalls = 0
+        val chorusPlan = planner.plan(
+            artistCount = 70,
+            maxWidth = 240f,
+            artistWidthAt = {
+                measureCalls++
+                80f
+            },
+            separatorWidth = 6f,
+            singleArtistChevronWidth = 20f,
+            overflowBadgeWidthForHidden = { 56f },
+            albumFullWidth = 90f,
+            minAlbumDisplayWidth = 60f,
+            minTruncatedArtistWidth = 56f
+        )
+        assertEquals(2, chorusPlan.visibleCount)
+        assertEquals(68, chorusPlan.hiddenCount)
+        assertFalse(chorusPlan.showAlbum)
+        assertFalse(chorusPlan.truncateSingleVisibleArtist)
+        assertTrue("Expected lazy measurement (< 10 calls), got $measureCalls", measureCalls <= 4)
+
+        // 5. Multi-artist where artist #1 alone overflows with badge -> truncates #1 & keeps badge visible
+        val longFirstPlan = planner.plan(
+            artistCount = 3,
+            maxWidth = 220f,
+            artistWidthAt = { idx -> if (idx == 0) 210f else 60f },
+            separatorWidth = 6f,
+            singleArtistChevronWidth = 20f,
+            overflowBadgeWidthForHidden = { 50f },
+            albumFullWidth = 0f,
+            minAlbumDisplayWidth = 60f,
+            minTruncatedArtistWidth = 56f
+        )
+        assertEquals(1, longFirstPlan.visibleCount)
+        assertEquals(2, longFirstPlan.hiddenCount)
+        assertTrue(longFirstPlan.truncateSingleVisibleArtist)
+        assertFalse(longFirstPlan.showCompactSummaryOnly)
+
+        // 6. Absurdly narrow viewport -> compact summary pill only
+        val tinyPlan = planner.plan(
+            artistCount = 5,
+            maxWidth = 90f,
+            artistWidthAt = { 120f },
+            separatorWidth = 6f,
+            singleArtistChevronWidth = 20f,
+            overflowBadgeWidthForHidden = { 52f },
+            albumFullWidth = 0f,
+            minAlbumDisplayWidth = 60f,
+            minTruncatedArtistWidth = 56f
+        )
+        assertEquals(0, tinyPlan.visibleCount)
+        assertEquals(5, tinyPlan.hiddenCount)
+        assertTrue(tinyPlan.showCompactSummaryOnly)
+    }
 }

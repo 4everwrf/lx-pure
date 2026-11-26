@@ -16,6 +16,7 @@ import coil.fetch.FetchResult
 import coil.fetch.Fetcher
 import coil.request.Options
 import coil.size.pxOrElse
+import com.lxpure.music.domain.model.ArtistParser
 import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.Track
 import java.io.IOException
@@ -93,9 +94,9 @@ class LocalMusicScanner(private val context: Context) {
                         }
                         val title = rawTitle.ifBlank { displayFallback.ifBlank { "未知曲目" } }
                         val rawArtist = if (artistCol >= 0) c.getString(artistCol).orEmpty().trim() else ""
-                        val artist = if (rawArtist.isBlank() || rawArtist == "<unknown>") "未知歌手" else rawArtist
+                        val artist = if (ArtistParser.isUnknownPlaceholder(rawArtist)) "未知歌手" else rawArtist
                         val rawAlbum = if (albumCol >= 0) c.getString(albumCol).orEmpty().trim() else ""
-                        val album = if (rawAlbum == "<unknown>") "" else rawAlbum
+                        val album = if (rawAlbum.equals("<unknown>", ignoreCase = true)) "" else rawAlbum
                         val albumId = if (albumIdCol >= 0) c.getLong(albumIdCol) else 0L
                         val duration = if (durationCol >= 0) c.getLong(durationCol).coerceAtLeast(0L) else 0L
 

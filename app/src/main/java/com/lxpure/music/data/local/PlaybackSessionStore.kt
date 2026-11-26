@@ -51,6 +51,7 @@ class PlaybackSessionStore(private val baseDir: File) {
         private val json = Json {
             ignoreUnknownKeys = true
             encodeDefaults = true
+            coerceInputValues = true
         }
 
         /**

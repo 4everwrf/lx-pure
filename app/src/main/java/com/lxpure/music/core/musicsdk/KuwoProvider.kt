@@ -1,5 +1,6 @@
 package com.lxpure.music.core.musicsdk
 
+import com.lxpure.music.domain.model.ArtistParser
 import com.lxpure.music.domain.model.LeaderboardItem
 import com.lxpure.music.domain.model.LyricLine
 import com.lxpure.music.domain.model.MusicSource
@@ -48,6 +49,17 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                 upgraded
             }
         }
+
+        internal fun parseKuwoArtist(raw: String?): Pair<String, List<String>> {
+            val decoded = FormatUtils.decodeHtml(raw)
+            val parsed = ArtistParser.parseRawString(decoded)
+            val display = if (parsed.isNotEmpty()) {
+                parsed.joinToString(" / ")
+            } else {
+                ArtistParser.fallbackDisplayName(decoded)
+            }
+            return display to parsed
+        }
     }
 
     val leaderboards: List<LeaderboardItem> = listOf(
@@ -73,9 +85,7 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                     val rid = obj["MUSICRID"].asNonBlankStringOrNull()?.removePrefix("MUSIC_") ?: return@mapNotNull null
                     val name = FormatUtils.decodeHtml(obj["SONGNAME"].asNonBlankStringOrNull() ?: obj["NAME"].asNonBlankStringOrNull())
                         .ifBlank { return@mapNotNull null }
-                    val artist = FormatUtils.decodeHtml(obj["ARTIST"].asStringOrNull())
-                        .replace("&", " / ")
-                        .ifBlank { "未知歌手" }
+                    val (artist, artistList) = parseKuwoArtist(obj["ARTIST"].asStringOrNull())
                     val album = FormatUtils.decodeHtml(obj["ALBUM"].asStringOrNull())
                     val durationSec = obj["DURATION"].asLongOrNull() ?: 0L
                     val rawPic = obj["hts_MVPIC"].asNonBlankStringOrNull()
@@ -93,7 +103,8 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                         durationMs = durationSec * 1000L,
                         coverUrl = cover,
                         albumId = obj["ALBUMID"].asStringOrNull(),
-                        qualities = parseMinfoQualities(obj["N_MINFO"].asNonBlankStringOrNull() ?: obj["n_minfo"].asNonBlankStringOrNull())
+                        qualities = parseMinfoQualities(obj["N_MINFO"].asNonBlankStringOrNull() ?: obj["n_minfo"].asNonBlankStringOrNull()),
+                        artistNames = artistList
                     )
                 }.getOrNull()
             }
@@ -159,17 +170,19 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                         val obj = el.asJsonObjectOrNull() ?: return@runCatching null
                         val rid = obj["id"].asNonBlankStringOrNull() ?: return@runCatching null
                         val title = FormatUtils.decodeHtml(obj["name"].asNonBlankStringOrNull()).ifBlank { return@runCatching null }
+                        val (artist, artistList) = parseKuwoArtist(obj["artist"].asStringOrNull())
                         Track(
                             id = "kw_$rid",
                             title = title,
-                            artist = FormatUtils.decodeHtml(obj["artist"].asStringOrNull()).replace("&", " / ").ifBlank { "未知歌手" },
+                            artist = artist,
                             album = FormatUtils.decodeHtml(obj["album"].asStringOrNull()),
                             source = MusicSource.KW,
                             songmid = rid,
                             durationMs = (obj["duration"].asLongOrNull() ?: 0L) * 1000L,
                             coverUrl = extractInlineCover(obj),
                             albumId = obj["albumid"].asStringOrNull(),
-                            qualities = parseMinfoQualities(obj["N_MINFO"].asNonBlankStringOrNull() ?: obj["n_minfo"].asNonBlankStringOrNull())
+                            qualities = parseMinfoQualities(obj["N_MINFO"].asNonBlankStringOrNull() ?: obj["n_minfo"].asNonBlankStringOrNull()),
+                            artistNames = artistList
                         )
                     }.getOrNull()
                     if (track != null && seenIds.add(track.id)) {
@@ -211,17 +224,19 @@ class KuwoProvider(private val httpClient: OkHttpClient) {
                     val obj = el.asJsonObjectOrNull() ?: return@mapNotNull null
                     val rid = obj["id"].asNonBlankStringOrNull() ?: return@mapNotNull null
                     val title = FormatUtils.decodeHtml(obj["name"].asNonBlankStringOrNull()).ifBlank { return@mapNotNull null }
+                    val (artist, artistList) = parseKuwoArtist(obj["artist"].asStringOrNull())
                     Track(
                         id = "kw_$rid",
                         title = title,
-                        artist = FormatUtils.decodeHtml(obj["artist"].asStringOrNull()).replace("&", " / ").ifBlank { "未知歌手" },
+                        artist = artist,
                         album = FormatUtils.decodeHtml(obj["album"].asStringOrNull()),
                         source = MusicSource.KW,
                         songmid = rid,
                         durationMs = (obj["duration"].asLongOrNull() ?: 0L) * 1000L,
                         coverUrl = extractInlineCover(obj),
                         albumId = obj["albumid"].asStringOrNull(),
-                        qualities = parseMinfoQualities(obj["n_minfo"].asNonBlankStringOrNull() ?: obj["N_MINFO"].asNonBlankStringOrNull())
+                        qualities = parseMinfoQualities(obj["n_minfo"].asNonBlankStringOrNull() ?: obj["N_MINFO"].asNonBlankStringOrNull()),
+                        artistNames = artistList
                     )
                 }.getOrNull()
             }

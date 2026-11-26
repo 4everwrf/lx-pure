@@ -285,7 +285,7 @@ fun SettingsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("边听边存与封面缓存", style = MaterialTheme.typography.titleMedium, color = lxColors.textPrimary)
-                            Text("上限 300MB 自动循环淘汰，重听不耗流量 · 点击清理", style = MaterialTheme.typography.bodyMedium, color = lxColors.textSecondary)
+                            Text("音频 300MB + 封面与数据 76MB，自动循环淘汰 · 点击清理", style = MaterialTheme.typography.bodyMedium, color = lxColors.textSecondary)
                         }
                         Spacer(Modifier.width(10.dp))
                         Text(

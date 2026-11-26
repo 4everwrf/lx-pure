@@ -247,7 +247,7 @@ final class LocalMusicManager: ObservableObject {
 
         let metadataItems = (try? await asset.load(.commonMetadata)) ?? []
         var title = url.deletingPathExtension().lastPathComponent
-        var artist = "本地音频"
+        var collectedArtists: [String] = []
         var album = ""
         var coverPath: String?
 
@@ -264,12 +264,16 @@ final class LocalMusicManager: ObservableObject {
                     title = val
                 }
             case .commonKeyArtist:
-                if let val = try? await item.load(.stringValue), !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    artist = val
+                if let val = try? await item.load(.stringValue) {
+                    let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty && !ArtistParser.isUnknownPlaceholder(trimmed) {
+                        collectedArtists.append(trimmed)
+                    }
                 }
             case .commonKeyAlbumName:
                 if let val = try? await item.load(.stringValue) {
-                    album = val
+                    let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                    album = trimmed.caseInsensitiveCompare("<unknown>") == .orderedSame ? "" : trimmed
                 }
             case .commonKeyArtwork:
                 if let data = try? await item.load(.dataValue), !data.isEmpty {
@@ -287,16 +291,27 @@ final class LocalMusicManager: ObservableObject {
             }
         }
 
+        let resolvedArtists: [String]
+        if collectedArtists.count > 1 {
+            resolvedArtists = ArtistParser.extractArtists(rawArtist: "", structuredArtists: collectedArtists)
+        } else if let single = collectedArtists.first {
+            resolvedArtists = ArtistParser.parseRawString(single)
+        } else {
+            resolvedArtists = []
+        }
+        let artistDisplay = resolvedArtists.isEmpty ? "未知歌手" : resolvedArtists.joined(separator: " / ")
+
         return Track(
             id: "local_\(hashId)",
             title: title,
-            artist: artist,
+            artist: artistDisplay,
             album: album,
             source: .local,
             songmid: hashId,
             durationMs: durationMs,
             coverUrl: coverPath,
-            localUri: relPath
+            localUri: relPath,
+            artistNames: resolvedArtists
         )
     }
 }

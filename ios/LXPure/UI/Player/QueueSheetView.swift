@@ -27,11 +27,20 @@ struct QueueSheetView: View {
                     Button(action: onCycleRepeat) {
                         HStack(spacing: 6) {
                             Image(systemName: repeatMode.sfSymbol)
+                                .foregroundColor(lx.accent)
                             Text("\(repeatMode.label) (\(queue.count))")
+                                .foregroundColor(lx.textPrimary)
                         }
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(lx.textPrimary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 7)
+                        .background(lx.accentSoft)
+                        .clipShape(Capsule())
+                        .contentShape(Capsule())
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("播放模式：\(repeatMode.label)，共 \(queue.count) 首")
+                    .accessibilityHint("轻点切换播放模式")
                     Spacer()
                     if canOpenSource, let queueSource {
                         Button("原歌单") {
@@ -103,9 +112,11 @@ struct QueueSheetView: View {
                                             Image(systemName: "xmark")
                                                 .font(.system(size: 12, weight: .semibold))
                                                 .foregroundColor(lx.textTertiary)
-                                                .frame(width: 30, height: 30)
+                                                .frame(width: 36, height: 36)
+                                                .contentShape(Rectangle())
                                         }
                                         .buttonStyle(.plain)
+                                        .accessibilityLabel("移出队列")
                                     }
                                     .padding(.horizontal, 18)
                                     .padding(.vertical, 10)

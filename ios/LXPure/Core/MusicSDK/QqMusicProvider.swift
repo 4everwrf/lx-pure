@@ -352,7 +352,11 @@ final class QqMusicProvider: Sendable {
         guard !title.isEmpty else { return nil }
 
         let singers = JsonSafe.asArray(item["singer"]) ?? []
-        let singerNames = singers.compactMap { JsonSafe.asString(JsonSafe.asObject($0)?["name"]) }
+        let singerNames = singers.compactMap { el -> String? in
+            guard let rawName = JsonSafe.asNonBlankString(JsonSafe.asObject(el)?["name"]) else { return nil }
+            let decoded = FormatUtils.decodeHtml(rawName).trimmingCharacters(in: .whitespacesAndNewlines)
+            return decoded.isEmpty ? nil : decoded
+        }
         let artist = singerNames.isEmpty ? "未知歌手" : singerNames.joined(separator: " / ")
 
         let albumObj = JsonSafe.asObject(item["album"])
@@ -393,7 +397,8 @@ final class QqMusicProvider: Sendable {
             albumMid: albumMid,
             strMediaMid: mediaMid,
             songId: JsonSafe.asString(item["id"]),
-            qualities: qualities
+            qualities: qualities,
+            artistNames: singerNames
         )
     }
 }

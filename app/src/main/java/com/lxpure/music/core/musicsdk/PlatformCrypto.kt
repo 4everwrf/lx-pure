@@ -135,7 +135,7 @@ object FormatUtils {
             val hex = m.groupValues[1]
             val dec = m.groupValues[2]
             val cp = if (hex.isNotEmpty()) hex.toIntOrNull(16) else dec.toIntOrNull(10)
-            if (cp != null && cp in 1..0x10FFFF && !Character.isSurrogate(cp.toChar())) {
+            if (cp != null && cp in 1..0x10FFFF && cp !in 0xD800..0xDFFF) {
                 runCatching { String(Character.toChars(cp)) }.getOrDefault(m.value)
             } else {
                 m.value

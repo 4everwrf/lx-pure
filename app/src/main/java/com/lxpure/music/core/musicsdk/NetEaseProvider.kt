@@ -293,10 +293,11 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
     internal fun parseSongObj(item: JsonObject, privilege: JsonObject?): Track? {
         val id = item["id"].asStringOrNull() ?: return null
         val name = item["name"].asStringOrNull()?.takeIf { it.isNotBlank() } ?: return null
-        val artists = item["ar"].asJsonArrayOrNull()
-            ?.mapNotNull { it.asJsonObjectOrNull()?.get("name").asStringOrNull() }
-            ?.joinToString(" / ")
+        val artistList = item["ar"].asJsonArrayOrNull()
+            ?.mapNotNull { it.asJsonObjectOrNull()?.get("name").asNonBlankStringOrNull() }
             .orEmpty()
+        val artists = artistList
+            .joinToString(" / ")
             .ifBlank { "未知歌手" }
         val albumObj = item["al"].asJsonObjectOrNull()
         val albumName = albumObj?.get("name").asStringOrNull().orEmpty()
@@ -351,7 +352,8 @@ class NetEaseProvider(private val httpClient: OkHttpClient) {
             durationMs = durationMs,
             coverUrl = coverUrl,
             albumId = albumId,
-            qualities = qualities
+            qualities = qualities,
+            artistNames = artistList
         )
     }
 

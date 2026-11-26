@@ -1,4 +1,12 @@
 import SwiftUI
+import UIKit
+
+private struct ArtistPickerData: Identifiable, Equatable {
+    let id = UUID()
+    let trackTitle: String
+    let album: String
+    let artists: [String]
+}
 
 struct FullPlayerView: View {
     let state: PlayerState
@@ -20,11 +28,15 @@ struct FullPlayerView: View {
     let onOpenQueue: () -> Void
     let onSelectQuality: (AudioQuality) -> Void
     let onSetSleepTimer: (Int?) -> Void
+    let onArtistClick: (String) -> Void
 
+    @Environment(\.lxPalette) private var lx
     @State private var showLyrics = false
     @State private var showTranslation = true
     @State private var showQualitySheet = false
     @State private var showSleepSheet = false
+    @State private var artistPickerData: ArtistPickerData?
+    @State private var pendingSelectedArtist: String?
     @State private var isDraggingSlider = false
     @State private var dragPositionMs: Double = 0
     @State private var pendingSeekTargetMs: Int64?
@@ -69,6 +81,7 @@ struct FullPlayerView: View {
                                     .foregroundColor(.white.opacity(0.88))
                                     .frame(width: 38, height: 38)
                             }
+                            .accessibilityLabel("收起播放器")
 
                             Spacer()
 
@@ -104,6 +117,7 @@ struct FullPlayerView: View {
                                 }
                                 .frame(width: 38, height: 38)
                             }
+                            .accessibilityLabel("睡眠定时")
                         }
                     }
                     .padding(.horizontal, 20)
@@ -139,13 +153,28 @@ struct FullPlayerView: View {
                                     .font(.system(size: 21, weight: .bold))
                                     .foregroundColor(.white)
                                     .lineLimit(1)
-                                Text(track.album.isEmpty ? track.artist : "\(track.artist) · \(track.album)")
-                                    .font(.system(size: 14))
-                                    .foregroundColor(.white.opacity(0.70))
-                                    .lineLimit(1)
+                                PlayerArtistAlbumRow(
+                                    trackTitle: track.title,
+                                    rawArtist: track.artist,
+                                    structuredArtists: track.artistNames,
+                                    album: track.album,
+                                    onArtistClick: onArtistClick,
+                                    onOpenArtistPicker: { parsedArtists in
+                                        let cleanedAlbum = track.album
+                                            .replacingOccurrences(of: "\r\n", with: " ")
+                                            .replacingOccurrences(of: "\r", with: " ")
+                                            .replacingOccurrences(of: "\n", with: " ")
+                                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                                        artistPickerData = ArtistPickerData(
+                                            trackTitle: track.title,
+                                            album: cleanedAlbum,
+                                            artists: parsedArtists
+                                        )
+                                    }
+                                )
+                                .equatable()
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
 
                             Button {
                                 onToggleFavorite(track)
@@ -155,6 +184,7 @@ struct FullPlayerView: View {
                                     .foregroundColor(isFavorite ? Color(hex: 0xFB7185) : .white.opacity(0.82))
                                     .frame(width: 38, height: 38)
                             }
+                            .accessibilityLabel(isFavorite ? "取消喜欢" : "添加到我喜欢的")
                         }
 
                         // Progress Slider
@@ -226,15 +256,17 @@ struct FullPlayerView: View {
                                     .foregroundColor(.white.opacity(0.82))
                                     .frame(width: 44, height: 44)
                             }
+                            .accessibilityLabel(state.repeatMode.label)
 
                             Spacer()
 
                             Button(action: onPrevious) {
                                 Image(systemName: "backward.fill")
                                     .font(.system(size: 26))
-                                    .foregroundColor(.white)
+                                    .foregroundColor(state.canSkipPrevious ? .white : .white.opacity(0.44))
                                     .frame(width: 50, height: 50)
                             }
+                            .accessibilityLabel(state.canSkipPrevious ? "上一首" : "上一首（重新播放当前曲目）")
 
                             Spacer()
 
@@ -255,15 +287,21 @@ struct FullPlayerView: View {
                                     }
                                 }
                             }
+                            .accessibilityLabel(state.isBuffering ? "正在缓冲，点击暂停" : (state.isPlaying ? "暂停" : "播放"))
 
                             Spacer()
 
                             Button(action: onNext) {
                                 Image(systemName: "forward.fill")
                                     .font(.system(size: 26))
-                                    .foregroundColor(.white)
+                                    .foregroundColor(state.canSkipNext ? .white : .white.opacity(0.44))
                                     .frame(width: 50, height: 50)
                             }
+                            .accessibilityLabel(
+                                state.canSkipNext
+                                    ? "下一首"
+                                    : (state.repeatMode == .sequential ? "下一首（已到队列末尾）" : "下一首（重新播放当前曲目）")
+                            )
 
                             Spacer()
 
@@ -273,6 +311,7 @@ struct FullPlayerView: View {
                                     .foregroundColor(.white.opacity(0.82))
                                     .frame(width: 44, height: 44)
                             }
+                            .accessibilityLabel("播放队列")
                         }
                         .padding(.vertical, 4)
 
@@ -356,6 +395,9 @@ struct FullPlayerView: View {
             .onAppear {
                 showTranslation = showTranslationDefault
             }
+            .onDisappear {
+                pendingSelectedArtist = nil
+            }
             .onChange(of: track.id) { _ in
                 isDraggingSlider = false
                 dragPositionMs = 0
@@ -386,6 +428,25 @@ struct FullPlayerView: View {
                     Button("关闭定时", role: .destructive) { onSetSleepTimer(nil) }
                 }
                 Button("取消", role: .cancel) {}
+            }
+            .sheet(item: $artistPickerData, onDismiss: {
+                if let selected = pendingSelectedArtist {
+                    pendingSelectedArtist = nil
+                    onArtistClick(selected)
+                }
+            }) { data in
+                ArtistPickerSheetView(
+                    data: data,
+                    onSelectArtist: { selected in
+                        guard pendingSelectedArtist == nil else { return }
+                        pendingSelectedArtist = selected
+                        artistPickerData = nil
+                    }
+                )
+                .environment(\.lxPalette, lx)
+                .preferredColorScheme(lx.isDark ? .dark : .light)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
             }
         }
     }
@@ -549,5 +610,316 @@ struct FullPlayerView: View {
             return "\(base) · \(badge)"
         }
         return base
+    }
+}
+
+private struct PlayerArtistAlbumRow: View, Equatable {
+    let trackTitle: String
+    let rawArtist: String
+    let structuredArtists: [String]
+    let album: String
+    let onArtistClick: (String) -> Void
+    let onOpenArtistPicker: ([String]) -> Void
+
+    @Environment(\.legibilityWeight) private var legibilityWeight
+    @State private var availableWidth: CGFloat = 0
+
+    static func == (lhs: PlayerArtistAlbumRow, rhs: PlayerArtistAlbumRow) -> Bool {
+        lhs.trackTitle == rhs.trackTitle &&
+            lhs.rawArtist == rhs.rawArtist &&
+            lhs.structuredArtists == rhs.structuredArtists &&
+            lhs.album == rhs.album
+    }
+
+    private func fontMetrics(size: CGFloat, weight: UIFont.Weight) -> UIFont {
+        let adjusted: UIFont.Weight = legibilityWeight == .bold ? .bold : weight
+        return UIFont.systemFont(ofSize: size, weight: adjusted)
+    }
+
+    private func measureWidth(_ text: String, size: CGFloat, weight: UIFont.Weight) -> Double {
+        let font = fontMetrics(size: size, weight: weight)
+        let measured = (text as NSString).size(withAttributes: [.font: font])
+        return ceil(Double(measured.width))
+    }
+
+    var body: some View {
+        let artists = ArtistParser.extractArtists(rawArtist: rawArtist, structuredArtists: structuredArtists)
+        let trimmedAlbum = album
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        ZStack(alignment: .leading) {
+            if artists.isEmpty {
+                let displayArtist = ArtistParser.fallbackDisplayName(rawArtist)
+                Text(trimmedAlbum.isEmpty ? displayArtist : "\(displayArtist) · \(trimmedAlbum)")
+                    .font(.system(size: 14))
+                    .foregroundColor(.white.opacity(0.62))
+                    .lineLimit(1)
+            } else if availableWidth <= 1 {
+                Color.clear.frame(height: 28)
+            } else {
+                measuredRow(artists: artists, trimmedAlbum: trimmedAlbum, effectiveWidth: Double(availableWidth))
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear {
+                        if abs(availableWidth - geo.size.width) > 0.5 {
+                            availableWidth = geo.size.width
+                        }
+                    }
+                    .onChange(of: geo.size.width) { newWidth in
+                        if abs(availableWidth - newWidth) > 0.5 {
+                            availableWidth = newWidth
+                        }
+                    }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func measuredRow(artists: [String], trimmedAlbum: String, effectiveWidth: Double) -> some View {
+        let singleChevronW: Double = 14.0
+        let chipChromeW: Double = 18.0
+        let minChipW: Double = 34.0
+        let chipGapW: Double = 6.0
+        let badgeChromeW: Double = 32.0
+        let albumDisplayText = artists.count == 1 ? " · \(trimmedAlbum)" : "· \(trimmedAlbum)"
+        let albumFullW: Double = trimmedAlbum.isEmpty
+            ? 0
+            : (measureWidth(albumDisplayText, size: 14, weight: .regular) + 2)
+        let minAlbumDisplayW: Double = max(
+            measureWidth(artists.count == 1 ? " · 专辑…" : "· 专辑…", size: 14, weight: .regular) + 2,
+            54.0
+        )
+        let minTruncatedArtistW: Double = artists.count == 1
+            ? max(measureWidth("歌手…", size: 14.5, weight: .medium) + 2, 54.0)
+            : max(measureWidth("歌手…", size: 13.5, weight: .medium) + chipChromeW, 64.0)
+
+        let plan = ArtistRowLayoutPlanner.plan(
+            artistCount: artists.count,
+            maxWidth: effectiveWidth,
+            artistWidthAt: { idx in
+                let name = artists[idx]
+                if artists.count == 1 {
+                    return measureWidth(name, size: 14.5, weight: .medium) + 2
+                } else {
+                    let textW = measureWidth(name, size: 13.5, weight: .medium)
+                    return max(textW + chipChromeW, minChipW)
+                }
+            },
+            separatorWidth: chipGapW,
+            singleArtistChevronWidth: singleChevronW,
+            overflowBadgeWidthForHidden: { hidden in
+                measureWidth("+\(hidden)", size: 12, weight: .semibold) + badgeChromeW
+            },
+            albumFullWidth: albumFullW,
+            minAlbumDisplayWidth: minAlbumDisplayW,
+            minTruncatedArtistWidth: minTruncatedArtistW,
+            albumLeadingGap: artists.count >= 2 ? chipGapW : 0
+        )
+
+        if artists.count == 1 {
+            let singleArtist = artists[0]
+            let artistCap: CGFloat? = plan.singleArtistMaxWidth.map { CGFloat($0) }
+
+            HStack(spacing: 0) {
+                Button {
+                    onArtistClick(singleArtist)
+                } label: {
+                    HStack(spacing: 2) {
+                        Text(singleArtist)
+                            .font(.system(size: 14.5, weight: .medium))
+                            .foregroundColor(.white.opacity(0.88))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.58))
+                            .fixedSize()
+                    }
+                    .padding(.vertical, 5)
+                    .padding(.trailing, 4)
+                    .frame(minWidth: 34, maxWidth: artistCap, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .layoutPriority(1)
+                .accessibilityLabel("搜索歌手 \(singleArtist)")
+
+                if plan.showAlbum && !trimmedAlbum.isEmpty {
+                    Text(" · \(trimmedAlbum)")
+                        .font(.system(size: 14))
+                        .foregroundColor(.white.opacity(0.52))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+        } else if plan.showCompactSummaryOnly {
+            Button {
+                onOpenArtistPicker(artists)
+            } label: {
+                HStack(spacing: 3) {
+                    Text("共 \(artists.count) 位歌手")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.92))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundColor(.white.opacity(0.72))
+                        .fixedSize()
+                }
+                .padding(.leading, 10)
+                .padding(.trailing, 7)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.16))
+                .clipShape(Capsule())
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("查看全部 \(artists.count) 位歌手")
+        } else {
+            let visibleArtists = Array(artists.prefix(plan.visibleCount))
+            HStack(spacing: 6) {
+                ForEach(visibleArtists, id: \.self) { artistName in
+                    let isTruncatedFirst = plan.truncateSingleVisibleArtist && artistName == visibleArtists.first
+                    Button {
+                        onArtistClick(artistName)
+                    } label: {
+                        Text(artistName)
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundColor(.white.opacity(0.90))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3.5)
+                            .frame(minWidth: 34)
+                            .background(Color.white.opacity(0.10))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .padding(.vertical, 3)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .layoutPriority(isTruncatedFirst ? 0 : 1)
+                    .accessibilityLabel("搜索歌手 \(artistName)")
+                }
+
+                if plan.hiddenCount > 0 {
+                    Button {
+                        onOpenArtistPicker(artists)
+                    } label: {
+                        HStack(spacing: 2) {
+                            Text("+\(plan.hiddenCount)")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.92))
+                                .lineLimit(1)
+                                .fixedSize()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9.5, weight: .bold))
+                                .foregroundColor(.white.opacity(0.72))
+                                .fixedSize()
+                        }
+                        .padding(.leading, 10)
+                        .padding(.trailing, 6)
+                        .padding(.vertical, 4)
+                        .background(Color.white.opacity(0.17))
+                        .clipShape(Capsule())
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .layoutPriority(2)
+                    .accessibilityLabel("展开查看全部 \(artists.count) 位歌手")
+                } else if plan.showAlbum && !trimmedAlbum.isEmpty {
+                    Text("· \(trimmedAlbum)")
+                        .font(.system(size: 14))
+                        .foregroundColor(.white.opacity(0.52))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+        }
+    }
+}
+
+private struct ArtistPickerSheetView: View {
+    let data: ArtistPickerData
+    let onSelectArtist: (String) -> Void
+
+    @Environment(\.lxPalette) private var lx
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("选择歌手搜索")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundColor(lx.textPrimary)
+                    Text(data.album.isEmpty ? "《\(data.trackTitle)》" : "《\(data.trackTitle)》 · \(data.album)")
+                        .font(.system(size: 13))
+                        .foregroundColor(lx.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                Text("共 \(data.artists.count) 位")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(lx.accent)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(lx.accentSoft)
+                    .clipShape(Capsule())
+                    .layoutPriority(1)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+
+            Divider().overlay(lx.hairline)
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(data.artists.enumerated()), id: \.offset) { _, artistName in
+                        Button {
+                            onSelectArtist(artistName)
+                        } label: {
+                            HStack(spacing: 13) {
+                                ZStack {
+                                    Circle()
+                                        .fill(lx.accentSoft)
+                                        .frame(width: 36, height: 36)
+                                    Image(systemName: "person.fill")
+                                        .font(.system(size: 15, weight: .medium))
+                                        .foregroundColor(lx.accent)
+                                }
+                                Text(artistName)
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundColor(lx.textPrimary)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Image(systemName: "magnifyingglass")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundColor(lx.textTertiary)
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 11)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("搜索歌手 \(artistName)")
+                    }
+                }
+                .padding(.bottom, 24)
+            }
+        }
+        .background(lx.surfaceElevated.ignoresSafeArea())
     }
 }

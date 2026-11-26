@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Explore
@@ -57,6 +58,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,6 +71,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -79,6 +83,7 @@ import com.lxpure.music.core.update.AppUpdateState
 import com.lxpure.music.data.repository.CreatePlaylistResult
 import com.lxpure.music.data.repository.LibraryRepository
 import com.lxpure.music.domain.model.AppSettings
+import com.lxpure.music.domain.model.ArtistParser
 import com.lxpure.music.domain.model.DownloadStatus
 import com.lxpure.music.domain.model.LeaderboardItem
 import com.lxpure.music.domain.model.OnlinePlaylist
@@ -99,6 +104,7 @@ import com.lxpure.music.ui.library.LibraryCollectionType
 import com.lxpure.music.ui.library.LibraryScreen
 import com.lxpure.music.ui.player.FullPlayerScreen
 import com.lxpure.music.ui.player.QueueBottomSheet
+import com.lxpure.music.ui.search.PendingSearchRequest
 import com.lxpure.music.ui.search.SearchScreen
 import com.lxpure.music.ui.settings.SettingsScreen
 import com.lxpure.music.ui.settings.SourceManagerScreen
@@ -152,6 +158,8 @@ class MainActivity : ComponentActivity() {
 private fun LxPureRoot(container: AppContainer) {
     val context = LocalContext.current
     val view = LocalView.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -179,6 +187,8 @@ private fun LxPureRoot(container: AppContainer) {
     var cacheBytes by remember { mutableStateOf(0L) }
     var pendingInstallApkFile by remember { mutableStateOf<File?>(null) }
     var autoLaunchedApkPath by remember { mutableStateOf<String?>(null) }
+    var pendingSearchRequest by remember { mutableStateOf<PendingSearchRequest?>(null) }
+    var searchRequestSeq by remember { mutableLongStateOf(0L) }
 
     val hasReadySource = remember(sources) {
         sources.any { it.enabled && it.status == UserApiRuntimeStatus.READY }
@@ -328,6 +338,19 @@ private fun LxPureRoot(container: AppContainer) {
         }
     }
 
+    fun navigateToArtistSearch(artistName: String) {
+        val trimmed = artistName.trim()
+        if (trimmed.isEmpty() || ArtistParser.isUnknownPlaceholder(trimmed)) return
+        isPlayerExpanded = false
+        showQueueSheet = false
+        actionSheetTrack = null
+        addToPlaylistTrack = null
+        backStack.clear()
+        activeTab = BottomTab.SEARCH
+        val nextId = ++searchRequestSeq
+        pendingSearchRequest = PendingSearchRequest(id = nextId, query = trimmed)
+    }
+
     fun triggerLocalScan() {
         val granted = ContextCompat.checkSelfPermission(context, audioPermission) == PackageManager.PERMISSION_GRANTED
         if (granted) {
@@ -419,6 +442,19 @@ private fun LxPureRoot(container: AppContainer) {
             if (!hasCurrentTrack) {
                 isPlayerExpanded = false
                 showQueueSheet = false
+            }
+        }
+
+        LaunchedEffect(isPlayerExpanded) {
+            if (isPlayerExpanded) {
+                focusManager.clearFocus(force = true)
+                keyboardController?.hide()
+            }
+        }
+
+        LaunchedEffect(activeTab, backStack.size) {
+            if (activeTab != BottomTab.SEARCH || backStack.isNotEmpty()) {
+                pendingSearchRequest = null
             }
         }
 
@@ -532,6 +568,12 @@ private fun LxPureRoot(container: AppContainer) {
                         currentTrackId = playerState.currentTrack?.id,
                         isPlaying = playerState.isPlaying,
                         bottomPadding = contentBottomPadding,
+                        pendingSearchRequest = pendingSearchRequest,
+                        onConsumeSearchRequest = { consumedId ->
+                            if (pendingSearchRequest?.id == consumedId) {
+                                pendingSearchRequest = null
+                            }
+                        },
                         onSaveSearchQuery = { q -> scope.launch { container.libraryRepository.saveSearchQuery(q) } },
                         onClearSearchHistory = { scope.launch { container.libraryRepository.clearSearchHistory() } },
                         onPlayTracks = { list, idx ->
@@ -833,15 +875,36 @@ private fun LxPureRoot(container: AppContainer) {
                 }
             }
 
-            // Bottom Floating Stack with soft vertical scrim to eliminate text bleed-through between capsules
+            // Bottom Floating Stack: Snackbar sits cleanly above the scrim dock (0dp when idle) so it
+            // neither adds idle dead space nor pulls the vertical scrim behind the floating toast.
             val hasBottomDock = hasCurrentTrack || showBottomNav
-            Box(
+            Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .then(
-                        if (hasBottomDock) {
-                            Modifier.background(
+            ) {
+                if (!isPlayerExpanded || !hasCurrentTrack) {
+                    SnackbarHost(
+                        hostState = snackbarHostState,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(if (!hasBottomDock) Modifier.navigationBarsPadding() else Modifier)
+                    ) { data ->
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 6.dp)
+                        ) {
+                            MinimalGlassSnackbar(data = data)
+                        }
+                    }
+                }
+
+                if (hasBottomDock) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
                                 Brush.verticalGradient(
                                     colorStops = arrayOf(
                                         0.0f to Color.Transparent,
@@ -851,34 +914,28 @@ private fun LxPureRoot(container: AppContainer) {
                                     )
                                 )
                             )
-                        } else {
-                            Modifier
+                            .navigationBarsPadding()
+                    ) {
+                        Spacer(Modifier.height(8.dp))
+
+                        if (hasCurrentTrack) {
+                            FloatingMiniPlayer(
+                                state = playerState,
+                                progressFlow = container.playerController.progress,
+                                onExpand = { isPlayerExpanded = true },
+                                onTogglePlayPause = { container.playerController.togglePlayPause() },
+                                onNext = { container.playerController.next() },
+                                onPrevious = { container.playerController.previous() },
+                                onOpenQueue = { showQueueSheet = true }
+                            )
                         }
-                    )
-                    .navigationBarsPadding()
-            ) {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    if (hasBottomDock) {
-                        Spacer(Modifier.height(10.dp))
-                    }
 
-                    if (hasCurrentTrack) {
-                        FloatingMiniPlayer(
-                            state = playerState,
-                            progressFlow = container.playerController.progress,
-                            onExpand = { isPlayerExpanded = true },
-                            onTogglePlayPause = { container.playerController.togglePlayPause() },
-                            onNext = { container.playerController.next() },
-                            onPrevious = { container.playerController.previous() },
-                            onOpenQueue = { showQueueSheet = true }
-                        )
-                    }
-
-                    if (showBottomNav) {
-                        MinimalBottomBar(
-                            activeTab = activeTab,
-                            onSelect = { activeTab = it }
-                        )
+                        if (showBottomNav) {
+                            MinimalBottomBar(
+                                activeTab = activeTab,
+                                onSelect = { activeTab = it }
+                            )
+                        }
                     }
                 }
             }
@@ -918,36 +975,48 @@ private fun LxPureRoot(container: AppContainer) {
                                 showToast(if (liked) "已添加到我喜欢" else "已取消喜欢")
                             }
                         },
-                        onAddToPlaylist = { track -> addToPlaylistTrack = track },
+                        onAddToPlaylist = { track ->
+                            if (isPlayerExpanded) addToPlaylistTrack = track
+                        },
                         onDownload = { track -> triggerTrackDownload(track) },
-                        onOpenQueue = { showQueueSheet = true },
+                        onOpenQueue = {
+                            if (isPlayerExpanded) showQueueSheet = true
+                        },
                         onSelectQuality = { q ->
                             scope.launch { container.settingsDataStore.setPreferredQuality(q) }
                             container.playerController.retryWithQuality(q)
                         },
                         onSetSleepTimer = { mins ->
                             container.playerController.setSleepTimerMinutes(mins)
+                        },
+                        isExpanded = isPlayerExpanded,
+                        onArtistClick = { artistName ->
+                            if (isPlayerExpanded) {
+                                navigateToArtistSearch(artistName)
+                            }
                         }
                     )
+                    if (!isPlayerExpanded) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(Unit) {}
+                        )
+                    }
                 }
             }
 
-            // Single root SnackbarHost eliminates dual-mount clashes during FullPlayer expand/collapse animations
-            val snackbarBottomOffset = when {
-                isPlayerExpanded && hasCurrentTrack -> 82.dp
-                showBottomNav && hasCurrentTrack -> 152.dp
-                showBottomNav -> 84.dp
-                hasCurrentTrack -> 84.dp
-                else -> 16.dp
-            }
-            SnackbarHost(
-                hostState = snackbarHostState,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .navigationBarsPadding()
-                    .padding(start = 16.dp, end = 16.dp, bottom = snackbarBottomOffset)
-            ) { data ->
-                MinimalGlassSnackbar(data = data)
+            // Expanded FullPlayer Snackbar sits cleanly below the top header bar so it never obstructs transport controls
+            if (isPlayerExpanded && hasCurrentTrack) {
+                SnackbarHost(
+                    hostState = snackbarHostState,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .statusBarsPadding()
+                        .padding(start = 16.dp, end = 16.dp, top = 74.dp)
+                ) { data ->
+                    MinimalGlassSnackbar(data = data)
+                }
             }
         }
 
@@ -958,11 +1027,7 @@ private fun LxPureRoot(container: AppContainer) {
                 forceDarkStatusBar = isPlayerExpanded,
                 onDismiss = { showQueueSheet = false },
                 onSelectIndex = { idx ->
-                    container.playerController.playTracks(
-                        tracks = playerState.queue,
-                        startIndex = idx,
-                        queueSource = playerState.queueSource
-                    )
+                    container.playerController.selectQueueIndex(idx)
                     showQueueSheet = false
                 },
                 onRemoveIndex = { idx ->

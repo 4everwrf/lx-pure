@@ -29,10 +29,10 @@ final class AppContainer: ObservableObject {
         config.waitsForConnectivity = false
         self.urlSession = URLSession(configuration: config)
 
-        // Configure shared URLCache cap (24MB RAM / 64MB disk)
+        // Configure shared URLCache cap (24MB RAM / 12MB disk, matching Android OkHttp API metadata cache)
         URLCache.shared = URLCache(
             memoryCapacity: 24 * 1024 * 1024,
-            diskCapacity: 64 * 1024 * 1024,
+            diskCapacity: 12 * 1024 * 1024,
             diskPath: "LXPureSharedCache"
         )
 

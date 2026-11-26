@@ -43,7 +43,31 @@ final class MusicAggregator: Sendable {
             return lhs.qualities.count > rhs.qualities.count
         }
         var primary = sorted[0]
-        primary.alternates = Array(sorted.dropFirst())
+        let alternates = Array(sorted.dropFirst())
+        primary.alternates = alternates
+        if primary.artistNames.isEmpty,
+           let resolvedNames = alternates.first(where: { !$0.artistNames.isEmpty })?.artistNames {
+            primary = Track(
+                id: primary.id,
+                title: primary.title,
+                artist: primary.artist,
+                album: primary.album,
+                source: primary.source,
+                songmid: primary.songmid,
+                durationMs: primary.durationMs,
+                coverUrl: primary.coverUrl,
+                albumId: primary.albumId,
+                albumMid: primary.albumMid,
+                hash: primary.hash,
+                strMediaMid: primary.strMediaMid,
+                songId: primary.songId,
+                qualities: primary.qualities,
+                localUri: primary.localUri,
+                cachedFilePath: primary.cachedFilePath,
+                alternates: alternates,
+                artistNames: resolvedNames
+            )
+        }
         return primary
     }
 
@@ -173,10 +197,7 @@ final class MusicAggregator: Sendable {
         let fTitle = Self.normalizeText(track.title)
         guard !fTitle.isEmpty else { return [] }
 
-        let primaryArtist = track.artist
-            .components(separatedBy: Self.artistSeparators)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty && $0 != "未知歌手" } ?? ""
+        let primaryArtist = ArtistParser.extractArtists(from: track).first ?? ""
         let query = "\(track.title) \(primaryArtist)".trimmingCharacters(in: .whitespacesAndNewlines)
 
         let candidates: [Track] = await withTaskGroup(of: [Track].self) { group in
@@ -274,10 +295,7 @@ final class MusicAggregator: Sendable {
         }
         if !direct.isEmpty { return direct }
 
-        let primaryArtist = track.artist
-            .components(separatedBy: Self.artistSeparators)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty && $0 != "未知歌手" } ?? ""
+        let primaryArtist = ArtistParser.extractArtists(from: track).first ?? ""
         let query = "\(track.title) \(primaryArtist)".trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return ParsedLyrics() }
 

@@ -10,6 +10,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -48,6 +49,8 @@ import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.SkipNext
+import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material.icons.rounded.VerticalAlignBottom
 import androidx.compose.material.icons.rounded.VerticalAlignTop
 import androidx.compose.material3.AlertDialog
@@ -80,6 +83,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -87,6 +91,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -99,6 +106,7 @@ import coil.request.ImageRequest
 import coil.size.Precision
 import com.lxpure.music.core.player.PlaybackProgress
 import com.lxpure.music.core.player.PlayerState
+import com.lxpure.music.domain.model.RepeatMode as PlayerRepeatMode
 import com.lxpure.music.domain.model.Track
 import com.lxpure.music.domain.model.UserPlaylist
 import com.lxpure.music.ui.theme.LocalLxColors
@@ -450,15 +458,20 @@ fun FloatingMiniPlayer(
 ) {
     val track = state.currentTrack ?: return
     val lxColors = LocalLxColors.current
+    val density = LocalDensity.current
+    val swipeTriggerPx = remember(density) { with(density) { 54.dp.toPx() } }
+    val swipeClampPx = remember(density) { with(density) { 52.dp.toPx() } }
     val liveProgress by progressFlow.collectAsState()
-    var dragOffset by remember { mutableFloatStateOf(0f) }
+    var rawDragPx by remember { mutableFloatStateOf(0f) }
+    var visualDragOffset by remember { mutableFloatStateOf(0f) }
     LaunchedEffect(track.id) {
-        dragOffset = 0f
+        rawDragPx = 0f
+        visualDragOffset = 0f
     }
     val currentOnNext by rememberUpdatedState(onNext)
     val currentOnPrevious by rememberUpdatedState(onPrevious)
     val animatedOffset by animateFloatAsState(
-        targetValue = dragOffset,
+        targetValue = visualDragOffset,
         animationSpec = spring(stiffness = 500f, dampingRatio = 0.8f),
         label = "miniSwipe"
     )
@@ -471,25 +484,29 @@ fun FloatingMiniPlayer(
     Surface(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 14.dp, vertical = 6.dp)
-            .offset { IntOffset(animatedOffset.roundToInt(), 0) }
-            .pointerInput(Unit) {
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .pointerInput(swipeTriggerPx, swipeClampPx) {
                 detectHorizontalDragGestures(
                     onDragEnd = {
                         when {
-                            dragOffset < -90f -> currentOnNext()
-                            dragOffset > 90f -> currentOnPrevious()
+                            rawDragPx < -swipeTriggerPx -> currentOnNext()
+                            rawDragPx > swipeTriggerPx -> currentOnPrevious()
                         }
-                        dragOffset = 0f
+                        rawDragPx = 0f
+                        visualDragOffset = 0f
                     },
-                    onDragCancel = { dragOffset = 0f },
-                    onHorizontalDrag = { _, delta ->
-                        dragOffset = (dragOffset + delta * 0.65f).coerceIn(-140f, 140f)
+                    onDragCancel = {
+                        rawDragPx = 0f
+                        visualDragOffset = 0f
+                    },
+                    onHorizontalDrag = { change, delta ->
+                        change.consume()
+                        rawDragPx += delta
+                        visualDragOffset = (rawDragPx * 0.45f).coerceIn(-swipeClampPx, swipeClampPx)
                     }
                 )
             }
-            .clip(RoundedCornerShape(20.dp))
-            .clickable(onClick = onExpand),
+            .graphicsLayer { translationX = animatedOffset },
         shape = RoundedCornerShape(20.dp),
         color = if (lxColors.isDark) Color(0xF2151924) else Color(0xFAFFFFFF),
         border = BorderStroke(0.9.dp, lxColors.hairline),
@@ -499,63 +516,178 @@ fun FloatingMiniPlayer(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 10.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                    .padding(start = 8.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                AlbumArtwork(
-                    url = track.coverUrl,
-                    contentDescription = track.title,
-                    size = 44.dp,
-                    cornerRadius = 12.dp
+                // Dedicated tap zone for expanding the full-screen player (prevents gap fall-through near transport buttons)
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(onClickLabel = "展开播放器", onClick = onExpand)
+                        .padding(end = 6.dp, top = 2.dp, bottom = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    AlbumArtwork(
+                        url = track.coverUrl,
+                        contentDescription = null,
+                        size = 40.dp,
+                        cornerRadius = 10.dp
+                    )
+
+                    Spacer(Modifier.width(9.dp))
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = track.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = lxColors.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(Modifier.height(1.dp))
+                        val activeIdx = remember(state.lyrics, liveProgress.positionMs) {
+                            state.lyrics.activeIndexAt(liveProgress.positionMs)
+                        }
+                        val activeLine = state.lyrics.lines.getOrNull(activeIdx)?.text
+                        Text(
+                            text = if (state.isPlaying && !activeLine.isNullOrBlank()) activeLine else track.artist,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = lxColors.textSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                val boundaryTint = lxColors.textPrimary.copy(alpha = if (lxColors.isDark) 0.36f else 0.45f)
+                val playButtonBg = if (lxColors.isDark) {
+                    Color.White.copy(alpha = 0.11f)
+                } else {
+                    lxColors.accentSoft
+                }
+                val playButtonBorder = if (lxColors.isDark) {
+                    lxColors.hairline
+                } else {
+                    lxColors.accent.copy(alpha = 0.22f)
+                }
+                val dividerColor = if (lxColors.isDark) {
+                    lxColors.hairline
+                } else {
+                    lxColors.textPrimary.copy(alpha = 0.14f)
+                }
+                val nextA11yLabel = when {
+                    state.canSkipNext -> "下一首"
+                    state.repeatMode == PlayerRepeatMode.SEQUENTIAL -> "下一首（已到队列末尾）"
+                    else -> "下一首（重新播放当前曲目）"
+                }
+
+                // Previous Track
+                Box(
+                    modifier = Modifier
+                        .size(width = 32.dp, height = 44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .semantics {
+                            contentDescription = if (state.canSkipPrevious) "上一首" else "上一首（重新播放当前曲目）"
+                        }
+                        .clickable(role = Role.Button, onClick = onPrevious),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.SkipPrevious,
+                        contentDescription = null,
+                        tint = if (state.canSkipPrevious) lxColors.textPrimary else boundaryTint,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+
+                Spacer(Modifier.width(2.dp))
+
+                // Play / Pause focal circular control (44dp vertical hit area wrapping 36dp visual circle)
+                Box(
+                    modifier = Modifier
+                        .size(width = 36.dp, height = 44.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .semantics {
+                            contentDescription = when {
+                                state.isBuffering -> "正在缓冲，点击暂停"
+                                state.isPlaying -> "暂停"
+                                else -> "播放"
+                            }
+                        }
+                        .clickable(role = Role.Button, onClick = onTogglePlayPause),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(playButtonBg)
+                            .border(0.6.dp, playButtonBorder, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (state.isBuffering) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = lxColors.accent
+                            )
+                        } else {
+                            Icon(
+                                imageVector = if (state.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                contentDescription = null,
+                                tint = if (lxColors.isDark) lxColors.textPrimary else lxColors.accent,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.width(2.dp))
+
+                // Next Track
+                Box(
+                    modifier = Modifier
+                        .size(width = 32.dp, height = 44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .semantics { contentDescription = nextA11yLabel }
+                        .clickable(role = Role.Button, onClick = onNext),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.SkipNext,
+                        contentDescription = null,
+                        tint = if (state.canSkipNext) lxColors.textPrimary else boundaryTint,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+
+                Spacer(Modifier.width(3.dp))
+
+                // Subtle divider separating transport controls from queue list
+                Box(
+                    modifier = Modifier
+                        .width(0.8.dp)
+                        .height(16.dp)
+                        .background(dividerColor)
                 )
 
-                Spacer(Modifier.width(12.dp))
+                Spacer(Modifier.width(2.dp))
 
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = track.title,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = lxColors.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(Modifier.height(1.dp))
-                    val activeIdx = remember(state.lyrics, liveProgress.positionMs) {
-                        state.lyrics.activeIndexAt(liveProgress.positionMs)
-                    }
-                    val activeLine = state.lyrics.lines.getOrNull(activeIdx)?.text
-                    Text(
-                        text = if (state.isPlaying && !activeLine.isNullOrBlank()) activeLine else track.artist,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = lxColors.textSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                IconButton(onClick = onTogglePlayPause) {
-                    if (state.isBuffering) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            strokeWidth = 2.dp,
-                            color = lxColors.accent
-                        )
-                    } else {
-                        Icon(
-                            imageVector = if (state.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                            contentDescription = if (state.isPlaying) "暂停" else "播放",
-                            tint = lxColors.textPrimary,
-                            modifier = Modifier.size(26.dp)
-                        )
-                    }
-                }
-
-                IconButton(onClick = onOpenQueue) {
+                // Playback Queue
+                Box(
+                    modifier = Modifier
+                        .size(width = 32.dp, height = 44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .semantics { contentDescription = "播放队列" }
+                        .clickable(role = Role.Button, onClick = onOpenQueue),
+                    contentAlignment = Alignment.Center
+                ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Rounded.QueueMusic,
-                        contentDescription = "播放队列",
+                        contentDescription = null,
                         tint = lxColors.textSecondary,
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
             }

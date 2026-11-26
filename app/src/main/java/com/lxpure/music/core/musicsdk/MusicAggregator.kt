@@ -1,5 +1,6 @@
 package com.lxpure.music.core.musicsdk
 
+import com.lxpure.music.domain.model.ArtistParser
 import com.lxpure.music.domain.model.LeaderboardItem
 import com.lxpure.music.domain.model.MusicSource
 import com.lxpure.music.domain.model.OnlinePlaylist
@@ -45,7 +46,11 @@ class MusicAggregator(httpClient: OkHttpClient) {
                     .thenByDescending { it.qualities.size }
             )
             val primary = sorted.first()
-            return primary.copy(alternates = sorted.drop(1))
+            val alternates = sorted.drop(1)
+            val resolvedArtistNames = primary.artistNames.ifEmpty {
+                alternates.firstOrNull { it.artistNames.isNotEmpty() }?.artistNames.orEmpty()
+            }
+            return primary.copy(alternates = alternates, artistNames = resolvedArtistNames)
         }
 
         internal fun normalizeText(str: String): String =
@@ -159,10 +164,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
         val fTitle = normalizeText(track.title)
         if (fTitle.isEmpty()) return@coroutineScope emptyList()
 
-        val primaryArtist = track.artist.split(artistSplitRegex)
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() && it != "未知歌手" }
-            .orEmpty()
+        val primaryArtist = ArtistParser.extractArtists(track).firstOrNull().orEmpty()
         val query = "${track.title} $primaryArtist".trim()
 
         val candidates = targetPlatforms.map { platform ->
@@ -240,10 +242,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
         if (!direct.isEmpty) return direct
 
         // Fallback lyric lookup via NetEase search (guarded by title/artist/duration match)
-        val primaryArtist = track.artist.split(artistSplitRegex)
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() && it != "未知歌手" }
-            .orEmpty()
+        val primaryArtist = ArtistParser.extractArtists(track).firstOrNull().orEmpty()
         val query = "${track.title} $primaryArtist".trim()
         if (query.isEmpty()) return ParsedLyrics()
 

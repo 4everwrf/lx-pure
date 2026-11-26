@@ -67,7 +67,8 @@ data class Track(
     val qualities: List<QualityInfo> = emptyList(),
     val localUri: String? = null,
     val cachedFilePath: String? = null,
-    @Transient val alternates: List<Track> = emptyList()
+    @Transient val alternates: List<Track> = emptyList(),
+    val artistNames: List<String> = emptyList()
 ) {
     val isLocal: Boolean get() = source == MusicSource.LOCAL || !localUri.isNullOrBlank()
 
@@ -239,11 +240,13 @@ data class ParsedLyrics(
 
 enum class RepeatMode(val label: String) {
     LIST_LOOP("列表循环"),
+    SEQUENTIAL("顺序播放"),
     SHUFFLE("随机播放"),
     SINGLE_LOOP("单曲循环");
 
     fun next(): RepeatMode = when (this) {
-        LIST_LOOP -> SHUFFLE
+        LIST_LOOP -> SEQUENTIAL
+        SEQUENTIAL -> SHUFFLE
         SHUFFLE -> SINGLE_LOOP
         SINGLE_LOOP -> LIST_LOOP
     }

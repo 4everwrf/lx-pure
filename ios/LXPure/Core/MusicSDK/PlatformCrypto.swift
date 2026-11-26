@@ -143,7 +143,7 @@ enum FormatUtils {
                 } else if decRange.location != NSNotFound {
                     codePoint = UInt32(nsText.substring(with: decRange), radix: 10)
                 }
-                if let cp = codePoint, let scalar = UnicodeScalar(cp) {
+                if let cp = codePoint, cp >= 1, let scalar = UnicodeScalar(cp) {
                     mutable.replaceCharacters(in: match.range, with: String(scalar))
                 }
             }

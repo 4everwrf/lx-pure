@@ -32,8 +32,10 @@ final class KugouProvider: Sendable {
             let suffix = FormatUtils.decodeHtml(JsonSafe.asString(obj["Suffix"]))
             let title = suffix.isEmpty ? baseName : "\(baseName) \(suffix)"
 
-            let singersList = (JsonSafe.asArray(obj["Singers"]) ?? []).compactMap {
-                JsonSafe.asNonBlankString(JsonSafe.asObject($0)?["name"]).map { FormatUtils.decodeHtml($0) }
+            let singersList = (JsonSafe.asArray(obj["Singers"]) ?? []).compactMap { el -> String? in
+                guard let rawName = JsonSafe.asNonBlankString(JsonSafe.asObject(el)?["name"]) else { return nil }
+                let decoded = FormatUtils.decodeHtml(rawName).trimmingCharacters(in: .whitespacesAndNewlines)
+                return decoded.isEmpty ? nil : decoded
             }
             var artist = singersList.joined(separator: " / ")
             if artist.isEmpty { artist = FormatUtils.decodeHtml(JsonSafe.asString(obj["SingerName"])) }
@@ -68,7 +70,8 @@ final class KugouProvider: Sendable {
                 coverUrl: img,
                 albumId: JsonSafe.asString(obj["AlbumID"]),
                 hash: hash,
-                qualities: qualities
+                qualities: qualities,
+                artistNames: singersList
             )
         }
     }

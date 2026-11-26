@@ -319,7 +319,7 @@ final class NetEaseProvider: Sendable {
         }
 
         let artistsList = (JsonSafe.asArray(item["ar"]) ?? []).compactMap { el -> String? in
-            JsonSafe.asString(JsonSafe.asObject(el)?["name"])
+            JsonSafe.asNonBlankString(JsonSafe.asObject(el)?["name"])
         }
         let artist = artistsList.isEmpty ? "未知歌手" : artistsList.joined(separator: " / ")
 
@@ -375,7 +375,8 @@ final class NetEaseProvider: Sendable {
             durationMs: durationMs,
             coverUrl: coverUrl,
             albumId: albumId,
-            qualities: qualities
+            qualities: qualities,
+            artistNames: artistsList
         )
     }
 

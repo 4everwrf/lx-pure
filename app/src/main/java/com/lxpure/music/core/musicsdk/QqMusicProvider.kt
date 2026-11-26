@@ -344,9 +344,13 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
         val title = FormatUtils.decodeHtml(item["title"].asNonBlankStringOrNull() ?: item["name"].asNonBlankStringOrNull())
             .ifBlank { return null }
         val singers = item["singer"].asJsonArrayOrNull()
-        val artist = singers?.mapNotNull { it.asJsonObjectOrNull()?.get("name").asStringOrNull() }
-            ?.joinToString(" / ")
-            .orEmpty()
+        val artistList = singers?.mapNotNull {
+            it.asJsonObjectOrNull()?.get("name").asNonBlankStringOrNull()
+                ?.let { rawName -> FormatUtils.decodeHtml(rawName).trim() }
+                ?.takeIf { cleaned -> cleaned.isNotEmpty() }
+        }.orEmpty()
+        val artist = artistList
+            .joinToString(" / ")
             .ifBlank { "未知歌手" }
         val albumObj = item["album"].asJsonObjectOrNull()
         val albumName = FormatUtils.decodeHtml(albumObj?.get("name").asStringOrNull())
@@ -382,7 +386,8 @@ class QqMusicProvider(private val httpClient: OkHttpClient) {
             albumMid = albumMid,
             strMediaMid = mediaMid,
             songId = item["id"].asStringOrNull(),
-            qualities = qualities
+            qualities = qualities,
+            artistNames = artistList
         )
     }
 }

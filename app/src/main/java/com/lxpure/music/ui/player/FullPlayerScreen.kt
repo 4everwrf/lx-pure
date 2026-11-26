@@ -22,15 +22,18 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -38,9 +41,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
+import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Download
@@ -51,9 +56,11 @@ import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.RepeatOne
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
@@ -68,7 +75,9 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -94,14 +103,23 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lxpure.music.core.player.PlaybackProgress
 import com.lxpure.music.core.player.PlayerState
+import com.lxpure.music.domain.model.ArtistParser
+import com.lxpure.music.domain.model.ArtistRowLayoutPlanner
 import com.lxpure.music.domain.model.AudioQuality
+import kotlin.math.ceil
 import com.lxpure.music.domain.model.DownloadRecord
 import com.lxpure.music.domain.model.DownloadStatus
 import com.lxpure.music.domain.model.PlaybackQueueSource
@@ -113,6 +131,13 @@ import com.lxpure.music.ui.components.MiniEqualizerIndicator
 import com.lxpure.music.ui.components.SyncDialogSystemBars
 import com.lxpure.music.ui.theme.FluidAmbientBackground
 import com.lxpure.music.ui.theme.LocalLxColors
+
+@Immutable
+private data class ArtistPickerData(
+    val trackTitle: String,
+    val album: String,
+    val artists: List<String>
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -135,7 +160,9 @@ fun FullPlayerScreen(
     onDownload: (Track) -> Unit,
     onOpenQueue: () -> Unit,
     onSelectQuality: (AudioQuality) -> Unit,
-    onSetSleepTimer: (Int?) -> Unit
+    onSetSleepTimer: (Int?) -> Unit,
+    isExpanded: Boolean = true,
+    onArtistClick: (String) -> Unit = {}
 ) {
     val track = state.currentTrack ?: return
     val liveProgress by progressFlow.collectAsState()
@@ -147,6 +174,15 @@ fun FullPlayerScreen(
     var showTranslation by remember(showTranslationDefault) { mutableStateOf(showTranslationDefault) }
     var showQualitySheet by remember { mutableStateOf(false) }
     var showSleepSheet by remember { mutableStateOf(false) }
+    var artistPickerData by remember { mutableStateOf<ArtistPickerData?>(null) }
+
+    LaunchedEffect(isExpanded) {
+        if (!isExpanded) {
+            artistPickerData = null
+            showQualitySheet = false
+            showSleepSheet = false
+        }
+    }
 
     var isDraggingSlider by remember { mutableStateOf(false) }
     var sliderDragMs by remember { mutableFloatStateOf(0f) }
@@ -370,16 +406,24 @@ fun FullPlayerScreen(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(Modifier.height(3.dp))
-                    Text(
-                        text = buildString {
-                            append(track.artist)
-                            if (track.album.isNotBlank()) append(" · ${track.album}")
-                        },
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = Color.White.copy(alpha = 0.68f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                    Spacer(Modifier.height(4.dp))
+                    val handleOpenArtistPicker = remember(track.title, track.album, isExpanded) {
+                        { parsedArtists: List<String> ->
+                            if (isExpanded) {
+                                artistPickerData = ArtistPickerData(
+                                    trackTitle = track.title,
+                                    album = track.album.replace(Regex("[\\r\\n]+"), " ").trim(),
+                                    artists = parsedArtists
+                                )
+                            }
+                        }
+                    }
+                    PlayerArtistAlbumRow(
+                        rawArtist = track.artist,
+                        structuredArtists = track.artistNames,
+                        album = track.album,
+                        onArtistClick = onArtistClick,
+                        onOpenArtistPicker = handleOpenArtistPicker
                     )
                 }
 
@@ -458,9 +502,16 @@ fun FullPlayerScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
+                val nextA11yLabel = when {
+                    state.canSkipNext -> "下一首"
+                    state.repeatMode == RepeatMode.SEQUENTIAL -> "下一首（已到队列末尾）"
+                    else -> "下一首（重新播放当前曲目）"
+                }
+
                 IconButton(onClick = onCycleRepeat) {
                     val modeIcon = when (state.repeatMode) {
                         RepeatMode.LIST_LOOP -> Icons.Rounded.Repeat
+                        RepeatMode.SEQUENTIAL -> Icons.AutoMirrored.Rounded.PlaylistPlay
                         RepeatMode.SHUFFLE -> Icons.Rounded.Shuffle
                         RepeatMode.SINGLE_LOOP -> Icons.Rounded.RepeatOne
                     }
@@ -472,12 +523,12 @@ fun FullPlayerScreen(
                     )
                 }
 
-                IconButton(onClick = onPrevious, modifier = Modifier.size(54.dp)) {
+                IconButton(onClick = onPrevious, modifier = Modifier.size(50.dp)) {
                     Icon(
                         imageVector = Icons.Rounded.SkipPrevious,
-                        contentDescription = "上一首",
-                        tint = Color.White,
-                        modifier = Modifier.size(38.dp)
+                        contentDescription = if (state.canSkipPrevious) "上一首" else "上一首（重新播放当前曲目）",
+                        tint = if (state.canSkipPrevious) Color.White else Color.White.copy(alpha = 0.44f),
+                        modifier = Modifier.size(36.dp)
                     )
                 }
 
@@ -486,7 +537,15 @@ fun FullPlayerScreen(
                     shape = CircleShape,
                     color = Color.White,
                     contentColor = Color(0xFF0A0B0F),
-                    modifier = Modifier.size(68.dp),
+                    modifier = Modifier
+                        .size(66.dp)
+                        .semantics {
+                            contentDescription = when {
+                                state.isBuffering -> "正在缓冲，点击暂停"
+                                state.isPlaying -> "暂停"
+                                else -> "播放"
+                            }
+                        },
                     shadowElevation = 10.dp
                 ) {
                     Box(contentAlignment = Alignment.Center) {
@@ -499,19 +558,19 @@ fun FullPlayerScreen(
                         } else {
                             Icon(
                                 imageVector = if (state.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                contentDescription = if (state.isPlaying) "暂停" else "播放",
+                                contentDescription = null,
                                 modifier = Modifier.size(36.dp)
                             )
                         }
                     }
                 }
 
-                IconButton(onClick = onNext, modifier = Modifier.size(54.dp)) {
+                IconButton(onClick = onNext, modifier = Modifier.size(50.dp)) {
                     Icon(
                         imageVector = Icons.Rounded.SkipNext,
-                        contentDescription = "下一首",
-                        tint = Color.White,
-                        modifier = Modifier.size(38.dp)
+                        contentDescription = nextA11yLabel,
+                        tint = if (state.canSkipNext) Color.White else Color.White.copy(alpha = 0.44f),
+                        modifier = Modifier.size(36.dp)
                     )
                 }
 
@@ -751,6 +810,490 @@ fun FullPlayerScreen(
                             }
                         }
                     }
+            }
+        }
+    }
+
+    artistPickerData?.let { picker ->
+        ArtistPickerBottomSheet(
+            data = picker,
+            onDismiss = { artistPickerData = null },
+            onSelectArtist = { selectedArtist ->
+                artistPickerData = null
+                onArtistClick(selectedArtist)
+            }
+        )
+    }
+}
+
+@Composable
+private fun PlayerArtistAlbumRow(
+    rawArtist: String,
+    structuredArtists: List<String>,
+    album: String,
+    onArtistClick: (String) -> Unit,
+    onOpenArtistPicker: (List<String>) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val artists = remember(rawArtist, structuredArtists) {
+        ArtistParser.extractArtists(rawArtist = rawArtist, structuredArtists = structuredArtists)
+    }
+    val trimmedAlbum = remember(album) {
+        album.replace(Regex("[\\r\\n]+"), " ").trim()
+    }
+
+    if (artists.isEmpty()) {
+        val fallbackArtist = remember(rawArtist) { ArtistParser.fallbackDisplayName(rawArtist) }
+        Box(
+            modifier = modifier
+                .fillMaxWidth()
+                .heightIn(min = 30.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Text(
+                text = if (trimmedAlbum.isNotEmpty()) "$fallbackArtist · $trimmedAlbum" else fallbackArtist,
+                style = MaterialTheme.typography.bodyLarge,
+                color = Color.White.copy(alpha = 0.62f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        return
+    }
+
+    val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val artistStyle = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
+    val chipTextStyle = MaterialTheme.typography.bodyMedium.copy(
+        fontSize = 14.sp,
+        lineHeight = 19.sp,
+        fontWeight = FontWeight.Medium
+    )
+    val albumStyle = MaterialTheme.typography.bodyLarge
+    val badgeStyle = MaterialTheme.typography.labelMedium.copy(
+        fontSize = 12.sp,
+        fontWeight = FontWeight.SemiBold
+    )
+
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 30.dp),
+        contentAlignment = Alignment.CenterStart
+    ) {
+        val maxWidthPx = constraints.maxWidth.toFloat()
+        val singleChevronPx = with(density) { (16.dp + 4.dp).toPx() } + 2f
+        val chipChromePx = with(density) { 16.dp.toPx() } + 2f
+        val minChipPx = with(density) { 34.dp.toPx() }
+        val chipGapPx = with(density) { 6.dp.toPx() }
+        val badgeChromePx = with(density) { (6.dp + 10.dp + 14.dp + 6.dp).toPx() } + 4f
+
+        val albumFullWidthPx = remember(trimmedAlbum, albumStyle, textMeasurer, density.density, density.fontScale) {
+            if (trimmedAlbum.isEmpty()) {
+                0f
+            } else {
+                ceil(
+                    textMeasurer.measure(
+                        text = " · $trimmedAlbum",
+                        style = albumStyle,
+                        maxLines = 1,
+                        softWrap = false
+                    ).size.width.toFloat()
+                ) + 2f
+            }
+        }
+        val minAlbumDisplayPx = remember(albumStyle, textMeasurer, density.density, density.fontScale) {
+            maxOf(
+                ceil(
+                    textMeasurer.measure(
+                        text = " · 专辑…",
+                        style = albumStyle,
+                        maxLines = 1,
+                        softWrap = false
+                    ).size.width.toFloat()
+                ) + 2f,
+                with(density) { 56.dp.toPx() }
+            )
+        }
+        val minTruncatedArtistPx = remember(artists.size, artistStyle, chipTextStyle, textMeasurer, density.density, density.fontScale) {
+            if (artists.size == 1) {
+                maxOf(
+                    ceil(
+                        textMeasurer.measure(
+                            text = "歌手…",
+                            style = artistStyle,
+                            maxLines = 1,
+                            softWrap = false
+                        ).size.width.toFloat()
+                    ) + 2f,
+                    with(density) { 56.dp.toPx() }
+                )
+            } else {
+                maxOf(
+                    ceil(
+                        textMeasurer.measure(
+                            text = "歌手…",
+                            style = chipTextStyle,
+                            maxLines = 1,
+                            softWrap = false
+                        ).size.width.toFloat()
+                    ) + chipChromePx,
+                    with(density) { 64.dp.toPx() }
+                )
+            }
+        }
+
+        val plan = remember(
+            artists,
+            albumFullWidthPx,
+            minAlbumDisplayPx,
+            minTruncatedArtistPx,
+            maxWidthPx,
+            textMeasurer,
+            density.density,
+            density.fontScale,
+            artistStyle,
+            chipTextStyle,
+            badgeStyle
+        ) {
+            ArtistRowLayoutPlanner.plan(
+                artistCount = artists.size,
+                maxWidth = maxWidthPx,
+                artistWidthAt = { index ->
+                    val name = artists[index]
+                    if (artists.size == 1) {
+                        ceil(
+                            textMeasurer.measure(
+                                text = name,
+                                style = artistStyle,
+                                maxLines = 1,
+                                softWrap = false
+                            ).size.width.toFloat()
+                        ) + 2f
+                    } else {
+                        val textW = ceil(
+                            textMeasurer.measure(
+                                text = name,
+                                style = chipTextStyle,
+                                maxLines = 1,
+                                softWrap = false
+                            ).size.width.toFloat()
+                        )
+                        maxOf(textW + chipChromePx, minChipPx)
+                    }
+                },
+                separatorWidth = chipGapPx,
+                singleArtistChevronWidth = singleChevronPx,
+                overflowBadgeWidthForHidden = { hidden ->
+                    val badgeW = ceil(
+                        textMeasurer.measure(
+                            text = "+$hidden",
+                            style = badgeStyle,
+                            maxLines = 1,
+                            softWrap = false
+                        ).size.width.toFloat()
+                    )
+                    badgeW + badgeChromePx
+                },
+                albumFullWidth = albumFullWidthPx,
+                minAlbumDisplayWidth = minAlbumDisplayPx,
+                minTruncatedArtistWidth = minTruncatedArtistPx
+            )
+        }
+
+        if (plan.visibleCount == 0 && !plan.showCompactSummaryOnly) {
+            return@BoxWithConstraints
+        }
+
+        if (artists.size == 1) {
+            val singleArtist = artists[0]
+            val artistMaxWidthModifier = plan.singleArtistMaxWidth?.let { capPx ->
+                Modifier.widthIn(max = with(density) { capPx.toDp() })
+            } ?: Modifier.widthIn(max = maxWidth)
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    modifier = artistMaxWidthModifier
+                        .defaultMinSize(minWidth = 36.dp, minHeight = 30.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .clearAndSetSemantics {
+                            contentDescription = "搜索歌手 $singleArtist"
+                            role = Role.Button
+                        }
+                        .clickable(role = Role.Button) { onArtistClick(singleArtist) }
+                        .padding(end = 4.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = singleArtist,
+                        style = artistStyle,
+                        color = Color.White.copy(alpha = 0.88f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    Icon(
+                        imageVector = Icons.Rounded.ChevronRight,
+                        contentDescription = null,
+                        tint = Color.White.copy(alpha = 0.58f),
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+
+                if (plan.showAlbum && trimmedAlbum.isNotEmpty()) {
+                    Text(
+                        text = " · $trimmedAlbum",
+                        style = albumStyle,
+                        color = Color.White.copy(alpha = 0.52f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                }
+            }
+        } else if (plan.showCompactSummaryOnly) {
+            Surface(
+                shape = RoundedCornerShape(50),
+                color = Color.White.copy(alpha = 0.16f),
+                modifier = Modifier
+                    .heightIn(min = 28.dp)
+                    .clip(RoundedCornerShape(50))
+                    .clearAndSetSemantics {
+                        contentDescription = "查看全部 ${artists.size} 位歌手"
+                        role = Role.Button
+                    }
+                    .clickable(role = Role.Button) { onOpenArtistPicker(artists) }
+            ) {
+                Row(
+                    modifier = Modifier.padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "共 ${artists.size} 位歌手",
+                        style = badgeStyle,
+                        color = Color.White.copy(alpha = 0.92f),
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    Icon(
+                        imageVector = Icons.Rounded.ChevronRight,
+                        contentDescription = null,
+                        tint = Color.White.copy(alpha = 0.72f),
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val visibleArtists = artists.take(plan.visibleCount)
+                visibleArtists.forEachIndexed { idx, artistName ->
+                    if (idx > 0) Spacer(Modifier.width(6.dp))
+                    val chipWeightMod = if (plan.truncateSingleVisibleArtist && idx == 0) {
+                        Modifier.weight(1f, fill = false)
+                    } else {
+                        Modifier
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = Color.White.copy(alpha = 0.10f),
+                        modifier = chipWeightMod
+                            .defaultMinSize(minWidth = 34.dp, minHeight = 28.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clearAndSetSemantics {
+                                contentDescription = "搜索歌手 $artistName"
+                                role = Role.Button
+                            }
+                            .clickable(role = Role.Button) { onArtistClick(artistName) }
+                    ) {
+                        Box(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = artistName,
+                                style = chipTextStyle,
+                                color = Color.White.copy(alpha = 0.90f),
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+
+                if (plan.hiddenCount > 0) {
+                    Spacer(Modifier.width(6.dp))
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = Color.White.copy(alpha = 0.17f),
+                        modifier = Modifier
+                            .heightIn(min = 28.dp)
+                            .clip(RoundedCornerShape(50))
+                            .clearAndSetSemantics {
+                                contentDescription = "展开查看全部 ${artists.size} 位歌手"
+                                role = Role.Button
+                            }
+                            .clickable(role = Role.Button) { onOpenArtistPicker(artists) }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "+${plan.hiddenCount}",
+                                style = badgeStyle,
+                                color = Color.White.copy(alpha = 0.92f),
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                            Icon(
+                                imageVector = Icons.Rounded.ChevronRight,
+                                contentDescription = null,
+                                tint = Color.White.copy(alpha = 0.72f),
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
+                } else if (plan.showAlbum && trimmedAlbum.isNotEmpty()) {
+                    Text(
+                        text = " · $trimmedAlbum",
+                        style = albumStyle,
+                        color = Color.White.copy(alpha = 0.52f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ArtistPickerBottomSheet(
+    data: ArtistPickerData,
+    onDismiss: () -> Unit,
+    onSelectArtist: (String) -> Unit
+) {
+    val lxColors = LocalLxColors.current
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = lxColors.surfaceElevated,
+        contentColor = lxColors.textPrimary
+    ) {
+        SyncDialogSystemBars(
+            useLightStatusBars = false,
+            useLightNavigationBars = !lxColors.isDark
+        )
+        Column(modifier = Modifier.padding(bottom = 28.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "选择歌手搜索",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = lxColors.textPrimary
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = buildString {
+                            append("《${data.trackTitle}》")
+                            if (data.album.isNotEmpty()) append(" · ${data.album}")
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = lxColors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(Modifier.width(10.dp))
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = lxColors.accentSoft
+                ) {
+                    Text(
+                        text = "共 ${data.artists.size} 位",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                        color = lxColors.accent,
+                        maxLines = 1,
+                        softWrap = false,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            HorizontalDivider(
+                modifier = Modifier.padding(top = 6.dp),
+                color = lxColors.hairline
+            )
+
+            LazyColumn(
+                modifier = Modifier.heightIn(max = 420.dp)
+            ) {
+                itemsIndexed(
+                    items = data.artists,
+                    key = { idx, artist -> "${idx}_$artist" }
+                ) { _, artistName ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 54.dp)
+                            .clearAndSetSemantics {
+                                contentDescription = "搜索歌手 $artistName"
+                                role = Role.Button
+                            }
+                            .clickable(role = Role.Button) { onSelectArtist(artistName) }
+                            .padding(horizontal = 20.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(lxColors.accentSoft),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Person,
+                                contentDescription = null,
+                                tint = lxColors.accent,
+                                modifier = Modifier.size(19.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(13.dp))
+                        Text(
+                            text = artistName,
+                            style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium),
+                            color = lxColors.textPrimary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Icon(
+                            imageVector = Icons.Rounded.Search,
+                            contentDescription = null,
+                            tint = lxColors.textTertiary,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    }
+                }
             }
         }
     }
@@ -1000,31 +1543,15 @@ fun QueueBottomSheet(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 6.dp),
+                    .padding(horizontal = 20.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("当前播放队列", style = MaterialTheme.typography.titleLarge)
-                    val subtitle = buildString {
-                        if (!queueSource?.title.isNullOrBlank()) {
-                            append("来自「${queueSource!!.title}」 · ")
-                        }
-                        append("${state.queue.size} 首歌曲 · ${state.repeatMode.label}")
-                    }
-                    Text(
-                        subtitle,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = lxColors.textSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = if (onCycleRepeat != null) {
-                            Modifier.clickable { onCycleRepeat() }
-                        } else {
-                            Modifier
-                        }
-                    )
-                }
+                Text(
+                    text = "当前播放队列",
+                    style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.weight(1f)
+                )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (canJumpToSource) {
                         val targetSource = queueSource!!
@@ -1045,6 +1572,67 @@ fun QueueBottomSheet(
                             Text("清空")
                         }
                     }
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 20.dp, end = 20.dp, bottom = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                val modeIcon = when (state.repeatMode) {
+                    RepeatMode.LIST_LOOP -> Icons.Rounded.Repeat
+                    RepeatMode.SEQUENTIAL -> Icons.AutoMirrored.Rounded.PlaylistPlay
+                    RepeatMode.SHUFFLE -> Icons.Rounded.Shuffle
+                    RepeatMode.SINGLE_LOOP -> Icons.Rounded.RepeatOne
+                }
+                Surface(
+                    shape = RoundedCornerShape(999.dp),
+                    color = lxColors.accentSoft,
+                    modifier = Modifier
+                        .heightIn(min = 34.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .semantics {
+                            contentDescription = "播放模式：${state.repeatMode.label}，共 ${state.queue.size} 首，点击切换"
+                        }
+                        .then(
+                            if (onCycleRepeat != null) {
+                                Modifier.clickable(role = Role.Button, onClick = onCycleRepeat)
+                            } else {
+                                Modifier
+                            }
+                        )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Icon(
+                            imageVector = modeIcon,
+                            contentDescription = null,
+                            tint = lxColors.accent,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "${state.repeatMode.label} (${state.queue.size})",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                            color = lxColors.textPrimary,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
+                }
+                if (!queueSource?.title.isNullOrBlank()) {
+                    Text(
+                        text = "来自「${queueSource!!.title}」",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = lxColors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
                 }
             }
             HorizontalDivider(color = lxColors.hairline)

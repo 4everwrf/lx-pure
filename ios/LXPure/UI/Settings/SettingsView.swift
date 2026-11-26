@@ -201,7 +201,7 @@ struct SettingsView: View {
                                 Text("边听边存与封面缓存")
                                     .font(.system(size: 15, weight: .semibold))
                                     .foregroundColor(lx.textPrimary)
-                                Text("上限 300MB 自动循环淘汰，重听不耗流量 · 点击清理")
+                                Text("音频 300MB + 封面与数据 76MB，自动循环淘汰 · 点击清理")
                                     .font(.system(size: 12))
                                     .foregroundColor(lx.textSecondary)
                             }

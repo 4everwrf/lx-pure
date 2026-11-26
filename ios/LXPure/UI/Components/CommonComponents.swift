@@ -186,6 +186,15 @@ struct TrackListRow: View {
     }
 }
 
+private struct MiniPlayerControlButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.52 : 1.0)
+            .scaleEffect(configuration.isPressed ? 0.90 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
 struct FloatingMiniPlayer: View {
     let state: PlayerState
     @ObservedObject var progress: PlaybackProgressModel
@@ -205,47 +214,109 @@ struct FloatingMiniPlayer: View {
                 ? min(max(Double(progress.positionMs) / Double(effectiveDuration), 0), 1)
                 : 0
 
+            let boundaryTint = lx.textPrimary.opacity(lx.isDark ? 0.36 : 0.45)
+            let playButtonBg = lx.isDark ? Color.white.opacity(0.11) : lx.accentSoft
+            let playButtonBorder = lx.isDark ? lx.hairline : lx.accent.opacity(0.22)
+            let dividerColor = lx.isDark ? lx.hairline : lx.textPrimary.opacity(0.14)
+            let nextA11yLabel: String = {
+                if state.canSkipNext { return "下一首" }
+                return state.repeatMode == .sequential ? "下一首（已到队列末尾）" : "下一首（重新播放当前曲目）"
+            }()
+            let clampedDragOffset = min(max(dragOffsetX * 0.28, -48), 48)
+
             VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    AlbumArtworkView(url: track.coverUrl, size: 42, cornerRadius: 10, isThumbnail: true)
+                HStack(spacing: 0) {
+                    // Dedicated tap zone for expanding FullPlayer (uses onTapGesture so parent highPriorityGesture DragGesture can swipe cleanly)
+                    HStack(spacing: 9) {
+                        AlbumArtworkView(url: track.coverUrl, size: 40, cornerRadius: 10, isThumbnail: true)
+                            .accessibilityHidden(true)
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(track.title)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(lx.textPrimary)
-                            .lineLimit(1)
-                        Text(state.isBuffering ? "正在解析与缓冲..." : track.artist)
-                            .font(.system(size: 12))
-                            .foregroundColor(lx.textSecondary)
-                            .lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Button(action: onTogglePlayPause) {
-                        if state.isBuffering {
-                            ProgressView()
-                                .tint(lx.accent)
-                                .scaleEffect(0.85)
-                                .frame(width: 34, height: 34)
-                        } else {
-                            Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
-                                .font(.system(size: 18, weight: .semibold))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(track.title)
+                                .font(.system(size: 14, weight: .semibold))
                                 .foregroundColor(lx.textPrimary)
-                                .frame(width: 34, height: 34)
+                                .lineLimit(1)
+                            Text(state.isBuffering ? "正在解析与缓冲..." : track.artist)
+                                .font(.system(size: 12))
+                                .foregroundColor(lx.textSecondary)
+                                .lineLimit(1)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .buttonStyle(.plain)
+                    .padding(.trailing, 6)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onTap)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityLabel("\(track.title)，\(track.artist)")
+                    .accessibilityHint("轻点展开全屏播放器")
+
+                    // Compact cohesive transport cluster + hairline + queue
+                    HStack(spacing: 2) {
+                        Button(action: onPrevious) {
+                            Image(systemName: "backward.fill")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(state.canSkipPrevious ? lx.textPrimary : boundaryTint)
+                                .frame(width: 32, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(MiniPlayerControlButtonStyle())
+                        .accessibilityLabel(state.canSkipPrevious ? "上一首" : "上一首（重新播放当前曲目）")
+
+                        Button(action: onTogglePlayPause) {
+                            ZStack {
+                                Circle()
+                                    .fill(playButtonBg)
+                                    .overlay(Circle().stroke(playButtonBorder, lineWidth: 0.6))
+                                    .frame(width: 36, height: 36)
+                                if state.isBuffering {
+                                    ProgressView()
+                                        .tint(lx.accent)
+                                        .scaleEffect(0.78)
+                                } else {
+                                    Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundColor(lx.isDark ? lx.textPrimary : lx.accent)
+                                        .offset(x: state.isPlaying ? 0 : 1)
+                                }
+                            }
+                            .frame(width: 36, height: 44)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(MiniPlayerControlButtonStyle())
+                        .accessibilityLabel(state.isBuffering ? "正在缓冲，点击暂停" : (state.isPlaying ? "暂停" : "播放"))
+
+                        Button(action: onNext) {
+                            Image(systemName: "forward.fill")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(state.canSkipNext ? lx.textPrimary : boundaryTint)
+                                .frame(width: 32, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(MiniPlayerControlButtonStyle())
+                        .accessibilityLabel(nextA11yLabel)
+                    }
+
+                    Rectangle()
+                        .fill(dividerColor)
+                        .frame(width: 0.8, height: 16)
+                        .padding(.leading, 3)
+                        .padding(.trailing, 2)
 
                     Button(action: onOpenQueue) {
                         Image(systemName: "list.bullet")
-                            .font(.system(size: 16, weight: .medium))
+                            .font(.system(size: 15, weight: .medium))
                             .foregroundColor(lx.textSecondary)
-                            .frame(width: 32, height: 32)
+                            .frame(width: 32, height: 44)
+                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(MiniPlayerControlButtonStyle())
+                    .accessibilityLabel("播放队列")
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
+                .padding(.leading, 8)
+                .padding(.trailing, 6)
+                .padding(.vertical, 6)
 
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
@@ -265,12 +336,9 @@ struct FloatingMiniPlayer: View {
                     .stroke(lx.hairline, lineWidth: 0.8)
             )
             .shadow(color: Color.black.opacity(lx.isDark ? 0.35 : 0.10), radius: 12, y: 4)
-            .offset(x: dragOffsetX * 0.28)
-            .animation(.spring(response: 0.3, dampingFraction: 0.78), value: dragOffsetX)
             .contentShape(Rectangle())
-            .onTapGesture(perform: onTap)
-            .gesture(
-                DragGesture(minimumDistance: 16)
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 20, coordinateSpace: CoordinateSpace.global)
                     .updating($dragOffsetX) { value, state, _ in
                         if abs(value.translation.width) > abs(value.translation.height) {
                             state = value.translation.width
@@ -286,7 +354,9 @@ struct FloatingMiniPlayer: View {
                         }
                     }
             )
-            .padding(.horizontal, 14)
+            .offset(x: clampedDragOffset)
+            .animation(.spring(response: 0.3, dampingFraction: 0.78), value: clampedDragOffset)
+            .padding(.horizontal, 12)
         }
     }
 }

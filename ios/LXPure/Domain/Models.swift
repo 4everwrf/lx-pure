@@ -118,11 +118,12 @@ struct Track: Codable, Identifiable, Hashable, Sendable {
     var localUri: String?
     var cachedFilePath: String?
     var alternates: [Track]
+    let artistNames: [String]
 
     enum CodingKeys: String, CodingKey {
         case id, title, artist, album, source, songmid, durationMs
         case coverUrl, albumId, albumMid, hash, strMediaMid, songId
-        case qualities, localUri, cachedFilePath
+        case qualities, localUri, cachedFilePath, artistNames
     }
 
     init(
@@ -142,7 +143,8 @@ struct Track: Codable, Identifiable, Hashable, Sendable {
         qualities: [QualityInfo] = [],
         localUri: String? = nil,
         cachedFilePath: String? = nil,
-        alternates: [Track] = []
+        alternates: [Track] = [],
+        artistNames: [String] = []
     ) {
         self.id = id
         self.title = title
@@ -161,6 +163,7 @@ struct Track: Codable, Identifiable, Hashable, Sendable {
         self.localUri = localUri
         self.cachedFilePath = cachedFilePath
         self.alternates = alternates
+        self.artistNames = artistNames
     }
 
     init(from decoder: Decoder) throws {
@@ -182,12 +185,14 @@ struct Track: Codable, Identifiable, Hashable, Sendable {
         localUri = try c.decodeIfPresent(String.self, forKey: .localUri)
         cachedFilePath = try c.decodeIfPresent(String.self, forKey: .cachedFilePath)
         alternates = []
+        artistNames = try c.decodeIfPresent([String].self, forKey: .artistNames) ?? []
     }
 
     static func == (lhs: Track, rhs: Track) -> Bool {
         lhs.id == rhs.id &&
             lhs.title == rhs.title &&
             lhs.artist == rhs.artist &&
+            lhs.artistNames == rhs.artistNames &&
             lhs.album == rhs.album &&
             lhs.source == rhs.source &&
             lhs.songmid == rhs.songmid &&
@@ -389,12 +394,14 @@ struct ParsedLyrics: Hashable, Sendable {
 
 enum RepeatMode: String, Codable, CaseIterable, Sendable {
     case listLoop
+    case sequential
     case shuffle
     case singleLoop
 
     var label: String {
         switch self {
         case .listLoop: return "列表循环"
+        case .sequential: return "顺序播放"
         case .shuffle: return "随机播放"
         case .singleLoop: return "单曲循环"
         }
@@ -403,14 +410,37 @@ enum RepeatMode: String, Codable, CaseIterable, Sendable {
     var sfSymbol: String {
         switch self {
         case .listLoop: return "repeat"
+        case .sequential: return "arrow.right.to.line"
         case .shuffle: return "shuffle"
         case .singleLoop: return "repeat.1"
         }
     }
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        if let exact = RepeatMode(rawValue: raw) {
+            self = exact
+            return
+        }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "sequential":
+            self = .sequential
+        case "shuffle":
+            self = .shuffle
+        case "singleloop", "single_loop":
+            self = .singleLoop
+        case "listloop", "list_loop":
+            self = .listLoop
+        default:
+            self = .listLoop
+        }
+    }
+
     func next() -> RepeatMode {
         switch self {
-        case .listLoop: return .shuffle
+        case .listLoop: return .sequential
+        case .sequential: return .shuffle
         case .shuffle: return .singleLoop
         case .singleLoop: return .listLoop
         }
@@ -640,6 +670,53 @@ struct PlaybackCursorSnapshot: Codable, Sendable {
     var activeQualityBadge: String? = nil
     var activeProviderName: String? = nil
     var updatedAt: Int64 = 0
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case currentIndex
+        case currentTrackId
+        case positionMs
+        case durationMs
+        case repeatMode
+        case activeQualityBadge
+        case activeProviderName
+        case updatedAt
+    }
+
+    init(
+        version: Int = 1,
+        currentIndex: Int = -1,
+        currentTrackId: String? = nil,
+        positionMs: Int64 = 0,
+        durationMs: Int64 = 0,
+        repeatMode: RepeatMode = .listLoop,
+        activeQualityBadge: String? = nil,
+        activeProviderName: String? = nil,
+        updatedAt: Int64 = 0
+    ) {
+        self.version = version
+        self.currentIndex = currentIndex
+        self.currentTrackId = currentTrackId
+        self.positionMs = positionMs
+        self.durationMs = durationMs
+        self.repeatMode = repeatMode
+        self.activeQualityBadge = activeQualityBadge
+        self.activeProviderName = activeProviderName
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = (try? c.decodeIfPresent(Int.self, forKey: .version)) ?? 1
+        currentIndex = (try? c.decodeIfPresent(Int.self, forKey: .currentIndex)) ?? -1
+        currentTrackId = try? c.decodeIfPresent(String.self, forKey: .currentTrackId)
+        positionMs = (try? c.decodeIfPresent(Int64.self, forKey: .positionMs)) ?? 0
+        durationMs = (try? c.decodeIfPresent(Int64.self, forKey: .durationMs)) ?? 0
+        repeatMode = (try? c.decodeIfPresent(RepeatMode.self, forKey: .repeatMode)) ?? .listLoop
+        activeQualityBadge = try? c.decodeIfPresent(String.self, forKey: .activeQualityBadge)
+        activeProviderName = try? c.decodeIfPresent(String.self, forKey: .activeProviderName)
+        updatedAt = (try? c.decodeIfPresent(Int64.self, forKey: .updatedAt)) ?? 0
+    }
 }
 
 struct PlaylistDetailResult: Sendable {

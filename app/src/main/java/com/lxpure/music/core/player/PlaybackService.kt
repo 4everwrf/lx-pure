@@ -67,10 +67,21 @@ class PlaybackService : MediaSessionService() {
                 mainHandler.post { runRefresh() }
             }
         }
+
+        /**
+         * Propagates updated queue navigation capabilities (canSkipPrevious / canSkipNext / hasQueue)
+         * to MediaSession & system notifications after `_state` commits.
+         */
+        fun refreshAvailableCommands() {
+            mainHandler.post {
+                activeInstance?.notifyAvailableCommandsChanged?.invoke()
+            }
+        }
     }
 
     private var mediaSession: MediaSession? = null
     private var exoPlayerRef: ExoPlayer? = null
+    private var notifyAvailableCommandsChanged: (() -> Unit)? = null
 
     @OptIn(UnstableApi::class)
     override fun onCreate() {
@@ -115,23 +126,67 @@ class PlaybackService : MediaSessionService() {
             .build()
         exoPlayerRef = exoPlayer
 
-        // Bridge system/Bluetooth/Lock-Screen controls directly to our queue controller
+        // Bridge system/Bluetooth/Lock-Screen controls directly to our queue controller and intercept
+        // ExoPlayer's raw onAvailableCommandsChanged so shrinking 2->1 preloaded items never strips Next.
+        val wrappedListeners = java.util.IdentityHashMap<Player.Listener, Player.Listener>()
+        fun computeForwardingCommands(base: Player.Commands): Player.Commands {
+            val pc = app.container.playerController
+            val builder = base.buildUpon()
+            if (pc.hasQueue()) {
+                builder.add(Player.COMMAND_SEEK_TO_PREVIOUS)
+                if (pc.hasPrevious()) {
+                    builder.add(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+                } else {
+                    builder.remove(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+                }
+                if (pc.hasNext()) {
+                    builder.add(Player.COMMAND_SEEK_TO_NEXT)
+                    builder.add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+                } else {
+                    builder.remove(Player.COMMAND_SEEK_TO_NEXT)
+                    builder.remove(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+                }
+            } else {
+                builder.remove(Player.COMMAND_SEEK_TO_PREVIOUS)
+                builder.remove(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+                builder.remove(Player.COMMAND_SEEK_TO_NEXT)
+                builder.remove(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+            }
+            return builder.build()
+        }
+
         val forwardingPlayer = object : ForwardingPlayer(exoPlayer) {
+            override fun addListener(listener: Player.Listener) {
+                val proxy = synchronized(wrappedListeners) {
+                    wrappedListeners.getOrPut(listener) {
+                        object : Player.Listener by listener {
+                            override fun onAvailableCommandsChanged(availableCommands: Player.Commands) {
+                                listener.onAvailableCommandsChanged(computeForwardingCommands(availableCommands))
+                            }
+                        }
+                    }
+                }
+                super.addListener(proxy)
+            }
+
+            override fun removeListener(listener: Player.Listener) {
+                val proxy = synchronized(wrappedListeners) {
+                    wrappedListeners.remove(listener)
+                } ?: listener
+                super.removeListener(proxy)
+            }
+
             override fun getAvailableCommands(): Player.Commands {
-                return super.getAvailableCommands().buildUpon()
-                    .add(Player.COMMAND_SEEK_TO_NEXT)
-                    .add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
-                    .add(Player.COMMAND_SEEK_TO_PREVIOUS)
-                    .add(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
-                    .build()
+                return computeForwardingCommands(super.getAvailableCommands())
             }
 
             override fun isCommandAvailable(command: Int): Boolean {
+                val pc = app.container.playerController
                 return when (command) {
+                    Player.COMMAND_SEEK_TO_PREVIOUS -> pc.hasQueue()
+                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> pc.hasPrevious()
                     Player.COMMAND_SEEK_TO_NEXT,
-                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
-                    Player.COMMAND_SEEK_TO_PREVIOUS,
-                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> true
+                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> pc.hasNext()
                     else -> super.isCommandAvailable(command)
                 }
             }
@@ -148,6 +203,7 @@ class PlaybackService : MediaSessionService() {
                 if (app.container.playerController.needsReloadForCurrentTrack(exoPlayer)) {
                     app.container.playerController.resumeOrReloadCurrent()
                 } else {
+                    app.container.playerController.onExternalPlayRequested()
                     super.play()
                 }
             }
@@ -166,6 +222,21 @@ class PlaybackService : MediaSessionService() {
 
             override fun seekToPreviousMediaItem() {
                 app.container.playerController.previous()
+            }
+        }
+        notifyAvailableCommandsChanged = {
+            val listenersSnapshot = synchronized(wrappedListeners) { wrappedListeners.keys.toList() }
+            val updatedCommands = forwardingPlayer.availableCommands
+            for (listener in listenersSnapshot) {
+                val stillRegistered = synchronized(wrappedListeners) { wrappedListeners.containsKey(listener) }
+                if (stillRegistered) {
+                    listener.onAvailableCommandsChanged(updatedCommands)
+                }
+            }
+            // MediaNotificationManager on API 26-32 does not listen to onAvailableCommandsChanged;
+            // explicitly re-trigger notification refresh while playback is active/prepared.
+            if (isPlaybackOngoing || exoPlayer.playbackState != Player.STATE_IDLE) {
+                mediaSession?.let { onUpdateNotification(it, false) }
             }
         }
 
@@ -224,6 +295,7 @@ class PlaybackService : MediaSessionService() {
         if (activeInstance === this) {
             activeInstance = null
         }
+        notifyAvailableCommandsChanged = null
         exoPlayerRef = null
         mediaSession?.run {
             player.release()

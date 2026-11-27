@@ -27,6 +27,43 @@ private struct MockHttpStub: Sendable {
     }
 }
 
+private func readRequestBodyText(_ req: URLRequest) -> String {
+    if let data = req.httpBody {
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+    guard let stream = req.httpBodyStream else { return "" }
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while stream.hasBytesAvailable {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count > 0 {
+            data.append(buffer, count: count)
+        } else {
+            break
+        }
+    }
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+private final class SendableStringLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [String] = []
+
+    func append(_ value: String) {
+        lock.lock()
+        items.append(value)
+        lock.unlock()
+    }
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return items
+    }
+}
+
 private final class MockURLProtocol: URLProtocol {
     private static let lock = NSLock()
     private static var requestHandler: (@Sendable (URLRequest) -> MockHttpStub)?
@@ -1313,6 +1350,32 @@ final class PlayerAndRacingTests: XCTestCase {
           }
         }
         """
+        let sodaHotJson = """
+        {
+          "inner_block": [
+            {
+              "resources": [
+                {
+                  "entity": {
+                    "playlist": {
+                      "id": "soda_p1",
+                      "title": "汽水热歌",
+                      "url_cover": {
+                        "uri": "ies-music/cover1.jpeg",
+                        "template_prefix": "tplv-b829550vbb",
+                        "urls": ["https://p3-luna.douyinpic.com/img/"]
+                      },
+                      "owner": { "public_name": "汽水官方" },
+                      "stats": { "count_collected": 30000 },
+                      "resource_cnt": { "track_cnt": 25 }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+        """
 
         MockURLProtocol.configure { req in
             let url = req.url?.absoluteString ?? ""
@@ -1325,8 +1388,13 @@ final class PlayerAndRacingTests: XCTestCase {
             if url.contains("wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList") {
                 return MockHttpStub(statusCode: 200, body: Data(kwHotJson.utf8))
             }
+            if url.contains("api.qishui.com/luna/pc/discover/mix") {
+                return MockHttpStub(statusCode: 200, body: Data(sodaHotJson.utf8))
+            }
             return MockHttpStub(statusCode: 404, body: Data())
         }
+
+        XCTAssertEqual(DiscoverState.supportedSources, [.wy, .tx, .kw, .soda])
 
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [MockURLProtocol.self]
@@ -1365,6 +1433,26 @@ final class PlayerAndRacingTests: XCTestCase {
         let kwRequestsAfterPop = MockURLProtocol.requestedURLs.filter { $0.contains("wapi.kuwo.cn") }.count
         XCTAssertEqual(kwRequestsAfterPop, kwRequestsBeforePop, "Pop-back re-entry must reuse cached Kuwo playlists without duplicate HTTP requests")
 
+        // Switch to Qishui (.soda), load, simulate pop-back re-entry (force: false) & force refresh
+        state.selectSource(.soda)
+        XCTAssertEqual(state.selectedSource, .soda)
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["soda_p1"])
+        let sodaRequestsBeforePop = MockURLProtocol.requestedURLs.filter { $0.contains("qishui.com/luna/pc/discover/mix") }.count
+        XCTAssertEqual(sodaRequestsBeforePop, 2)
+
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator, force: false)
+        XCTAssertEqual(state.selectedSource, .soda)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["soda_p1"])
+        let sodaRequestsAfterPop = MockURLProtocol.requestedURLs.filter { $0.contains("qishui.com/luna/pc/discover/mix") }.count
+        XCTAssertEqual(sodaRequestsAfterPop, sodaRequestsBeforePop, "Pop-back re-entry must reuse cached Qishui playlists")
+
+        await state.loadHotPlaylistsIfNeeded(aggregator: aggregator, force: true)
+        XCTAssertEqual(state.selectedSource, .soda)
+        XCTAssertEqual(state.hotPlaylists.map(\.id), ["soda_p1"])
+        let sodaRequestsAfterForce = MockURLProtocol.requestedURLs.filter { $0.contains("qishui.com/luna/pc/discover/mix") }.count
+        XCTAssertEqual(sodaRequestsAfterForce, sodaRequestsBeforePop + 2)
+
         // Switch back to .tx -> cached immediately; manual force reload refreshes without resetting selectedSource
         state.selectSource(.tx)
         XCTAssertEqual(state.selectedSource, .tx)
@@ -1379,18 +1467,18 @@ final class PlayerAndRacingTests: XCTestCase {
         state.selectSource(.kg)
         XCTAssertEqual(state.selectedSource, .wy)
 
-        // Stale async response guard: slow .wy load must not overwrite .tx selection/cache
+        // Stale async response guard: slow .soda load must not overwrite .tx selection/cache
         MockURLProtocol.configure { req in
             let url = req.url?.absoluteString ?? ""
-            if url.contains("music.163.com/weapi/playlist/list") {
-                return MockHttpStub(statusCode: 200, body: Data(wyHotJson.utf8), delaySeconds: 0.25)
+            if url.contains("qishui.com/luna/pc/discover/mix") {
+                return MockHttpStub(statusCode: 200, body: Data(sodaHotJson.utf8), delaySeconds: 0.25)
             }
             if url.contains("u.y.qq.com/cgi-bin/musicu.fcg") {
                 return MockHttpStub(statusCode: 200, body: Data(txHotJson.utf8))
             }
             return MockHttpStub(statusCode: 404, body: Data())
         }
-        let raceState = DiscoverState()
+        let raceState = DiscoverState(initialSource: .soda)
         let slowTask = Task { @MainActor in
             await raceState.loadHotPlaylistsIfNeeded(aggregator: aggregator, force: true)
         }
@@ -1400,5 +1488,508 @@ final class PlayerAndRacingTests: XCTestCase {
         await slowTask.value
         XCTAssertEqual(raceState.selectedSource, .tx)
         XCTAssertEqual(raceState.hotPlaylists.map(\.id), ["tx_p1"])
+        XCTAssertNil(raceState.hotPlaylistsBySource[.soda], "Stale Qishui response must not pollute cache after switching away")
+    }
+
+    func testQishuiProviderParsingPaginationDirtyJsonAndSearchIsolation() async throws {
+        let mixChannel0Json = """
+        {
+          "inner_block": [
+            {
+              "resources": [
+                {
+                  "entity": {
+                    "playlist": {
+                      "id": "pl_empty",
+                      "title": "空歌单应过滤",
+                      "resource_cnt": { "track_cnt": 0 }
+                    }
+                  }
+                },
+                {
+                  "entity": {
+                    "playlist": {
+                      "id": 7096700219496368135,
+                      "title": "汽水精选集",
+                      "desc": "好听 &amp; 精选",
+                      "url_cover": {
+                        "uri": "ies-music/단체1.jpeg",
+                        "urls": ["http://p3-luna.douyinpic.com/img/"]
+                      },
+                      "owner": { "public_name": "编辑部" },
+                      "stats": { "count_collected": 125000 },
+                      "resource_cnt": { "track_cnt": 2 }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+        """
+        let mixChannel14Json = """
+        {
+          "inner_block": [
+            null,
+            {
+              "resources": [
+                {
+                  "entity": {
+                    "playlist": {
+                      "id": "7096700219496368135",
+                      "title": "重复歌单应去重",
+                      "resource_cnt": { "track_cnt": 2 }
+                    }
+                  }
+                },
+                {
+                  "entity": {
+                    "playlist": {
+                      "id": "pl_pop",
+                      "title": "流行热歌",
+                      "url_cover": {
+                        "uri": "/ies-music/pop_cover.jpg",
+                        "template_prefix": "tplv-custom123"
+                      },
+                      "owner": { "nickname": "汽水流行" },
+                      "stats": { "count_played": 8800 },
+                      "count_tracks": 10
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+        """
+        let playlistPage1Json = """
+        {
+          "playlist": {
+            "id": "7096700219496368135",
+            "title": "汽水精选集",
+            "desc": "分页测试",
+            "url_cover": { "uri": "ies-music/pl_cover.jpg" },
+            "owner": { "public_name": "编辑部" },
+            "stats": { "count_collected": 125000 }
+          },
+          "has_more": true,
+          "next_cursor": "cursor_2",
+          "media_resources": [
+            null,
+            {
+              "entity": {
+                "track_wrapper": {
+                  "track": {
+                    "id": 9001,
+                    "name": "第一首",
+                    "duration": 205000,
+                    "artists": [null, { "name": "歌手A" }, { "name": "歌手B" }],
+                    "album": {
+                      "id": "alb_1",
+                      "name": "专辑一",
+                      "url_cover": { "uri": "ies-music/t1.jpg" }
+                    },
+                    "bit_rates": [
+                      { "quality": "medium", "size": 3145728 },
+                      { "quality": "lossless", "size": 31457280 }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+        """
+        let playlistPage2Json = """
+        {
+          "has_more": true,
+          "next_cursor": "cursor_2",
+          "media_resources": [
+            {
+              "entity": {
+                "track": {
+                  "id": "9002",
+                  "name": "第二首",
+                  "duration": null,
+                  "artists": null,
+                  "album": null,
+                  "bit_rates": null
+                }
+              }
+            }
+          ]
+        }
+        """
+        let playlistFallbackGetJson = """
+        {
+          "playlist": {
+            "id": "7096700219496368999",
+            "title": "首页回退歌单",
+            "url_cover": { "uri": "ies-music/fallback_pl.jpg" }
+          },
+          "has_more": true,
+          "next_cursor": "cursor_post",
+          "media_resources": []
+        }
+        """
+        let playlistFallbackPostJson = """
+        {
+          "playlist": {
+            "id": "7096700219496368999",
+            "title": "首页回退歌单",
+            "url_cover": { "uri": "ies-music/fallback_pl.jpg" }
+          },
+          "has_more": true,
+          "next_cursor": "cursor_empty_page",
+          "media_resources": [
+            {
+              "entity": {
+                "track": {
+                  "id": "9901",
+                  "name": "回退首曲",
+                  "duration": 210000,
+                  "artists": [{ "name": "回退歌手" }],
+                  "bit_rates": [
+                    { "quality": "hi_res", "size": 52428800 },
+                    { "quality": "lossless", "size": 31457280 },
+                    { "quality": "highest", "size": 6291456 },
+                    { "quality": "higher", "size": 3145728 },
+                    { "quality": "medium", "size": 1572864 }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+        """
+        let playlistEmptyPageJson = """
+        {
+          "has_more": true,
+          "next_cursor": "cursor_never_fetched",
+          "media_resources": []
+        }
+        """
+        let chartFallbackJson = """
+        {
+          "chart": {
+            "id": "7036274230471712007",
+            "title": "汽水热歌榜",
+            "style": { "desc": "每周四更新" },
+            "track_ranks": [
+              {
+                "track": {
+                  "id": "8801",
+                  "name": "榜单金曲",
+                  "duration": 190000,
+                  "artists": [{ "name": "榜首歌手" }],
+                  "album": {
+                    "name": "榜单专辑",
+                    "url_cover": {
+                      "uri": "ies-music/chart_track.png",
+                      "template_prefix": "tplv-b829550vbb"
+                    }
+                  },
+                  "bit_rates": [{ "quality": "hi_res" }]
+                }
+              }
+            ]
+          }
+        }
+        """
+        let seoTrackJson = """
+        {
+          "lyric": {
+            "content": "[00:02.50]<0,300,0>汽<300,300,0>水<600,400,0>词"
+          }
+        }
+        """
+
+        let mixBodies = SendableStringLog()
+        MockURLProtocol.configure { req in
+            let url = req.url?.absoluteString ?? ""
+            let bodyText = readRequestBodyText(req)
+            if url.contains("api.qishui.com/luna/pc/discover/mix") {
+                mixBodies.append(bodyText)
+                if bodyText.contains("\"14\"") {
+                    return MockHttpStub(statusCode: 200, body: Data(mixChannel14Json.utf8))
+                }
+                return MockHttpStub(statusCode: 200, body: Data(mixChannel0Json.utf8))
+            }
+            if url.contains("api.qishui.com/luna/pc/playlist/detail") {
+                if url.contains("playlist_id=7096700219496368999") {
+                    if url.contains("cursor=cursor_empty_page") {
+                        return MockHttpStub(statusCode: 200, body: Data(playlistEmptyPageJson.utf8))
+                    }
+                    return MockHttpStub(statusCode: 200, body: Data(playlistFallbackGetJson.utf8))
+                }
+                if url.contains("cursor=cursor_2") {
+                    return MockHttpStub(statusCode: 200, body: Data(playlistPage2Json.utf8))
+                }
+                return MockHttpStub(statusCode: 200, body: Data(playlistPage1Json.utf8))
+            }
+            if url.contains("api.qishui.com/luna/playlist/detail") {
+                if bodyText.contains("7096700219496368999") && !bodyText.contains("cursor_empty_page") {
+                    return MockHttpStub(statusCode: 200, body: Data(playlistFallbackPostJson.utf8))
+                }
+                return MockHttpStub(statusCode: 200, body: Data(playlistEmptyPageJson.utf8))
+            }
+            if url.contains("api.qishui.com/luna/pc/charts/") {
+                return MockHttpStub(statusCode: 502, body: Data())
+            }
+            if url.contains("api5-lf.qishui.com/luna/charts/") {
+                return MockHttpStub(statusCode: 200, body: Data(chartFallbackJson.utf8))
+            }
+            if url.contains("beta-luna.douyin.com/luna/h5/seo_track") {
+                return MockHttpStub(statusCode: 200, body: Data(seoTrackJson.utf8))
+            }
+            return MockHttpStub(statusCode: 404, body: Data())
+        }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: cfg)
+        let aggregator = MusicAggregator(session: session)
+
+        // 1. Hot playlists: merged channels 0 & 14, filtered trackCount > 0, deduped, encoded non-ASCII cover URI
+        let hot = await aggregator.getHotPlaylists(source: .soda)
+        XCTAssertEqual(hot.map(\.id), ["7096700219496368135", "pl_pop"])
+        XCTAssertEqual(mixBodies.values.count, 2)
+        for body in mixBodies.values {
+            let parsedBody = JsonSafe.parseObject(body)
+            XCTAssertEqual(JsonSafe.asString(parsedBody?["block_type"]), "discover_playlist_mix")
+            XCTAssertEqual(JsonSafe.asInt(parsedBody?["count"]), 20)
+        }
+        XCTAssertEqual(hot[0].name, "汽水精选集")
+        XCTAssertEqual(hot[0].description, "好听 & 精选")
+        XCTAssertEqual(hot[0].playCount, "12.5万")
+        XCTAssertTrue(hot[0].coverUrl.hasPrefix("https://p3-luna.douyinpic.com/img/ies-music/"))
+        XCTAssertTrue(hot[0].coverUrl.contains("~tplv-b829550vbb-resize:500:500.png"))
+        XCTAssertFalse(hot[0].coverUrl.contains("단체"))
+        XCTAssertEqual(
+            hot[1].coverUrl,
+            "https://p3-luna.douyinpic.com/img/ies-music/pop_cover.jpg~tplv-custom123-resize:500:500.png"
+        )
+
+        // Never emit bare /img/{uri} and percent-encode non-ASCII in /img/ URL fallback
+        XCTAssertNil(QishuiProvider.buildCoverUrl(from: ["urls": ["https://p3-luna.douyinpic.com/img/"]]))
+        XCTAssertEqual(
+            QishuiProvider.buildCoverUrl(from: ["urls": ["http://p3-luna.douyinpic.com/img/ies-music/단체 1.jpeg"]]),
+            "https://p3-luna.douyinpic.com/img/ies-music/%EB%8B%A8%EC%B2%B4%201.jpeg~tplv-b829550vbb-resize:500:500.png"
+        )
+
+        // 2. Playlist detail: cursor pagination + repeated-cursor cycle guard + dirty JSON survival
+        let detailRes = await aggregator.getPlaylistDetail(source: .soda, idOrUrl: "https://music.douyin.com/qishui/playlist/7096700219496368135")
+        let detail = try detailRes.get()
+        XCTAssertEqual(detail.playlist.source, .soda)
+        XCTAssertEqual(detail.playlist.trackCount, 2)
+        XCTAssertEqual(detail.tracks.map(\.id), ["soda_9001", "soda_9002"])
+        XCTAssertEqual(detail.tracks[0].artist, "歌手A / 歌手B")
+        XCTAssertEqual(detail.tracks[0].artistNames, ["歌手A", "歌手B"])
+        XCTAssertEqual(detail.tracks[0].qualities.map(\.type), ["128k", "flac"])
+        XCTAssertEqual(detail.tracks[1].artist, "未知歌手")
+        XCTAssertEqual(detail.tracks[1].album, "")
+        XCTAssertTrue(detail.tracks[1].qualities.isEmpty, "Missing/null bit_rates should return empty qualities")
+
+        // 2b. Page-1 GET returning playlist metadata + empty media_resources falls back to POST /luna/playlist/detail
+        // and stops pagination when subsequent page adds 0 tracks; bit_rates map higher->128k, highest->320k in canonical order
+        let fallbackDetailRes = await aggregator.getPlaylistDetail(source: .soda, idOrUrl: "7096700219496368999")
+        let fallbackDetail = try fallbackDetailRes.get()
+        XCTAssertEqual(fallbackDetail.tracks.map(\.id), ["soda_9901"])
+        XCTAssertEqual(fallbackDetail.tracks[0].qualities.map(\.type), ["128k", "320k", "flac", "flac24bit"])
+        XCTAssertFalse(MockURLProtocol.requestedURLs.contains { $0.contains("cursor_never_fetched") })
+
+        let qishuiProvider = QishuiProvider(session: session)
+        let higherVsHighestTrack = qishuiProvider.parseTrackObj([
+            "id": "9902",
+            "name": "音质映射验证",
+            "bit_rates": [
+                ["quality": "highest", "size": 6_291_456],
+                ["quality": "higher", "size": 3_145_728]
+            ]
+        ])
+        XCTAssertEqual(higherVsHighestTrack?.qualities.map(\.type), ["128k", "320k"])
+        XCTAssertEqual(higherVsHighestTrack?.qualities.map(\.size), ["3.0MB", "6.0MB"])
+
+        // 3. Charts: 4 official boards & fallback endpoint
+        let boards = aggregator.getLeaderboards(source: .soda)
+        XCTAssertEqual(boards.map(\.bangId), [
+            "7036274230471712007",
+            "7060812597884869927",
+            "7061475546400005410",
+            "7415959718721494311"
+        ])
+        let boardDetail = try (await aggregator.getLeaderboardDetail(board: boards[0])).get()
+        XCTAssertEqual(boardDetail.tracks.first?.id, "soda_8801")
+        XCTAssertEqual(boardDetail.tracks.first?.qualities.map(\.type), ["flac24bit"])
+
+        // 4. Lyrics fetch & <...> tag stripping
+        let lyrics = await aggregator.fetchLyrics(for: boardDetail.tracks[0])
+        XCTAssertEqual(lyrics.lines.count, 1)
+        XCTAssertEqual(lyrics.lines[0].text, "汽水词")
+
+        // 5. Search isolation: searchSinglePlatform(.soda), searchAggregated, findAlternativeTracks never query Qishui
+        let beforeSearchRequests = MockURLProtocol.requestedURLs.count
+        let directSodaSearch = await aggregator.searchSinglePlatform(source: .soda, query: "晴天")
+        XCTAssertTrue(directSodaSearch.isEmpty)
+        XCTAssertEqual(MockURLProtocol.requestedURLs.count, beforeSearchRequests)
+
+        _ = await aggregator.searchAggregated(query: "晴天")
+        _ = await aggregator.findAlternativeTracks(
+            for: Track(id: "wy_probe", title: "晴天", artist: "周杰伦", source: .wy, songmid: "1"),
+            allowedPlatformCodes: ["wy", "tx", "kw", "kg", "soda"]
+        )
+        let searchUrls = MockURLProtocol.requestedURLs.dropFirst(beforeSearchRequests)
+        XCTAssertFalse(searchUrls.contains { $0.contains("qishui.com") || $0.contains("douyin.com") })
+    }
+
+    @MainActor
+    func testQishuiPlaybackCrossPlatformFallbackAndUnsupportedFastFail() async throws {
+        let weapiSearchJson = """
+        {
+          "code": 200,
+          "result": {
+            "songs": [
+              {
+                "id": 556677,
+                "name": "汽水热曲",
+                "ar": [{ "name": "汽水歌手" }],
+                "al": { "id": 10, "name": "测试专辑", "picUrl": "https://p1.music.126.net/a.jpg" },
+                "dt": 180000
+              }
+            ]
+          }
+        }
+        """
+
+        MockURLProtocol.configure { req in
+            let url = req.url?.absoluteString ?? ""
+            if url.contains("music.163.com/weapi/cloudsearch/get/web") {
+                return MockHttpStub(statusCode: 200, body: Data(weapiSearchJson.utf8))
+            }
+            if url.contains("mock.qishui.fallback/wy") {
+                return MockHttpStub(statusCode: 200, body: Data(#"{"url":"https://mock.qishui.fallback/stream.mp3"}"#.utf8))
+            }
+            if url.contains("mock.qishui.fallback/stream.mp3") {
+                return MockHttpStub(
+                    statusCode: 206,
+                    headers: ["Content-Type": "audio/mpeg", "Content-Length": "4096"],
+                    body: Data(repeating: 0x44, count: 128)
+                )
+            }
+            return MockHttpStub(statusCode: 404, body: Data())
+        }
+
+        let env = try await makeTestEnvironment(autoSkipDelayNs: 20_000_000)
+        let player = env.player
+        defer { player.clearQueue() }
+
+        _ = try await importAndWaitReady(
+            makeHttpScript(name: "WyOnlySource", requestUrlExpr: "'https://mock.qishui.fallback/' + info.musicInfo.source"),
+            into: env.userApi
+        )
+
+        let sodaTrack0 = Track(
+            id: "soda_101",
+            title: "汽水热曲",
+            artist: "汽水歌手",
+            source: .soda,
+            songmid: "101",
+            durationMs: 180_000
+        )
+        let sodaTrack1 = Track(
+            id: "soda_102",
+            title: "第二首汽水",
+            artist: "汽水歌手",
+            source: .soda,
+            songmid: "102",
+            durationMs: 180_000
+        )
+
+        // 1. allowCrossPlatformFallback = true -> resolves via WY alternative match
+        let fallbackRes = await env.userApi.resolveStream(
+            track: sodaTrack0,
+            preferredQuality: .q320k,
+            allowCrossPlatformFallback: true
+        )
+        let resolved = try fallbackRes.get()
+        XCTAssertTrue(resolved.switchedPlatform)
+        XCTAssertEqual(resolved.resolvedTrack.source, .wy)
+        XCTAssertEqual(resolved.resolvedTrack.songmid, "556677")
+        XCTAssertEqual(resolved.url, "https://mock.qishui.fallback/stream.mp3")
+
+        // 2. allowCrossPlatformFallback = true but no match on WY/TX/KW/KG -> explicit message
+        MockURLProtocol.configure { _ in MockHttpStub(statusCode: 404, body: Data()) }
+        let noMatchRes = await env.userApi.resolveStream(
+            track: sodaTrack0,
+            preferredQuality: .q320k,
+            allowCrossPlatformFallback: true
+        )
+        if case .failure(let err) = noMatchRes {
+            XCTAssertEqual(
+                err.localizedDescription,
+                "当前自定义音源不支持汽水音乐，且暂未在其他平台匹配到《汽水热曲》"
+            )
+        } else {
+            XCTFail("Expected failure when no cross-platform match exists")
+        }
+
+        // 2b. PlayerController-level stop with autoFallbackSource = true and no cross-platform match
+        // must preserve the explicit Qishui unsupported message (1-track queue & sequential boundary)
+        var uiEvents: [PlayerUiEvent] = []
+        let bag = player.events.sink { uiEvents.append($0) }
+        defer { bag.cancel() }
+
+        env.settingsStore.update { $0.autoFallbackSource = true }
+        player.playTracks([sodaTrack0], startIndex: 0)
+        let receivedSingleStopMsg = await waitUntilOnMain(timeoutSeconds: 5.0) {
+            uiEvents.contains {
+                $0.message == "当前自定义音源不支持汽水音乐，且暂未在其他平台匹配到《汽水热曲》"
+            } && !player.state.isBuffering
+        }
+        XCTAssertTrue(receivedSingleStopMsg)
+        XCTAssertFalse(player.state.isPlaying)
+
+        uiEvents.removeAll()
+        player.cycleRepeatMode() // .listLoop -> .sequential
+        XCTAssertEqual(player.state.repeatMode, .sequential)
+        player.playTracks([sodaTrack0, sodaTrack1], startIndex: 1)
+        let receivedBoundaryStopMsg = await waitUntilOnMain(timeoutSeconds: 5.0) {
+            uiEvents.contains {
+                $0.message == "当前自定义音源不支持汽水音乐，且暂未在其他平台匹配到《第二首汽水》"
+            } && !player.state.isBuffering
+        }
+        XCTAssertTrue(receivedBoundaryStopMsg)
+        XCTAssertFalse(player.state.isPlaying)
+        player.cycleRepeatMode() // .shuffle
+        player.cycleRepeatMode() // .singleLoop
+        player.cycleRepeatMode() // .listLoop
+
+        // 3. allowCrossPlatformFallback = false -> fast-fails with zero search requests and no playlist auto-skip
+        let beforeDisabledRequests = MockURLProtocol.requestedURLs.count
+        let disabledRes = await env.userApi.resolveStream(
+            track: sodaTrack0,
+            preferredQuality: .q320k,
+            allowCrossPlatformFallback: false
+        )
+        if case .failure(let err) = disabledRes {
+            XCTAssertEqual(
+                err.localizedDescription,
+                "当前自定义音源不支持汽水音乐，请在设置开启「无感自动换源兜底」或导入支持汽水音乐的音源"
+            )
+        } else {
+            XCTFail("Expected fast-fail when auto-fallback is disabled")
+        }
+        XCTAssertEqual(MockURLProtocol.requestedURLs.count, beforeDisabledRequests)
+
+        uiEvents.removeAll()
+        env.settingsStore.update { $0.autoFallbackSource = false }
+        player.playTracks([sodaTrack0, sodaTrack1], startIndex: 0)
+        let receivedUnsupportedEvent = await waitUntilOnMain(timeoutSeconds: 5.0) {
+            uiEvents.contains { $0.message.contains("当前自定义音源不支持汽水音乐") }
+        }
+        XCTAssertTrue(receivedUnsupportedEvent)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertEqual(player.state.currentIndex, 0, "Unsupported Qishui track with fallback disabled must not auto-skip")
+        XCTAssertFalse(player.state.isPlaying)
     }
 }

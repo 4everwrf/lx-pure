@@ -1316,4 +1316,156 @@ class CoreProtocolTest {
         assertEquals(5, tinyPlan.hiddenCount)
         assertTrue(tinyPlan.showCompactSummaryOnly)
     }
+
+    @Test
+    fun parseMeloraAndMultiScriptJsonBundlesWhileRejectingErrorAndMalformedJson() {
+        val scriptA = "/**\r\n * @name Alpha Demo\r\n * @version 1.2.0\r\n * @author TesterA\r\n */\r\n" +
+            "const { EVENT_NAMES, on, send } = globalThis.lx;\n" +
+            "on(EVENT_NAMES.request, async () => 'https://cdn.example.com/a.mp3');\n" +
+            "send(EVENT_NAMES.inited, { sources: { wy: { type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } } });"
+        val scriptB = "globalThis.lx.on('request', async () => 'https://cdn.example.com/b.mp3');\n" +
+            "globalThis.lx.send('inited', { sources: { kw: { type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } } });"
+
+        fun escapeJson(raw: String): String = kotlinx.serialization.json.JsonPrimitive(raw).toString()
+
+        // 1. Melora lx-sources bundle with BOM, valid scripts (header + headerless fallback name), and invalid entries to skip
+        val meloraJson = """
+            {
+              "app": "melora",
+              "type": "lx-sources",
+              "scripts": [
+                { "name": "Alpha_v1.2.0.js", "code": ${escapeJson(scriptA)} },
+                { "name": "FallbackSource.js", "code": ${escapeJson(scriptB)} },
+                { "name": "BadNumberCode.js", "code": 404 },
+                { "name": "HtmlStub.js", "code": "<html><body>404 Not Found</body></html>" },
+                { "name": "NonLxText.js", "code": "just plain text without markers" }
+              ]
+            }
+        """.trimIndent()
+
+        val meloraResult = LxScriptParser.parseScriptBundle("\uFEFF$meloraJson")
+        assertTrue(meloraResult is com.lxpure.music.core.userapi.ScriptBundleParseResult.ValidBundle)
+        val validMelora = meloraResult as com.lxpure.music.core.userapi.ScriptBundleParseResult.ValidBundle
+        assertEquals(2, validMelora.entries.size)
+        assertEquals(3, validMelora.skippedCount)
+        assertEquals("Alpha_v1.2.0", validMelora.entries[0].fallbackName)
+        assertFalse(validMelora.entries[0].script.contains("\r"))
+        assertEquals("Alpha Demo", LxScriptParser.parse(validMelora.entries[0].script, validMelora.entries[0].fallbackName).name)
+        assertEquals("FallbackSource", validMelora.entries[1].fallbackName)
+        assertEquals("FallbackSource", LxScriptParser.parse(validMelora.entries[1].script, validMelora.entries[1].fallbackName).name)
+
+        // Payload validator accepts Melora bundle while single-script validator keeps rejecting JSON (guards updateSingleSource)
+        assertTrue(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(meloraJson))
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedScript(meloraJson))
+
+        // 2. Top-level array & single wrapped object formats
+        val arrayBundle = """[{"name":"ArrSrc.js","script":${escapeJson(scriptA)}}]"""
+        val arrayRes = LxScriptParser.parseScriptBundle(arrayBundle)
+        assertTrue(arrayRes is com.lxpure.music.core.userapi.ScriptBundleParseResult.ValidBundle)
+        assertEquals(1, (arrayRes as com.lxpure.music.core.userapi.ScriptBundleParseResult.ValidBundle).entries.size)
+        // P0-1 regression: top-level JSON array bundle must NEVER pass single-script validator (guards updateSingleSource)
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedScript(arrayBundle))
+        assertTrue(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(arrayBundle))
+
+        val singleWrapped = """{"name":"Wrapped.js","code":${escapeJson(scriptA)}}"""
+        val wrappedRes = LxScriptParser.parseScriptBundle(singleWrapped)
+        assertTrue(wrappedRes is com.lxpure.music.core.userapi.ScriptBundleParseResult.ValidBundle)
+        assertEquals(1, (wrappedRes as com.lxpure.music.core.userapi.ScriptBundleParseResult.ValidBundle).entries.size)
+
+        // 3. Regular standalone .js script returns NotBundle (existing single-script path preserved)
+        assertEquals(com.lxpure.music.core.userapi.ScriptBundleParseResult.NotBundle, LxScriptParser.parseScriptBundle(scriptA))
+        assertTrue(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedScript(scriptA))
+        assertTrue(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(scriptA))
+
+        // 4. Adversarial / dirty JSON & oversized inputs must be rejected cleanly (A4)
+        val errorJsonNumeric = """{"code": 404, "message": "not found"}"""
+        assertTrue(LxScriptParser.parseScriptBundle(errorJsonNumeric) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(errorJsonNumeric))
+
+        val errorJsonString = """{"code": "ERROR_LX_404", "message": "short string not script"}"""
+        assertTrue(LxScriptParser.parseScriptBundle(errorJsonString) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(errorJsonString))
+
+        val shortTagArray = """{"sources":["lx-api"]}"""
+        assertTrue(LxScriptParser.parseScriptBundle(shortTagArray) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(shortTagArray))
+
+        val errorArrayLong = """[{"error":"lx rate limit","detail":"${"x".repeat(200)}"}]"""
+        assertTrue(LxScriptParser.parseScriptBundle(errorArrayLong) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(errorArrayLong))
+
+        val emptyScriptsJson = """{"app":"melora","scripts":[]}"""
+        assertTrue(LxScriptParser.parseScriptBundle(emptyScriptsJson) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+
+        val allInvalidJson = """{"app":"melora","scripts":[{"name":"bad.js","code":"<html>404</html>"}]}"""
+        assertTrue(LxScriptParser.parseScriptBundle(allInvalidJson) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+
+        val brokenJson = """{"app":"melora","scripts":[{"name":"a","code":"broken"""
+        assertTrue(LxScriptParser.parseScriptBundle(brokenJson) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+
+        val brokenContentJson = """{"app":"melora","content":"globalThis.lx broken"""
+        assertTrue(LxScriptParser.parseScriptBundle(brokenContentJson) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+
+        val nulJson = "{\"app\":\"melora\",\"scripts\":[{\"name\":\"a\",\"code\":\"globalThis.lx\u0000\"}]}"
+        assertTrue(LxScriptParser.parseScriptBundle(nulJson) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+
+        // JSON-escaped \u0000 inside script code is decoded by parser and rejected by entry validator
+        val escapedNulJson = """{"app":"melora","scripts":[{"name":"a.js","code":"globalThis.lx.send('inited', {});\u0000padding"}]}"""
+        assertTrue(LxScriptParser.parseScriptBundle(escapedNulJson) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+
+        // Single-script download validator rejects NUL bytes and > 1 MB scripts (guards updateSingleSource)
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedScript(scriptA + "\u0000"))
+        assertFalse(
+            com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedScript(
+                scriptA + "//" + "a".repeat(LxScriptParser.MAX_SINGLE_SCRIPT_BYTES)
+            )
+        )
+
+        // > 1 MB entry inside bundle is skipped if valid siblings exist, and rejected if alone
+        val oversizedEntry = scriptA + "//" + "a".repeat(LxScriptParser.MAX_SINGLE_SCRIPT_BYTES)
+        val mixedOversizedBundle = """{"scripts":[{"name":"Huge.js","code":${escapeJson(oversizedEntry)}},{"name":"Ok.js","code":${escapeJson(scriptB)}}]}"""
+        val mixedOversizedRes = LxScriptParser.parseScriptBundle(mixedOversizedBundle)
+        assertTrue(mixedOversizedRes is com.lxpure.music.core.userapi.ScriptBundleParseResult.ValidBundle)
+        assertEquals(1, (mixedOversizedRes as com.lxpure.music.core.userapi.ScriptBundleParseResult.ValidBundle).entries.size)
+        assertEquals(1, mixedOversizedRes.skippedCount)
+
+        val onlyOversizedBundle = """{"scripts":[{"name":"Huge.js","code":${escapeJson(oversizedEntry)}}]}"""
+        assertTrue(LxScriptParser.parseScriptBundle(onlyOversizedBundle) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+
+        // > 4 MB bundle payload rejected before JSON parsing
+        val hugePayload = "{\"scripts\":[\"" + "a".repeat(LxScriptParser.MAX_BUNDLE_PAYLOAD_BYTES + 16) + "\"]}"
+        assertTrue(LxScriptParser.parseScriptBundle(hugePayload) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(hugePayload))
+
+        val tooManyItems = (1..51).joinToString(",") { idx ->
+            """{"name":"S$idx.js","code":${escapeJson(scriptB)}}"""
+        }
+        val fiftyOneObjectJson = """{"scripts":[$tooManyItems]}"""
+        val fiftyOneArrayJson = """[$tooManyItems]"""
+        assertTrue(LxScriptParser.parseScriptBundle(fiftyOneObjectJson) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+        assertTrue(LxScriptParser.parseScriptBundle(fiftyOneArrayJson) is com.lxpure.music.core.userapi.ScriptBundleParseResult.InvalidBundle)
+        assertFalse(com.lxpure.music.core.userapi.UserApiManager.isValidDownloadedPayload(fiftyOneArrayJson))
+
+        // 5. SourceImportBatchResult message formatting parity
+        val dummySource = com.lxpure.music.domain.model.UserApiSource(
+            id = "s1", name = "Alpha Demo", description = "", version = "1.0.0",
+            author = "Tester", homepage = "", script = scriptA, sourceUrl = null, enabled = true, priority = 0
+        )
+        assertEquals(
+            "未导入任何有效音源",
+            com.lxpure.music.core.userapi.SourceImportBatchResult(emptyList(), 0).formatUserMessage()
+        )
+        assertEquals(
+            "已导入音源：Alpha Demo",
+            com.lxpure.music.core.userapi.SourceImportBatchResult(listOf(dummySource), 0).formatUserMessage()
+        )
+        assertEquals(
+            "已导入 2 个音源",
+            com.lxpure.music.core.userapi.SourceImportBatchResult(listOf(dummySource, dummySource.copy(id = "s2")), 0).formatUserMessage()
+        )
+        assertEquals(
+            "已导入 1 个音源（跳过 2 个无效项）",
+            com.lxpure.music.core.userapi.SourceImportBatchResult(listOf(dummySource), 2).formatUserMessage()
+        )
+    }
 }

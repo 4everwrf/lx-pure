@@ -96,14 +96,57 @@ data class BatchUpdateSummary(
     }
 }
 
-class UserApiManager(
-    private val context: Context,
-    private val dao: UserApiDao,
+data class SourceImportBatchResult(
+    val imported: List<UserApiSource>,
+    val skippedCount: Int = 0
+) {
+    fun formatUserMessage(): String {
+        if (imported.isEmpty()) return "未导入任何有效音源"
+        if (imported.size == 1 && skippedCount == 0) {
+            return "已导入音源：${imported.first().name}"
+        }
+        val base = "已导入 ${imported.size} 个音源"
+        return if (skippedCount > 0) "$base（跳过 $skippedCount 个无效项）" else base
+    }
+}
+
+class UserApiManager private constructor(
+    private val context: Context?,
+    private val dao: UserApiDao?,
     private val httpClient: OkHttpClient,
     private val aggregator: MusicAggregator,
-    private val networkAdvisor: NetworkQualityAdvisor,
-    streamHttpClient: OkHttpClient = httpClient
+    private val networkAdvisor: NetworkQualityAdvisor?,
+    streamHttpClient: OkHttpClient = httpClient,
+    private val initialSourcesOverride: List<UserApiSource>? = null,
+    private val fetchStreamUrlOverride: (suspend (ResolveCandidate, Long) -> Result<String>)? = null,
+    private val verifyStreamUrlOverride: (suspend (String) -> Boolean)? = null,
+    private val loggerDebug: (String) -> Unit = { msg -> Log.d(TAG, msg) },
+    private val loggerWarn: (String) -> Unit = { msg -> Log.w(TAG, msg) }
 ) {
+    constructor(
+        context: Context,
+        dao: UserApiDao,
+        httpClient: OkHttpClient,
+        aggregator: MusicAggregator,
+        networkAdvisor: NetworkQualityAdvisor,
+        streamHttpClient: OkHttpClient = httpClient
+    ) : this(
+        context = context,
+        dao = dao,
+        httpClient = httpClient,
+        aggregator = aggregator,
+        networkAdvisor = networkAdvisor,
+        streamHttpClient = streamHttpClient,
+        initialSourcesOverride = null,
+        fetchStreamUrlOverride = null,
+        verifyStreamUrlOverride = null
+    )
+    class UnsupportedSourcePlatformException(
+        val source: MusicSource,
+        val allowCrossPlatformFallback: Boolean,
+        message: String
+    ) : IllegalStateException(message)
+
     companion object {
         private const val TAG = "UserApiManager"
         internal const val SCRIPT_URL_TIMEOUT_MS = 4_000L
@@ -111,7 +154,7 @@ class UserApiManager(
         internal const val RESOLVE_TOTAL_BUDGET_MS = 16_000L
         internal const val INITIAL_PRIMARY_GRACE_MS = 600L
         private const val COOLDOWN_MS = 45_000L
-        private const val MAX_SCRIPT_DOWNLOAD_BYTES = 2 * 1024 * 1024 // 2 MB cap
+        private const val MAX_SCRIPT_DOWNLOAD_BYTES = LxScriptParser.MAX_BUNDLE_PAYLOAD_BYTES // 4 MB cap
         private val SEARCHABLE_PLATFORM_CODES = setOf(
             MusicSource.WY.code,
             MusicSource.TX.code,
@@ -126,21 +169,85 @@ class UserApiManager(
         internal fun sourceTrackKey(sourceId: String, trackId: String): String =
             "${sourceId}_${trackId}"
 
+        internal fun createForTesting(
+            httpClient: OkHttpClient,
+            aggregator: MusicAggregator,
+            sources: List<UserApiSource>,
+            fetchStreamUrl: suspend (ResolveCandidate, Long) -> Result<String>,
+            verifyStreamUrl: suspend (String) -> Boolean = { true }
+        ): UserApiManager = UserApiManager(
+            context = null,
+            dao = null,
+            httpClient = httpClient,
+            aggregator = aggregator,
+            networkAdvisor = null,
+            streamHttpClient = httpClient,
+            initialSourcesOverride = sources,
+            fetchStreamUrlOverride = fetchStreamUrl,
+            verifyStreamUrlOverride = verifyStreamUrl,
+            loggerDebug = {},
+            loggerWarn = {}
+        )
+
+        internal fun hasReadySourceSupportingPlatform(
+            readySources: List<UserApiSource>,
+            source: MusicSource
+        ): Boolean {
+            val code = source.code.lowercase(Locale.ROOT)
+            return readySources.any { it.supportedPlatforms.containsKey(code) }
+        }
+
+        internal fun buildUnsupportedPlatformFailure(
+            track: Track,
+            allowCrossPlatformFallback: Boolean
+        ): UnsupportedSourcePlatformException {
+            val platformName = track.source.displayName
+            val msg = if (allowCrossPlatformFallback) {
+                "当前自定义音源不支持${platformName}，且暂未在其他平台匹配到《${track.title}》"
+            } else {
+                "当前自定义音源不支持${platformName}，请在设置开启「无感自动换源兜底」或导入支持${platformName}的音源"
+            }
+            return UnsupportedSourcePlatformException(
+                source = track.source,
+                allowCrossPlatformFallback = allowCrossPlatformFallback,
+                message = msg
+            )
+        }
+
         internal fun computeSourceRevision(source: UserApiSource): String =
             LxCrypto.md5Hex("${source.version}:${source.script.trim()}").take(8)
 
         /**
-         * Validates a downloaded custom source script while rejecting HTML/JSON error pages
-         * (including those prefixed with a UTF-8 BOM).
+         * Validates a downloaded custom source script while rejecting HTML/JSON error pages,
+         * JSON source bundles (including top-level JSON arrays), NUL bytes, and oversized payloads.
          */
         fun isValidDownloadedScript(content: String?): Boolean {
             if (content.isNullOrBlank() || content.length < 150) return false
+            if (content.contains('\u0000')) return false
+            if (content.toByteArray(StandardCharsets.UTF_8).size > LxScriptParser.MAX_SINGLE_SCRIPT_BYTES) return false
             val cleaned = content.removePrefix("\uFEFF").trimStart()
             if (cleaned.isEmpty() || cleaned.startsWith("<") || cleaned.startsWith("{")) return false
+            if (cleaned.startsWith("[") &&
+                LxScriptParser.parseScriptBundle(content) !is ScriptBundleParseResult.NotBundle
+            ) {
+                return false
+            }
             return cleaned.contains("lx", ignoreCase = true) ||
                 cleaned.contains("\\x6c\\x78", ignoreCase = true) ||
                 cleaned.contains("@name") ||
                 cleaned.contains("globalThis")
+        }
+
+        /**
+         * Validates either a Melora / multi-script JSON source bundle or a standalone LX `.js` script.
+         */
+        fun isValidDownloadedPayload(content: String?): Boolean {
+            if (content.isNullOrBlank()) return false
+            return when (LxScriptParser.parseScriptBundle(content)) {
+                is ScriptBundleParseResult.ValidBundle -> true
+                is ScriptBundleParseResult.InvalidBundle -> false
+                is ScriptBundleParseResult.NotBundle -> isValidDownloadedScript(content)
+            }
         }
 
         /**
@@ -314,7 +421,7 @@ class UserApiManager(
     private val initialDbLoadDone = CompletableDeferred<Unit>()
 
     private val raceCoordinator = SourceRaceCoordinator(
-        isMeteredNetwork = { networkAdvisor.isMeteredNetwork() },
+        isMeteredNetwork = { networkAdvisor?.isMeteredNetwork() ?: false },
         isInCooldown = { key -> isInCooldown(key) },
         markCooldown = { sourceId, platformCode -> markCooldown(sourceId, platformCode) },
         clearCooldown = { key -> clearCooldown(key) },
@@ -329,31 +436,42 @@ class UserApiManager(
             }
         },
         fetchStreamUrl = { candidate, reqBudget ->
-            val activeRuntime = candidate.runtime ?: ensureRuntimeReady(candidate.source)
-            if (activeRuntime == null) {
-                Result.failure(IllegalStateException("引擎初始化失败"))
-            } else {
-                activeRuntime.requestMusicUrl(
-                    track = candidate.track,
-                    quality = candidate.quality,
-                    timeoutMs = reqBudget
-                )
+            fetchStreamUrlOverride?.invoke(candidate, reqBudget) ?: run {
+                val activeRuntime = candidate.runtime ?: ensureRuntimeReady(candidate.source)
+                if (activeRuntime == null) {
+                    Result.failure(IllegalStateException("引擎初始化失败"))
+                } else {
+                    activeRuntime.requestMusicUrl(
+                        track = candidate.track,
+                        quality = candidate.quality,
+                        timeoutMs = reqBudget
+                    )
+                }
             }
         },
-        verifyStreamUrl = { url -> verifyPlayableAudioUrl(url) },
-        logDebug = { msg -> Log.d(TAG, msg) },
-        logWarn = { msg -> Log.w(TAG, msg) }
+        verifyStreamUrl = { url -> verifyStreamUrlOverride?.invoke(url) ?: verifyPlayableAudioUrl(url) },
+        logDebug = loggerDebug,
+        logWarn = loggerWarn
     )
 
     init {
-        scope.launch {
-            try {
-                reloadAllFromDatabase()
-            } finally {
-                initialDbLoadDone.complete(Unit)
+        if (initialSourcesOverride != null) {
+            _sources.value = initialSourcesOverride
+            initialDbLoadDone.complete(Unit)
+        } else {
+            scope.launch {
+                try {
+                    reloadAllFromDatabase()
+                } finally {
+                    initialDbLoadDone.complete(Unit)
+                }
             }
         }
     }
+
+    private fun requireContext(): Context = checkNotNull(context) { "UserApiManager Context is required" }
+
+    private fun requireDao(): UserApiDao = checkNotNull(dao) { "UserApiManager Dao is required" }
 
     private fun mutexFor(id: String): Mutex = sourceMutexes.computeIfAbsent(id) { Mutex() }
 
@@ -384,7 +502,7 @@ class UserApiManager(
 
     suspend fun reloadAllFromDatabase() {
         LxQuickJsRuntime.ensureQuickJsLoaded()
-        val entities = dao.getAllOnce()
+        val entities = requireDao().getAllOnce()
         val initial = entities.map { entity ->
             UserApiSource(
                 id = entity.id,
@@ -428,7 +546,7 @@ class UserApiManager(
                 it.copy(status = UserApiRuntimeStatus.INITIALIZING, errorMessage = null, latencyMs = null)
             }
 
-            val runtime = LxQuickJsRuntime(context, httpClient, liveSource)
+            val runtime = LxQuickJsRuntime(requireContext(), httpClient, liveSource)
             val result = try {
                 runtime.initialize()
             } catch (ce: CancellationException) {
@@ -480,7 +598,10 @@ class UserApiManager(
     suspend fun importFromUrl(url: String): Result<UserApiSource> = withContext(Dispatchers.IO) {
         try {
             val cleanUrl = url.trim()
-            require(cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")) {
+            require(
+                cleanUrl.startsWith("http://", ignoreCase = true) ||
+                    cleanUrl.startsWith("https://", ignoreCase = true)
+            ) {
                 "请输入有效的 http:// 或 https:// 自定义源链接"
             }
             val script = downloadText(cleanUrl) ?: error("无法下载该音源链接")
@@ -488,6 +609,34 @@ class UserApiManager(
                 "下载内容不是有效的自定义源 JavaScript 脚本"
             }
             importRawScript(script, sourceUrl = cleanUrl)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
+    }
+
+    suspend fun importFromUrlPayload(url: String): Result<SourceImportBatchResult> = withContext(Dispatchers.IO) {
+        try {
+            val cleanUrl = url.trim()
+            require(
+                cleanUrl.startsWith("http://", ignoreCase = true) ||
+                    cleanUrl.startsWith("https://", ignoreCase = true)
+            ) {
+                "请输入有效的 http:// 或 https:// 自定义源链接"
+            }
+            val content = downloadText(cleanUrl) ?: error("无法下载该音源链接")
+            when (val parsed = LxScriptParser.parseScriptBundle(content)) {
+                is ScriptBundleParseResult.ValidBundle -> importParsedBundle(parsed)
+                is ScriptBundleParseResult.InvalidBundle -> Result.failure(IllegalArgumentException(parsed.errorMessage))
+                is ScriptBundleParseResult.NotBundle -> {
+                    require(isValidDownloadedScript(content)) {
+                        "下载内容不是有效的自定义源 JavaScript 脚本或音源包"
+                    }
+                    importRawScript(content, sourceUrl = cleanUrl)
+                        .map { SourceImportBatchResult(imported = listOf(it), skippedCount = 0) }
+                }
+            }
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {
@@ -521,6 +670,99 @@ class UserApiManager(
         }
     }
 
+    private suspend fun importParsedBundle(parsed: ScriptBundleParseResult.ValidBundle): Result<SourceImportBatchResult> {
+        val deduped = LinkedHashMap<String, Pair<ParsedScriptMeta, String>>()
+        for (entry in parsed.entries) {
+            val meta = LxScriptParser.parse(entry.script, entry.fallbackName)
+            deduped[meta.id] = meta to entry.script
+        }
+
+        val importedModels = priorityMutex.withLock {
+            val existingById = requireDao().getAllOnce().associateBy { it.id }
+            var nextPriority = (existingById.values.maxOfOrNull { it.priority } ?: -1) + 1
+            val models = mutableListOf<UserApiSource>()
+            for ((meta, normalizedScript) in deduped.values) {
+                val existingMatch = existingById[meta.id]
+                val priority = existingMatch?.priority ?: nextPriority++
+                val entity = UserApiEntity(
+                    id = meta.id,
+                    name = meta.name,
+                    description = meta.description,
+                    version = meta.version,
+                    author = meta.author,
+                    homepage = meta.homepage,
+                    script = normalizedScript,
+                    // Never bind a multi-script JSON bundle URL as a single-script update URL
+                    sourceUrl = existingMatch?.sourceUrl,
+                    enabled = true,
+                    priority = priority,
+                    addedAt = existingMatch?.addedAt ?: System.currentTimeMillis()
+                )
+                requireDao().upsert(entity)
+                models.add(
+                    UserApiSource(
+                        id = entity.id,
+                        name = entity.name,
+                        description = entity.description,
+                        version = entity.version,
+                        author = entity.author,
+                        homepage = entity.homepage,
+                        script = entity.script,
+                        sourceUrl = entity.sourceUrl,
+                        enabled = true,
+                        priority = entity.priority,
+                        status = UserApiRuntimeStatus.INITIALIZING
+                    )
+                )
+            }
+            // Bump generations & publish in-memory state under priorityMutex so concurrent movePriorityUp cannot clobber order
+            models.forEach { bumpGeneration(it.id) }
+            val importedById = models.associateBy { it.id }
+            _sources.update { list ->
+                val updatedExisting = list.map { importedById[it.id] ?: it }
+                val existingIds = list.mapTo(HashSet()) { it.id }
+                val newlyAdded = models.filter { it.id !in existingIds }
+                (updatedExisting + newlyAdded).sortedBy { it.priority }
+            }
+            models
+        }
+
+        importedModels.forEach { model ->
+            scope.launch { startRuntime(model) }
+        }
+        return Result.success(
+            SourceImportBatchResult(
+                imported = importedModels,
+                skippedCount = parsed.skippedCount
+            )
+        )
+    }
+
+    suspend fun importRawPayload(
+        rawContent: String,
+        sourceUrl: String? = null,
+        fallbackName: String = "自定义音源"
+    ): Result<SourceImportBatchResult> = withContext(Dispatchers.IO) {
+        try {
+            require(rawContent.isNotBlank()) { "脚本内容为空" }
+            require(!rawContent.contains('\u0000')) { "文件包含二进制内容，不是有效的 JS 音源脚本或音源包" }
+            when (val parsed = LxScriptParser.parseScriptBundle(rawContent)) {
+                is ScriptBundleParseResult.NotBundle -> {
+                    importRawScript(rawContent, sourceUrl = sourceUrl, fallbackName = fallbackName)
+                        .map { SourceImportBatchResult(imported = listOf(it), skippedCount = 0) }
+                }
+                is ScriptBundleParseResult.InvalidBundle -> {
+                    Result.failure(IllegalArgumentException(parsed.errorMessage))
+                }
+                is ScriptBundleParseResult.ValidBundle -> importParsedBundle(parsed)
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
+    }
+
     suspend fun importRawScript(
         script: String,
         sourceUrl: String? = null,
@@ -531,48 +773,54 @@ class UserApiManager(
             require(normalizedScript.isNotBlank()) { "脚本内容为空" }
             require(!normalizedScript.contains('\u0000')) { "文件包含二进制内容，不是有效的 JS 音源脚本" }
             val scriptBytes = normalizedScript.toByteArray(StandardCharsets.UTF_8).size
-            require(scriptBytes <= 1 * 1024 * 1024) { "脚本体积过大（上限 1 MB），请导入标准 JS 音源文件" }
+            require(scriptBytes <= LxScriptParser.MAX_SINGLE_SCRIPT_BYTES) {
+                "脚本体积过大（上限 1 MB），请导入标准 JS 音源文件"
+            }
             val meta = LxScriptParser.parse(normalizedScript, fallbackName)
-            val existing = dao.getAllOnce()
-            val existingMatch = existing.firstOrNull { it.id == meta.id }
-            val priority = existingMatch?.priority ?: ((existing.maxOfOrNull { it.priority } ?: -1) + 1)
+            val model = priorityMutex.withLock {
+                val existing = requireDao().getAllOnce()
+                val existingMatch = existing.firstOrNull { it.id == meta.id }
+                val priority = existingMatch?.priority ?: ((existing.maxOfOrNull { it.priority } ?: -1) + 1)
 
-            val entity = UserApiEntity(
-                id = meta.id,
-                name = meta.name,
-                description = meta.description,
-                version = meta.version,
-                author = meta.author,
-                homepage = meta.homepage,
-                script = normalizedScript,
-                sourceUrl = sourceUrl ?: existingMatch?.sourceUrl,
-                enabled = true,
-                priority = priority,
-                addedAt = existingMatch?.addedAt ?: System.currentTimeMillis()
-            )
-            dao.upsert(entity)
+                val entity = UserApiEntity(
+                    id = meta.id,
+                    name = meta.name,
+                    description = meta.description,
+                    version = meta.version,
+                    author = meta.author,
+                    homepage = meta.homepage,
+                    script = normalizedScript,
+                    sourceUrl = sourceUrl ?: existingMatch?.sourceUrl,
+                    enabled = true,
+                    priority = priority,
+                    addedAt = existingMatch?.addedAt ?: System.currentTimeMillis()
+                )
+                requireDao().upsert(entity)
 
-            val model = UserApiSource(
-                id = entity.id,
-                name = entity.name,
-                description = entity.description,
-                version = entity.version,
-                author = entity.author,
-                homepage = entity.homepage,
-                script = entity.script,
-                sourceUrl = entity.sourceUrl,
-                enabled = true,
-                priority = entity.priority,
-                status = UserApiRuntimeStatus.INITIALIZING
-            )
-            _sources.update { list ->
-                val existsInMem = list.any { it.id == model.id }
-                val nextList = if (existsInMem) {
-                    list.map { if (it.id == model.id) model else it }
-                } else {
-                    list + model
+                val built = UserApiSource(
+                    id = entity.id,
+                    name = entity.name,
+                    description = entity.description,
+                    version = entity.version,
+                    author = entity.author,
+                    homepage = entity.homepage,
+                    script = entity.script,
+                    sourceUrl = entity.sourceUrl,
+                    enabled = true,
+                    priority = entity.priority,
+                    status = UserApiRuntimeStatus.INITIALIZING
+                )
+                bumpGeneration(built.id)
+                _sources.update { list ->
+                    val existsInMem = list.any { it.id == built.id }
+                    val nextList = if (existsInMem) {
+                        list.map { if (it.id == built.id) built else it }
+                    } else {
+                        list + built
+                    }
+                    nextList.sortedBy { it.priority }
                 }
-                nextList.sortedBy { it.priority }
+                built
             }
             scope.launch { startRuntime(model) }
             Result.success(model)
@@ -585,7 +833,7 @@ class UserApiManager(
 
     suspend fun toggleEnabled(id: String, enabled: Boolean) {
         bumpGeneration(id)
-        dao.setEnabled(id, enabled)
+        requireDao().setEnabled(id, enabled)
         if (!enabled) {
             runtimes.remove(id)?.destroy()
             clearCooldownsForSource(id)
@@ -616,7 +864,7 @@ class UserApiManager(
         bumpGeneration(id)
         runtimes.remove(id)?.destroy()
         clearCooldownsForSource(id)
-        dao.delete(id)
+        requireDao().delete(id)
         _sources.update { list -> list.filterNot { it.id == id } }
     }
 
@@ -680,7 +928,7 @@ class UserApiManager(
         }
 
         // Re-read live DB record after network I/O so we never resurrect a deleted source or revert user edits
-        val liveEntity = dao.getAllOnce().firstOrNull { it.id == id }
+        val liveEntity = requireDao().getAllOnce().firstOrNull { it.id == id }
             ?: return@withContext SourceUpdateResult(
                 sourceName = current.name,
                 oldVersion = current.version,
@@ -718,7 +966,7 @@ class UserApiManager(
             script = fetchedScript,
             sourceUrl = usedUrl ?: liveEntity.sourceUrl
         )
-        dao.upsert(updatedEntity)
+        requireDao().upsert(updatedEntity)
         updateSourceState(id) { live ->
             live.copy(
                 name = updatedEntity.name,
@@ -784,13 +1032,13 @@ class UserApiManager(
     }
 
     suspend fun movePriorityUp(id: String) = priorityMutex.withLock {
-        val current = dao.getAllOnce().toMutableList()
+        val current = requireDao().getAllOnce().toMutableList()
         val index = current.indexOfFirst { it.id == id }
         if (index <= 0) return@withLock
         val item = current.removeAt(index)
         current.add(index - 1, item)
         val updated = current.mapIndexed { idx, entity -> entity.copy(priority = idx) }
-        dao.updateAll(updated)
+        requireDao().updateAll(updated)
         clearCooldownsForSource(id)
 
         val priorityMap = updated.associate { it.id to it.priority }
@@ -948,6 +1196,13 @@ class UserApiManager(
             return@withContext Result.failure(IllegalStateException(msg))
         }
 
+        val hasPlatformSupport = hasReadySourceSupportingPlatform(readySources, track.source)
+        if (!hasPlatformSupport && !allowCrossPlatformFallback) {
+            return@withContext Result.failure(
+                buildUnsupportedPlatformFailure(track, allowCrossPlatformFallback = false)
+            )
+        }
+
         val prunedSourcePlatforms = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
         prunedSourcePlatforms.addAll(excludedSourcePlatforms)
         val prunedSourceTracks = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
@@ -962,6 +1217,7 @@ class UserApiManager(
         } else {
             emptyList()
         }
+        var matchedCrossPlatformCount = attachedAlts.size
 
         // Phase A: Healthy (non-cooling) sources — Primary -> Attached Alts -> Dynamic Alts
         if (track.id !in excludedTrackIds) {
@@ -1016,6 +1272,7 @@ class UserApiManager(
                 } else {
                     emptyList()
                 }
+                matchedCrossPlatformCount += dynamicAlts.size
 
                 if (dynamicAlts.isNotEmpty()) {
                     dynamicCandidates = dynamicAlts.distinctBy { it.source }.take(3)
@@ -1069,6 +1326,11 @@ class UserApiManager(
             }
         }
 
+        if (!hasPlatformSupport && matchedCrossPlatformCount == 0) {
+            return@withContext Result.failure(
+                buildUnsupportedPlatformFailure(track, allowCrossPlatformFallback = allowCrossPlatformFallback)
+            )
+        }
         Result.failure(IllegalStateException("所有音源与平台均无法获取《${track.title}》的可用音频流"))
     }
 
@@ -1166,7 +1428,7 @@ class UserApiManager(
             val gen = currentGeneration(source.id)
 
             LxQuickJsRuntime.ensureQuickJsLoaded()
-            val runtime = LxQuickJsRuntime(context, httpClient, liveSource)
+            val runtime = LxQuickJsRuntime(requireContext(), httpClient, liveSource)
             val init = try {
                 runtime.initialize(timeoutMs = 5_000L)
             } catch (ce: CancellationException) {

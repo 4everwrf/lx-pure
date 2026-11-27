@@ -23,6 +23,11 @@ func optimizeCoverUrlForSize(_ url: String?, isThumbnail: Bool) -> String? {
             }
         }
     }
+    if lower.contains("douyinpic.com"),
+       let resizeRange = trimmed.range(of: "-resize:\\d+:\\d+\\.png", options: [.regularExpression, .caseInsensitive]) {
+        let dim = isThumbnail ? "200:200" : "640:640"
+        return trimmed.replacingCharacters(in: resizeRange, with: "-resize:\(dim).png")
+    }
     return trimmed
 }
 

@@ -32,6 +32,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
             MusicSource.KW -> 2
             MusicSource.KG -> 1
             MusicSource.MG -> 0
+            MusicSource.SODA -> -1
         }
 
         /**
@@ -99,6 +100,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
     val qq = QqMusicProvider(httpClient)
     val kuwo = KuwoProvider(httpClient)
     val kugou = KugouProvider(httpClient)
+    val qishui = QishuiProvider(httpClient)
 
     suspend fun searchSinglePlatform(source: MusicSource, query: String, page: Int = 1, limit: Int = 25): List<Track> =
         when (source) {
@@ -190,6 +192,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
         MusicSource.WY -> netEase.getHotPlaylists(page)
         MusicSource.TX -> qq.getHotPlaylists(page)
         MusicSource.KW -> kuwo.getHotPlaylists(page)
+        MusicSource.SODA -> qishui.getHotPlaylists(page)
         else -> netEase.getHotPlaylists(page)
     }
 
@@ -197,6 +200,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
         MusicSource.WY -> netEase.leaderboards
         MusicSource.TX -> qq.leaderboards
         MusicSource.KW -> kuwo.leaderboards
+        MusicSource.SODA -> qishui.leaderboards
         else -> netEase.leaderboards
     }
 
@@ -204,6 +208,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
         MusicSource.WY -> netEase.getPlaylistDetail(idOrUrl)
         MusicSource.TX -> qq.getPlaylistDetail(idOrUrl)
         MusicSource.KW -> kuwo.getPlaylistDetail(idOrUrl)
+        MusicSource.SODA -> qishui.getPlaylistDetail(idOrUrl)
         else -> Result.failure(IllegalArgumentException("暂不支持该平台歌单详情"))
     }
 
@@ -211,6 +216,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
         MusicSource.WY -> netEase.getPlaylistDetail(board.bangId)
         MusicSource.TX -> qq.getLeaderboardDetail(board)
         MusicSource.KW -> kuwo.getLeaderboardDetail(board)
+        MusicSource.SODA -> qishui.getLeaderboardDetail(board)
         else -> Result.failure(IllegalArgumentException("暂不支持该平台榜单"))
     }
 
@@ -237,6 +243,7 @@ class MusicAggregator(httpClient: OkHttpClient) {
             MusicSource.TX -> qq.getLyric(track.songmid)
             MusicSource.KW -> kuwo.getLyric(track.songmid)
             MusicSource.KG -> kugou.getLyric(track)
+            MusicSource.SODA -> qishui.getLyric(track.songmid)
             else -> ParsedLyrics()
         }
         if (!direct.isEmpty) return direct

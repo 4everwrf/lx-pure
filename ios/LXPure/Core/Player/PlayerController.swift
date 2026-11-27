@@ -1364,6 +1364,12 @@ final class PlayerController: ObservableObject {
                     self.failedTrackIdsForCurrentTrack.removeAll()
                 }
                 let noSource = !self.userApiManager.hasReadySource()
+                let unsupportedWithoutFallback = !noSource &&
+                    !settings.autoFallbackSource &&
+                    !self.userApiManager.hasReadySourceSupporting(platformCode: track.source.code)
+                let preferFallbackErrorOnStop = !noSource &&
+                    !preserveExclusions &&
+                    !self.userApiManager.hasReadySourceSupporting(platformCode: track.source.code)
                 let msg = (preserveExclusions && !noSource)
                     ? "暂无其他可用音源或平台，点击播放可重新尝试默认音源"
                     : error.localizedDescription
@@ -1371,7 +1377,8 @@ final class PlayerController: ObservableObject {
                     track: track,
                     message: msg,
                     openSourceManager: noSource,
-                    allowAutoSkip: self.allowAutoSkipForCurrentLoad
+                    allowAutoSkip: self.allowAutoSkipForCurrentLoad && !unsupportedWithoutFallback,
+                    preferFallbackErrorOnStop: preferFallbackErrorOnStop
                 )
             }
         }
@@ -1562,7 +1569,8 @@ final class PlayerController: ObservableObject {
         track: Track,
         message: String,
         openSourceManager: Bool = false,
-        allowAutoSkip: Bool = true
+        allowAutoSkip: Bool = true,
+        preferFallbackErrorOnStop: Bool = false
     ) {
         wantsPlayback = false
         detachCurrentPlayerItem()
@@ -1577,10 +1585,23 @@ final class PlayerController: ObservableObject {
             return
         }
 
+        let unsupportedWithoutFallback = !track.isLocal &&
+            !settingsStore.settings.autoFallbackSource &&
+            userApiManager.hasReadySource() &&
+            !userApiManager.hasReadySourceSupporting(platformCode: track.source.code)
         let canAttemptAutoSkip = !track.isLocal &&
             allowAutoSkip &&
+            !unsupportedWithoutFallback &&
             networkAdvisor.isNetworkConnected() &&
             state.queue.indices.contains(state.currentIndex)
+
+        let trimmedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shouldPreferFallback = (preferFallbackErrorOnStop || !userApiManager.hasReadySourceSupporting(platformCode: track.source.code)) &&
+            !trimmedMessage.isEmpty &&
+            !track.isLocal
+        let stopMessage = shouldPreferFallback
+            ? message
+            : "《\(track.title)》暂无可用音源，已停止播放"
 
         if canAttemptAutoSkip {
             var candidateSkipped = autoSkippedTrackIndices
@@ -1603,12 +1624,12 @@ final class PlayerController: ObservableObject {
                     guard !Task.isCancelled, let self else { return }
                     self.recoveryTask = nil
                     guard self.activeLoadToken == failedLoadToken else { return }
-                    self.performAutoSkipAfterFailure()
+                    self.performAutoSkipAfterFailure(stopMessage: stopMessage)
                 }
                 return
             } else {
                 autoSkippedTrackIndices.removeAll()
-                events.send(PlayerUiEvent(message: "《\(track.title)》暂无可用音源，已停止播放"))
+                events.send(PlayerUiEvent(message: stopMessage))
                 return
             }
         }
@@ -1617,7 +1638,7 @@ final class PlayerController: ObservableObject {
         events.send(PlayerUiEvent(message: message))
     }
 
-    private func performAutoSkipAfterFailure() {
+    private func performAutoSkipAfterFailure(stopMessage: String? = nil) {
         guard !state.queue.isEmpty else { return }
         let outcome = queueNavigator.navigateNextOnFailure(
             queueSize: state.queue.count,
@@ -1638,7 +1659,7 @@ final class PlayerController: ObservableObject {
         case .stopAtEnd, .restartCurrent, .stayAtBoundary, .noOp:
             autoSkippedTrackIndices.removeAll()
             if let track = state.currentTrack {
-                events.send(PlayerUiEvent(message: "《\(track.title)》暂无可用音源，已停止播放"))
+                events.send(PlayerUiEvent(message: stopMessage ?? "《\(track.title)》暂无可用音源，已停止播放"))
             }
         }
     }

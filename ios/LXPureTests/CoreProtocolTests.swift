@@ -167,6 +167,40 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertEqual(parsed.lines[1].timeMs, 4500)
     }
 
+    func testParseQishuiWordTimingLyricsAndMusicSourceSodaContract() {
+        let qishuiLrc = """
+        [00:01.20]<0,250,0>汽<250,300,0>水<550,400,0>音<950,300,0>乐
+        [00:05.50]<0,500>Hello <500,600>World
+        [6800,1200]<0,400,0>第<400,400,0>三<800,400,0>行
+        """
+        let parsed = LrcParser.parse(qishuiLrc)
+        XCTAssertEqual(parsed.lines.count, 3)
+        XCTAssertEqual(parsed.lines[0].timeMs, 1200)
+        XCTAssertEqual(parsed.lines[0].text, "汽水音乐")
+        XCTAssertEqual(parsed.lines[1].timeMs, 5500)
+        XCTAssertEqual(parsed.lines[1].text, "Hello World")
+        XCTAssertEqual(parsed.lines[2].timeMs, 6800)
+        XCTAssertEqual(parsed.lines[2].text, "第三行")
+
+        XCTAssertEqual(MusicSource.soda.code, "soda")
+        XCTAssertEqual(MusicSource.soda.displayName, "汽水音乐")
+        XCTAssertEqual(MusicSource.soda.shortLabel, "汽水")
+        XCTAssertEqual(MusicSource.fromCode("SODA"), .soda)
+        XCTAssertEqual(MusicAggregator.platformPriority(.soda), -1)
+
+        let sodaTrack = Track(
+            id: "soda_999",
+            title: "测试汽水曲",
+            artist: "测试歌手",
+            source: .soda,
+            songmid: "999",
+            durationMs: 185_000
+        )
+        let dict = sodaTrack.toLxMusicInfoDictionary()
+        XCTAssertEqual(dict["source"] as? String, "soda")
+        XCTAssertEqual(dict["songmid"] as? String, "999")
+    }
+
     func testTrackSerializesToLxMusicInfoContract() {
         let track = Track(
             id: "tx_001abc",
@@ -228,6 +262,20 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertEqual(
             optimizeCoverUrlForSize("https://y.gtimg.cn/music/photo_new/T002R500x500M000001abc.jpg", isThumbnail: true),
             "https://y.gtimg.cn/music/photo_new/T002R300x300M000001abc.jpg"
+        )
+        XCTAssertEqual(
+            optimizeCoverUrlForSize(
+                "https://p3-luna.douyinpic.com/img/ies-music/abc.jpeg~tplv-b829550vbb-resize:500:500.png",
+                isThumbnail: true
+            ),
+            "https://p3-luna.douyinpic.com/img/ies-music/abc.jpeg~tplv-b829550vbb-resize:200:200.png"
+        )
+        XCTAssertEqual(
+            optimizeCoverUrlForSize(
+                "https://p3-luna.douyinpic.com/img/ies-music/abc.jpeg~tplv-b829550vbb-resize:500:500.png",
+                isThumbnail: false
+            ),
+            "https://p3-luna.douyinpic.com/img/ies-music/abc.jpeg~tplv-b829550vbb-resize:640:640.png"
         )
     }
 
@@ -330,7 +378,8 @@ final class CoreProtocolTests: XCTestCase {
         send(EVENT_NAMES.inited, {
           sources: {
             wy: { type: 'music', actions: ['musicUrl'], qualitys: ['128k', '320k', 'flac'] },
-            tx: { type: 'music', actions: ['musicUrl'], qualitys: ['128k', '320k'] }
+            tx: { type: 'music', actions: ['musicUrl'], qualitys: ['128k', '320k'] },
+            soda: { type: 'music', actions: ['musicUrl'], qualitys: ['128k', '320k'] }
           }
         })
         """
@@ -356,6 +405,7 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertTrue(initRes.success, "Expected JSC init success, got error: \(initRes.errorMessage ?? "none")")
         XCTAssertEqual(initRes.supportedPlatforms["wy"], ["128k", "320k", "flac"])
         XCTAssertEqual(initRes.supportedPlatforms["tx"], ["128k", "320k"])
+        XCTAssertEqual(initRes.supportedPlatforms["soda"], ["128k", "320k"])
 
         let track = Track(id: "wy_12345", title: "测试曲", artist: "测试歌手", source: .wy, songmid: "12345")
         let urlRes = await runtime.requestMusicUrl(track: track, quality: .flac, timeoutSeconds: 5.0)
@@ -365,6 +415,16 @@ final class CoreProtocolTests: XCTestCase {
             XCTAssertEqual(url, "https://cdn.example.com/wy/flac/\(expectedDigest)/32.flac")
         case .failure(let err):
             XCTFail("Expected mock script URL resolution success, got error: \(err.localizedDescription)")
+        }
+
+        let sodaTrack = Track(id: "soda_67890", title: "汽水测试曲", artist: "测试歌手", source: .soda, songmid: "67890")
+        let sodaRes = await runtime.requestMusicUrl(track: sodaTrack, quality: .q320k, timeoutSeconds: 5.0)
+        switch sodaRes {
+        case .success(let url):
+            let expectedDigest = LxCrypto.md5Hex("67890")
+            XCTAssertEqual(url, "https://cdn.example.com/soda/320k/\(expectedDigest)/32.flac")
+        case .failure(let err):
+            XCTFail("Expected mock script soda URL resolution success, got error: \(err.localizedDescription)")
         }
     }
 
@@ -1371,4 +1431,299 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertFalse(UserApiManager.isDeterministicTrackMiss("HTTP 403 Forbidden"))
         XCTAssertFalse(UserApiManager.isDeterministicTrackMiss("当前音质不可用"))
     }
+
+    @MainActor
+    func testParseAndImportMeloraJsonBundlesAndFinalUrlSandboxParity() async throws {
+        let scriptA = "/**\r\n * @name Alpha Demo\r\n * @version 1.2.0\r\n * @author TesterA\r\n */\r\n" +
+            "const { EVENT_NAMES, on, send } = globalThis.lx;\n" +
+            "on(EVENT_NAMES.request, async () => 'https://cdn.example.com/a.mp3');\n" +
+            "send(EVENT_NAMES.inited, { sources: { wy: { type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } } });"
+        let scriptB = "globalThis.lx.on('request', async () => 'https://cdn.example.com/b.mp3');\n" +
+            "globalThis.lx.send('inited', { sources: { kw: { type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } } });"
+
+        let meloraObj: [String: Any] = [
+            "app": "melora",
+            "type": "lx-sources",
+            "scripts": [
+                ["name": "Alpha_v1.2.0.js", "code": scriptA],
+                ["name": "FallbackSource.js", "code": scriptB],
+                ["name": "BadNumberCode.js", "code": 404],
+                ["name": "HtmlStub.js", "code": "<html><body>404 Not Found</body></html>"],
+                ["name": "NonLxText.js", "code": "just plain text without markers"]
+            ]
+        ]
+        let meloraData = try JSONSerialization.data(withJSONObject: meloraObj)
+        let meloraJson = String(decoding: meloraData, as: UTF8.self)
+
+        // 1. Melora bundle parsing with BOM, CRLF normalization, fallbackName cleanup, and skipping invalid items
+        let meloraResult = LxScriptParser.parseScriptBundle("\u{FEFF}" + meloraJson)
+        guard case .validBundle(let entries, let skippedCount) = meloraResult else {
+            XCTFail("Expected validBundle for Melora JSON, got \(meloraResult)")
+            return
+        }
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(skippedCount, 3)
+        XCTAssertEqual(entries[0].fallbackName, "Alpha_v1.2.0")
+        XCTAssertFalse(entries[0].script.contains("\r"))
+        XCTAssertEqual(LxScriptParser.parse(entries[0].script, fallbackName: entries[0].fallbackName).name, "Alpha Demo")
+        XCTAssertEqual(entries[1].fallbackName, "FallbackSource")
+        XCTAssertEqual(LxScriptParser.parse(entries[1].script, fallbackName: entries[1].fallbackName).name, "FallbackSource")
+
+        // Payload validator accepts Melora bundle while single-script validator keeps rejecting JSON
+        XCTAssertTrue(UserApiManager.isValidDownloadedPayload(meloraJson))
+        XCTAssertFalse(UserApiManager.isValidDownloadedScript(meloraJson))
+
+        // 2. Top-level array & single wrapped object formats
+        let arrayData = try JSONSerialization.data(withJSONObject: [["name": "ArrSrc.js", "script": scriptA]])
+        let arrayJson = String(decoding: arrayData, as: UTF8.self)
+        if case .validBundle(let arrEntries, _) = LxScriptParser.parseScriptBundle(arrayJson) {
+            XCTAssertEqual(arrEntries.count, 1)
+        } else {
+            XCTFail("Expected validBundle for top-level script array")
+        }
+        // P0-1 regression: top-level JSON array bundle must NEVER pass single-script validator (guards updateSingleSource)
+        XCTAssertFalse(UserApiManager.isValidDownloadedScript(arrayJson))
+        XCTAssertTrue(UserApiManager.isValidDownloadedPayload(arrayJson))
+
+        let wrappedData = try JSONSerialization.data(withJSONObject: ["name": "Wrapped.js", "code": scriptA])
+        let wrappedJson = String(decoding: wrappedData, as: UTF8.self)
+        if case .validBundle(let wrapEntries, _) = LxScriptParser.parseScriptBundle(wrappedJson) {
+            XCTAssertEqual(wrapEntries.count, 1)
+        } else {
+            XCTFail("Expected validBundle for single wrapped script object")
+        }
+
+        // 3. Regular standalone .js script returns .notBundle
+        XCTAssertEqual(LxScriptParser.parseScriptBundle(scriptA), .notBundle)
+        XCTAssertTrue(UserApiManager.isValidDownloadedScript(scriptA))
+        XCTAssertTrue(UserApiManager.isValidDownloadedPayload(scriptA))
+
+        // 4. Adversarial / dirty JSON & oversized inputs must be rejected cleanly (A4)
+        let errorJsonNumeric = #"{"code": 404, "message": "not found"}"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(errorJsonNumeric) {} else {
+            XCTFail("Expected invalidBundle for numeric error JSON")
+        }
+        XCTAssertFalse(UserApiManager.isValidDownloadedPayload(errorJsonNumeric))
+
+        let errorJsonString = #"{"code": "ERROR_LX_404", "message": "short string not script"}"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(errorJsonString) {} else {
+            XCTFail("Expected invalidBundle for short string error JSON")
+        }
+        XCTAssertFalse(UserApiManager.isValidDownloadedPayload(errorJsonString))
+
+        let shortTagArray = #"{"sources":["lx-api"]}"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(shortTagArray) {} else {
+            XCTFail("Expected invalidBundle for short non-script array item")
+        }
+        XCTAssertFalse(UserApiManager.isValidDownloadedPayload(shortTagArray))
+
+        let errorArrayLong = #"[{"error":"lx rate limit","detail":""# + String(repeating: "x", count: 200) + #""}]"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(errorArrayLong) {} else {
+            XCTFail("Expected invalidBundle for error JSON array")
+        }
+        XCTAssertFalse(UserApiManager.isValidDownloadedPayload(errorArrayLong))
+
+        let emptyScriptsJson = #"{"app":"melora","scripts":[]}"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(emptyScriptsJson) {} else {
+            XCTFail("Expected invalidBundle for empty scripts array")
+        }
+
+        let allInvalidJson = #"{"app":"melora","scripts":[{"name":"bad.js","code":"<html>404</html>"}]}"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(allInvalidJson) {} else {
+            XCTFail("Expected invalidBundle when all bundle entries are invalid")
+        }
+
+        let brokenJson = #"{"app":"melora","scripts":[{"name":"a","code":"broken"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(brokenJson) {} else {
+            XCTFail("Expected invalidBundle for broken JSON")
+        }
+
+        let brokenContentJson = #"{"app":"melora","content":"globalThis.lx broken"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(brokenContentJson) {} else {
+            XCTFail("Expected invalidBundle for broken content JSON")
+        }
+
+        let nulJson = "{\"app\":\"melora\",\"scripts\":[{\"name\":\"a\",\"code\":\"globalThis.lx\u{0000}\"}]}"
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(nulJson) {} else {
+            XCTFail("Expected invalidBundle for NUL byte payload")
+        }
+
+        let escapedNulJson = #"{"app":"melora","scripts":[{"name":"a.js","code":"globalThis.lx.send('inited', {});\u0000padding"}]}"#
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(escapedNulJson) {} else {
+            XCTFail("Expected invalidBundle for JSON-escaped NUL byte")
+        }
+
+        // Single-script download validator rejects NUL bytes and > 1 MB scripts
+        XCTAssertFalse(UserApiManager.isValidDownloadedScript(scriptA + "\u{0000}"))
+        let oversizedSingle = scriptA + "//" + String(repeating: "a", count: LxScriptParser.maxSingleScriptBytes)
+        XCTAssertFalse(UserApiManager.isValidDownloadedScript(oversizedSingle))
+
+        // > 1 MB entry inside bundle is skipped if valid siblings exist, and rejected if alone
+        let mixedOversizedData = try JSONSerialization.data(withJSONObject: [
+            "scripts": [
+                ["name": "Huge.js", "code": oversizedSingle],
+                ["name": "Ok.js", "code": scriptB]
+            ]
+        ])
+        let mixedOversizedJson = String(decoding: mixedOversizedData, as: UTF8.self)
+        if case .validBundle(let okEntries, let skippedOversized) = LxScriptParser.parseScriptBundle(mixedOversizedJson) {
+            XCTAssertEqual(okEntries.count, 1)
+            XCTAssertEqual(skippedOversized, 1)
+        } else {
+            XCTFail("Expected validBundle skipping oversized sibling entry")
+        }
+
+        let onlyOversizedData = try JSONSerialization.data(withJSONObject: [
+            "scripts": [["name": "Huge.js", "code": oversizedSingle]]
+        ])
+        let onlyOversizedJson = String(decoding: onlyOversizedData, as: UTF8.self)
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(onlyOversizedJson) {} else {
+            XCTFail("Expected invalidBundle when only entry exceeds 1 MB")
+        }
+
+        let hugePayload = "{\"scripts\":[\"" + String(repeating: "a", count: LxScriptParser.maxBundlePayloadBytes + 16) + "\"]}"
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(hugePayload) {} else {
+            XCTFail("Expected invalidBundle when payload exceeds 4 MB")
+        }
+        XCTAssertFalse(UserApiManager.isValidDownloadedPayload(hugePayload))
+
+        let fiftyOneItems: [[String: Any]] = (1...51).map { idx in
+            ["name": "S\(idx).js", "code": scriptB]
+        }
+        let fiftyOneData = try JSONSerialization.data(withJSONObject: ["scripts": fiftyOneItems])
+        let fiftyOneJson = String(decoding: fiftyOneData, as: UTF8.self)
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(fiftyOneJson) {} else {
+            XCTFail("Expected invalidBundle when bundle exceeds 50 scripts")
+        }
+        let fiftyOneArrayData = try JSONSerialization.data(withJSONObject: fiftyOneItems)
+        let fiftyOneArrayJson = String(decoding: fiftyOneArrayData, as: UTF8.self)
+        if case .invalidBundle = LxScriptParser.parseScriptBundle(fiftyOneArrayJson) {} else {
+            XCTFail("Expected invalidBundle when top-level array exceeds 50 scripts")
+        }
+        XCTAssertFalse(UserApiManager.isValidDownloadedPayload(fiftyOneArrayJson))
+
+        // 5. SourceImportBatchResult message formatting parity
+        let dummySource = UserApiSource(
+            id: "s1", name: "Alpha Demo", description: "", version: "1.0.0",
+            author: "Tester", homepage: "", script: scriptA, sourceUrl: nil, enabled: true, priority: 0
+        )
+        XCTAssertEqual(SourceImportBatchResult(imported: [], skippedCount: 0).formatUserMessage(), "未导入任何有效音源")
+        XCTAssertEqual(SourceImportBatchResult(imported: [dummySource], skippedCount: 0).formatUserMessage(), "已导入音源：Alpha Demo")
+        XCTAssertEqual(SourceImportBatchResult(imported: [dummySource, dummySource], skippedCount: 0).formatUserMessage(), "已导入 2 个音源")
+        XCTAssertEqual(SourceImportBatchResult(imported: [dummySource], skippedCount: 2).formatUserMessage(), "已导入 1 个音源（跳过 2 个无效项）")
+
+        // 6. End-to-end UserApiManager.importRawPayload:
+        //    - Pre-existing single source keeps its sourceUrl & priority when re-imported via bundle
+        //    - Duplicate ID inside same bundle deduplicates with latest winning and insertion order preserved
+        //    - Bundle URL is NEVER bound as sourceUrl on newly imported scripts
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxpure_bundle_test_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = LibraryStore(baseDirectory: tempDir)
+        let advisor = NetworkQualityAdvisor(startMonitoring: false, initialConnected: true, initialMetered: false)
+        let userApi = UserApiManager(
+            libraryStore: store,
+            session: .shared,
+            aggregator: MusicAggregator(session: .shared),
+            networkAdvisor: advisor
+        )
+        await userApi.awaitInitialLoadIfNeeded(timeoutSec: 2.0)
+
+        let existingSingleRes = await userApi.importRawScript(scriptA, sourceUrl: "https://example.com/alpha.js")
+        let existingSingle = try existingSingleRes.get()
+        XCTAssertEqual(existingSingle.priority, 0)
+        XCTAssertEqual(existingSingle.sourceUrl, "https://example.com/alpha.js")
+
+        let scriptAV2 = scriptA.replacingOccurrences(of: "@version 1.2.0", with: "@version 1.2.5")
+        let dedupBundleData = try JSONSerialization.data(withJSONObject: [
+            "app": "melora",
+            "type": "lx-sources",
+            "scripts": [
+                ["name": "Alpha_old.js", "code": scriptA],
+                ["name": "FallbackSource.js", "code": scriptB],
+                ["name": "Alpha_new.js", "code": scriptAV2],
+                ["name": "Invalid.js", "code": "<html>bad</html>"]
+            ]
+        ])
+        let dedupBundleJson = String(decoding: dedupBundleData, as: UTF8.self)
+
+        let batchRes = await userApi.importRawPayload(dedupBundleJson, sourceUrl: "https://example.com/melora-sources.json")
+        let batch = try batchRes.get()
+        XCTAssertEqual(batch.imported.count, 2)
+        XCTAssertEqual(batch.skippedCount, 1)
+        XCTAssertEqual(batch.imported[0].name, "Alpha Demo")
+        XCTAssertEqual(batch.imported[0].version, "1.2.5", "Duplicate ID in same bundle must keep latest entry")
+        XCTAssertEqual(batch.imported[0].priority, 0, "Existing source priority must be preserved")
+        XCTAssertEqual(batch.imported[0].sourceUrl, "https://example.com/alpha.js", "Existing single-script sourceUrl must be preserved")
+        XCTAssertEqual(batch.imported[1].name, "FallbackSource")
+        XCTAssertEqual(batch.imported[1].priority, 1)
+        XCTAssertNil(batch.imported[1].sourceUrl, "Bundle URL must not be bound as single-script update URL")
+
+        // 7. End-to-end JavaScriptCore sandbox forwards resp.finalUrl through user-api-preload.js
+        let finalUrlScript = """
+        /**
+         * @name FinalUrl Test Source
+         * @version 1.0.0
+         */
+        const { EVENT_NAMES, on, send, request } = globalThis.lx
+        on(EVENT_NAMES.request, () => new Promise((resolve, reject) => {
+          request('https://redirect.example.com/audio.mp3', { method: 'get', timeout: 5000 }, (err, resp) => {
+            if (err) return reject(err)
+            resolve(resp.finalUrl || '')
+          })
+        }))
+        send(EVENT_NAMES.inited, {
+          sources: { wy: { type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } }
+        })
+        """
+        let stubCfg = URLSessionConfiguration.ephemeral
+        stubCfg.protocolClasses = [FinalUrlStubURLProtocol.self]
+        let stubSession = URLSession(configuration: stubCfg)
+        let finalUrlMeta = LxScriptParser.parse(finalUrlScript)
+        let finalUrlSrc = UserApiSource(
+            id: finalUrlMeta.id, name: finalUrlMeta.name, description: finalUrlMeta.description,
+            version: finalUrlMeta.version, author: finalUrlMeta.author, homepage: finalUrlMeta.homepage,
+            script: finalUrlScript, sourceUrl: nil, enabled: true, priority: 0
+        )
+        let finalUrlRt = LxJsRuntime(session: stubSession, source: finalUrlSrc)
+        defer { finalUrlRt.destroy() }
+        let finalInitRes = await finalUrlRt.initialize(timeoutSeconds: 5.0)
+        XCTAssertTrue(finalInitRes.success, "Expected finalUrl mock script to initialize")
+        let dummyTrack = Track(id: "wy_100", title: "Demo", artist: "Tester", source: .wy, songmid: "100")
+        let finalRes = await finalUrlRt.requestMusicUrl(track: dummyTrack, quality: .q128k, timeoutSeconds: 5.0)
+        if case .success(let resolvedFinalUrl) = finalRes {
+            XCTAssertEqual(resolvedFinalUrl, "https://redirect.example.com/audio.mp3")
+        } else {
+            XCTFail("Expected resp.finalUrl to be forwarded through preload bridge")
+        }
+
+        // Cleanly tear down spawned JS runtimes and flush LibraryStore writes before tempDir removal
+        for imported in batch.imported {
+            await userApi.removeSource(id: imported.id)
+        }
+        store.flushPendingWrites()
+    }
+}
+
+private final class FinalUrlStubURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url,
+              let resp = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: ["Content-Type": "application/json"]
+              ) else {
+            return
+        }
+        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(#"{"ok":true}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

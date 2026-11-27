@@ -80,6 +80,7 @@ LX Pure（轻雪音乐）的定位是**轻量、极简、双端原生（Android 
    - `ios/project.yml`：`CURRENT_PROJECT_VERSION` (+1) 与 `MARKETING_VERSION`
    - 纯文档/流程/CI 调整不递增版本号。
 3. **构建与 CI 核查**：
+   - 发版提交标题（commit subject）及 Release 变更内容**必须使用中文**（因为 `.github/workflows/release.yml` 会直接提取 commit 标题生成 Release 更新日志），避免裸露 `@annotation`。
    - 本地必要时执行 `.\gradlew.bat assembleDebug --no-daemon --max-workers=2`（或 `assembleRelease`）。
    - 推送 `origin/main` 后核查 `gh run list`（Android CI、iOS CI、Auto Release APK & IPA 均绿灯）及 `gh release list`。
 4. **分支与工作区收尾**：按项目本地规则（见 `GEMINI.md`）完成发布后的本地分支同步，确保最终停留在干净的 `main` 分支。

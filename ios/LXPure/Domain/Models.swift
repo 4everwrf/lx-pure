@@ -7,6 +7,7 @@ enum MusicSource: String, Codable, CaseIterable, Identifiable, Hashable, Sendabl
     case kw
     case kg
     case mg
+    case soda
     case local
 
     var id: String { rawValue }
@@ -19,6 +20,7 @@ enum MusicSource: String, Codable, CaseIterable, Identifiable, Hashable, Sendabl
         case .kw: return "酷我音乐"
         case .kg: return "酷狗音乐"
         case .mg: return "咪咕音乐"
+        case .soda: return "汽水音乐"
         case .local: return "本地音乐"
         }
     }
@@ -30,6 +32,7 @@ enum MusicSource: String, Codable, CaseIterable, Identifiable, Hashable, Sendabl
         case .kw: return "酷我"
         case .kg: return "酷狗"
         case .mg: return "咪咕"
+        case .soda: return "汽水"
         case .local: return "本地"
         }
     }

@@ -9,12 +9,15 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -74,7 +77,7 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 
-private const val MAX_LOCAL_SCRIPT_BYTES = 1 * 1024 * 1024
+private const val MAX_LOCAL_IMPORT_BYTES = LxScriptParser.MAX_BUNDLE_PAYLOAD_BYTES
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -114,21 +117,21 @@ fun SourceManagerScreen(
                                 val n = input.read(buf)
                                 if (n == -1) break
                                 total += n
-                                if (total > MAX_LOCAL_SCRIPT_BYTES) {
-                                    error("文件过大（上限 1 MB），请选择标准 .js 音源脚本")
+                                if (total > MAX_LOCAL_IMPORT_BYTES) {
+                                    error("文件过大（上限 4 MB），请选择标准 .js 脚本或 .json 音源包")
                                 }
                                 out.write(buf, 0, n)
                             }
                             out.toByteArray()
                         } ?: error("无法读取该文件")
                         if (bytes.any { it == 0.toByte() }) {
-                            error("该文件是二进制文件，不是有效的 JS 音源脚本")
+                            error("该文件是二进制文件，不是有效的 JS 音源脚本或音源包")
                         }
                         val content = String(bytes, StandardCharsets.UTF_8)
-                        userApiManager.importRawScript(content).getOrThrow()
+                        userApiManager.importRawPayload(content).getOrThrow()
                     }
                 }
-                result.onSuccess { onMessage("已导入音源：${it.name}") }
+                result.onSuccess { onMessage(it.formatUserMessage()) }
                     .onFailure { onMessage("导入失败：${it.message}") }
             } finally {
                 isImporting = false
@@ -151,10 +154,16 @@ fun SourceManagerScreen(
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "返回", tint = lxColors.textPrimary)
             }
-            Column(modifier = Modifier.weight(1f)) {
-                Text("自定义音源管理", style = MaterialTheme.typography.titleLarge, color = lxColors.textPrimary)
-                Text("100% 兼容洛雪音乐 .js 自定义源协议", style = MaterialTheme.typography.bodyMedium, color = lxColors.textSecondary)
-            }
+            Text(
+                text = "自定义音源管理",
+                style = MaterialTheme.typography.titleLarge,
+                color = lxColors.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp)
+            )
             if (isImporting || isUpdatingAll) {
                 CircularProgressIndicator(
                     modifier = Modifier.padding(end = 14.dp).size(20.dp),
@@ -186,27 +195,35 @@ fun SourceManagerScreen(
         }
 
         LazyColumn(
-            contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = bottomPadding),
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 10.dp, bottom = bottomPadding),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             // 3 Quick Import Methods
             item {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(IntrinsicSize.Max),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     ImportActionTile(
                         icon = Icons.Rounded.Link,
                         title = "在线链接",
-                        subtitle = "粘贴 .js URL",
+                        subtitle = "粘贴 .js / .json",
                         enabled = !isImporting,
                         onClick = { showUrlDialog = true },
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .heightIn(min = 88.dp)
                     )
                     ImportActionTile(
                         icon = Icons.Rounded.FolderOpen,
                         title = "本地文件",
-                        subtitle = "选择 .js 文件",
+                        subtitle = "选择 .js / .json",
                         enabled = !isImporting,
                         onClick = {
                             runCatching {
@@ -215,34 +232,38 @@ fun SourceManagerScreen(
                                 onMessage("无法打开系统文件选择器")
                             }
                         },
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .heightIn(min = 88.dp)
                     )
                     ImportActionTile(
                         icon = Icons.Rounded.Code,
                         title = "粘贴脚本",
-                        subtitle = "源码导入",
+                        subtitle = "源码 / 音源包",
                         enabled = !isImporting,
                         onClick = { showPasteDialog = true },
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .heightIn(min = 88.dp)
                     )
                 }
             }
 
             if (sources.isEmpty()) {
                 item {
-                    GlassCard {
-                        Column(
+                    GlassCard(modifier = Modifier.fillMaxWidth()) {
+                        Box(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 20.dp, vertical = 28.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                            contentAlignment = Alignment.Center
                         ) {
-                            Text("尚未添加任何音源", style = MaterialTheme.typography.titleMedium, color = lxColors.textPrimary)
                             Text(
-                                text = "轻雪音乐本身不内置也不提供任何音源脚本，请通过上方三种方式自行导入合规的洛雪协议 .js 自定义源。支持同时启用多个源并按优先级自动切换兜底。",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = lxColors.textSecondary,
+                                text = "尚未添加任何音源",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = lxColors.textPrimary,
                                 textAlign = TextAlign.Center
                             )
                         }
@@ -335,7 +356,7 @@ fun SourceManagerScreen(
         SimpleTextInputDialog(
             title = "在线导入音源",
             placeholder = "https://.../lx-source.js",
-            supportingText = "支持 GitHub Raw、CDN 或任意 HTTPS 直链托管的洛雪 .js 音源脚本。",
+            supportingText = "支持 GitHub Raw、CDN 或任意 HTTPS 直链托管的洛雪 .js 音源脚本与 Melora .json 音源包。",
             confirmLabel = "下载并启用",
             onDismiss = { showUrlDialog = false },
             onConfirm = { url ->
@@ -344,8 +365,8 @@ fun SourceManagerScreen(
                 scope.launch {
                     isImporting = true
                     try {
-                        userApiManager.importFromUrl(url)
-                            .onSuccess { onMessage("已导入并启用：${it.name}") }
+                        userApiManager.importFromUrlPayload(url)
+                            .onSuccess { onMessage(it.formatUserMessage()) }
                             .onFailure { onMessage("导入失败：${it.message}") }
                     } finally {
                         isImporting = false
@@ -357,8 +378,8 @@ fun SourceManagerScreen(
 
     if (showPasteDialog) {
         SimpleTextInputDialog(
-            title = "粘贴音源脚本代码",
-            placeholder = "粘贴完整的洛雪自定义源 JavaScript 代码…",
+            title = "粘贴音源脚本或音源包",
+            placeholder = "粘贴完整的洛雪 .js 脚本或 Melora JSON 音源包…",
             confirmLabel = "保存并启用",
             singleLine = false,
             onDismiss = { showPasteDialog = false },
@@ -368,8 +389,8 @@ fun SourceManagerScreen(
                 scope.launch {
                     isImporting = true
                     try {
-                        userApiManager.importRawScript(code)
-                            .onSuccess { onMessage("已导入并启用：${it.name}") }
+                        userApiManager.importRawPayload(code)
+                            .onSuccess { onMessage(it.formatUserMessage()) }
                             .onFailure { onMessage("导入失败：${it.message}") }
                     } finally {
                         isImporting = false
@@ -392,12 +413,34 @@ private fun ImportActionTile(
     val lxColors = LocalLxColors.current
     GlassCard(modifier = modifier, cornerRadius = 16.dp, onClick = if (enabled) onClick else null) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 10.dp, vertical = 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)
         ) {
-            Icon(icon, contentDescription = null, tint = if (enabled) lxColors.accent else lxColors.textTertiary, modifier = Modifier.size(22.dp))
-            Text(title, style = MaterialTheme.typography.titleMedium, color = if (enabled) lxColors.textPrimary else lxColors.textTertiary)
-            Text(subtitle, style = MaterialTheme.typography.labelMedium, color = lxColors.textTertiary)
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (enabled) lxColors.accent else lxColors.textTertiary,
+                modifier = Modifier.size(22.dp)
+            )
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = if (enabled) lxColors.textPrimary else lxColors.textTertiary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.labelMedium,
+                color = lxColors.textTertiary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center
+            )
         }
     }
 }

@@ -2,7 +2,7 @@ import SwiftUI
 
 @MainActor
 final class DiscoverState: ObservableObject {
-    static let supportedSources: [MusicSource] = [.wy, .tx, .kw]
+    static let supportedSources: [MusicSource] = [.wy, .tx, .kw, .soda]
 
     @Published var selectedSource: MusicSource = .wy
     @Published private(set) var hotPlaylistsBySource: [MusicSource: [OnlinePlaylist]] = [:]
@@ -88,21 +88,24 @@ struct DiscoverView: View {
                         .font(.system(size: 28, weight: .bold))
                         .foregroundColor(lx.textPrimary)
 
-                    HStack(spacing: 10) {
-                        ForEach(platforms) { source in
-                            let active = source == state.selectedSource
-                            Button {
-                                state.selectSource(source)
-                            } label: {
-                                Text(source.displayName)
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundColor(active ? lx.onAccent : lx.textSecondary)
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 8)
-                                    .background(active ? lx.accent : lx.surfaceElevated)
-                                    .clipShape(Capsule())
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(platforms) { source in
+                                let active = source == state.selectedSource
+                                Button {
+                                    state.selectSource(source)
+                                } label: {
+                                    Text(source.displayName)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundColor(active ? lx.onAccent : lx.textSecondary)
+                                        .lineLimit(1)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 8)
+                                        .background(active ? lx.accent : lx.surfaceElevated)
+                                        .clipShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
                     }
                 }

@@ -728,6 +728,7 @@ class LxQuickJsRuntime(
                             put("headers", respHeaders)
                             put("binary", isBinary)
                             put("body", bodyElement)
+                            put("finalUrl", resp.request.url.toString())
                         })
                     }
                     postCallJs("response", payload.toString(), parentRequestKey)

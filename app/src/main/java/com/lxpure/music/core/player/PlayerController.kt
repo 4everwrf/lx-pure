@@ -2180,13 +2180,17 @@ class PlayerController(
                 }
                 val liveIdx = _state.value.queue.indexOfFirst { it.id == latestTrack.id }
                     .takeIf { it >= 0 } ?: _state.value.currentIndex
+                val isUnsupportedPlatformError = err is UserApiManager.UnsupportedSourcePlatformException
+                val disableAutoSkipForUnsupportedPlatform =
+                    err is UserApiManager.UnsupportedSourcePlatformException && !err.allowCrossPlatformFallback
                 handleAllSourcesFailed(
                     failedIndex = liveIdx,
                     failedTrack = latestTrack,
                     preserveExclusions = preserveExclusions,
-                    allowAutoSkip = allowAutoSkipForCurrentLoad,
+                    allowAutoSkip = allowAutoSkipForCurrentLoad && !disableAutoSkipForUnsupportedPlatform,
                     resumePositionMs = resumePositionMs,
-                    fallbackErrorMessage = err.message ?: "无法播放《${latestTrack.title}》"
+                    fallbackErrorMessage = err.message ?: "无法播放《${latestTrack.title}》",
+                    preferFallbackErrorOnStop = isUnsupportedPlatformError
                 )
             }
         }
@@ -2198,7 +2202,8 @@ class PlayerController(
         preserveExclusions: Boolean,
         allowAutoSkip: Boolean = allowAutoSkipForCurrentLoad,
         resumePositionMs: Long,
-        fallbackErrorMessage: String?
+        fallbackErrorMessage: String?,
+        preferFallbackErrorOnStop: Boolean = false
     ) {
         val liveState = _state.value
         val decision = PlaybackRecoveryPolicy.decideAutoSkipOnFailure(
@@ -2213,7 +2218,8 @@ class PlayerController(
             mode = liveState.repeatMode,
             autoSkippedIndices = autoSkippedTrackIndices,
             queueNavigator = queueNavigator,
-            fallbackErrorMessage = fallbackErrorMessage
+            fallbackErrorMessage = fallbackErrorMessage,
+            preferFallbackErrorOnStop = preferFallbackErrorOnStop
         )
         when (decision) {
             is AutoSkipDecision.SkipTo -> {

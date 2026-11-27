@@ -281,10 +281,14 @@ class DiscoverAndNetEaseRegressionTest {
 
     @Test
     fun discoverSourceNormalizationDefaultsUnsupportedSourcesToWy() {
-        assertEquals(listOf(MusicSource.WY, MusicSource.TX, MusicSource.KW), DISCOVER_SUPPORTED_SOURCES)
+        assertEquals(
+            listOf(MusicSource.WY, MusicSource.TX, MusicSource.KW, MusicSource.SODA),
+            DISCOVER_SUPPORTED_SOURCES
+        )
         assertEquals(MusicSource.WY, normalizeDiscoverSource(MusicSource.WY))
         assertEquals(MusicSource.TX, normalizeDiscoverSource(MusicSource.TX))
         assertEquals(MusicSource.KW, normalizeDiscoverSource(MusicSource.KW))
+        assertEquals(MusicSource.SODA, normalizeDiscoverSource(MusicSource.SODA))
         assertEquals(MusicSource.WY, normalizeDiscoverSource(MusicSource.KG))
         assertEquals(MusicSource.WY, normalizeDiscoverSource(MusicSource.MG))
         assertEquals(MusicSource.WY, normalizeDiscoverSource(MusicSource.LOCAL))

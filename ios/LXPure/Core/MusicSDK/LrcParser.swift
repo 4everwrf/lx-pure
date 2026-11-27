@@ -17,6 +17,10 @@ enum LrcParser {
         pattern: "\\(-?\\d+,-?\\d+(?:,-?\\d+)?\\)",
         options: []
     )
+    private static let qishuiWordRegex = try! NSRegularExpression(
+        pattern: "<-?\\d+,-?\\d+(?:,-?\\d+)?>",
+        options: []
+    )
 
     static func parse(_ rawLrc: String?, translation rawTranslation: String? = nil) -> ParsedLyrics {
         let (primary, primaryOffsetMs) = parseSingle(rawLrc)
@@ -95,20 +99,25 @@ enum LrcParser {
                 continue
             }
 
-            // Support NetEase YRC `[startMs,duration](word...)` lines
+            // Support NetEase YRC `[startMs,duration](word...)` lines and Qishui `<start,dur,0>` word tags
             if let yrcMatch = yrcLineRegex.firstMatch(in: line, options: [], range: fullRange),
                yrcMatch.numberOfRanges > 1 {
                 let timeStr = nsLine.substring(with: yrcMatch.range(at: 1))
                 guard let timeMs = Int64(timeStr) else { continue }
                 let remainder = nsLine.substring(from: yrcMatch.range.location + yrcMatch.range.length)
-                let cleaned = FormatUtils.decodeHtml(
-                    yrcWordRegex.stringByReplacingMatches(
-                        in: remainder,
-                        options: [],
-                        range: NSRange(location: 0, length: (remainder as NSString).length),
-                        withTemplate: ""
-                    ).trimmingCharacters(in: .whitespacesAndNewlines)
+                let withoutYrc = yrcWordRegex.stringByReplacingMatches(
+                    in: remainder,
+                    options: [],
+                    range: NSRange(location: 0, length: (remainder as NSString).length),
+                    withTemplate: ""
                 )
+                let withoutQishui = qishuiWordRegex.stringByReplacingMatches(
+                    in: withoutYrc,
+                    options: [],
+                    range: NSRange(location: 0, length: (withoutYrc as NSString).length),
+                    withTemplate: ""
+                )
+                let cleaned = FormatUtils.decodeHtml(withoutQishui.trimmingCharacters(in: .whitespacesAndNewlines))
                 if !cleaned.isEmpty {
                     result.append(LyricLine(timeMs: max(timeMs - offsetMs, 0), text: cleaned))
                 }
@@ -118,14 +127,19 @@ enum LrcParser {
             let matches = timeTagRegex.matches(in: line, options: [], range: fullRange)
             if matches.isEmpty { continue }
 
-            let text = FormatUtils.decodeHtml(
-                timeTagRegex.stringByReplacingMatches(
-                    in: line,
-                    options: [],
-                    range: fullRange,
-                    withTemplate: ""
-                ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let withoutTimeTags = timeTagRegex.stringByReplacingMatches(
+                in: line,
+                options: [],
+                range: fullRange,
+                withTemplate: ""
             )
+            let withoutQishuiWords = qishuiWordRegex.stringByReplacingMatches(
+                in: withoutTimeTags,
+                options: [],
+                range: NSRange(location: 0, length: (withoutTimeTags as NSString).length),
+                withTemplate: ""
+            )
+            let text = FormatUtils.decodeHtml(withoutQishuiWords.trimmingCharacters(in: .whitespacesAndNewlines))
             if text.isEmpty { continue }
 
             for m in matches {

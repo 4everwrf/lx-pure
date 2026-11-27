@@ -11,12 +11,14 @@ final class MusicAggregator: Sendable {
     let qq: QqMusicProvider
     let kuwo: KuwoProvider
     let kugou: KugouProvider
+    let qishui: QishuiProvider
 
     init(session: URLSession) {
         self.netEase = NetEaseProvider(session: session)
         self.qq = QqMusicProvider(session: session)
         self.kuwo = KuwoProvider(session: session)
         self.kugou = KugouProvider(session: session)
+        self.qishui = QishuiProvider(session: session)
     }
 
     static func platformPriority(_ source: MusicSource) -> Int {
@@ -27,6 +29,7 @@ final class MusicAggregator: Sendable {
         case .kw: return 2
         case .kg: return 1
         case .mg: return 0
+        case .soda: return -1
         }
     }
 
@@ -231,6 +234,7 @@ final class MusicAggregator: Sendable {
         case .wy: return await netEase.getHotPlaylists(page: page)
         case .tx: return await qq.getHotPlaylists(page: page)
         case .kw: return await kuwo.getHotPlaylists(page: page)
+        case .soda: return await qishui.getHotPlaylists(page: page)
         default: return await netEase.getHotPlaylists(page: page)
         }
     }
@@ -240,6 +244,7 @@ final class MusicAggregator: Sendable {
         case .wy: return netEase.leaderboards
         case .tx: return qq.leaderboards
         case .kw: return kuwo.leaderboards
+        case .soda: return qishui.leaderboards
         default: return netEase.leaderboards
         }
     }
@@ -249,6 +254,7 @@ final class MusicAggregator: Sendable {
         case .wy: return await netEase.getPlaylistDetail(rawIdOrUrl: idOrUrl)
         case .tx: return await qq.getPlaylistDetail(rawIdOrUrl: idOrUrl)
         case .kw: return await kuwo.getPlaylistDetail(rawIdOrUrl: idOrUrl)
+        case .soda: return await qishui.getPlaylistDetail(rawIdOrUrl: idOrUrl)
         default: return .failure(LxRuntimeError.message("暂不支持该平台歌单详情"))
         }
     }
@@ -258,6 +264,7 @@ final class MusicAggregator: Sendable {
         case .wy: return await netEase.getPlaylistDetail(rawIdOrUrl: board.bangId)
         case .tx: return await qq.getLeaderboardDetail(board: board)
         case .kw: return await kuwo.getLeaderboardDetail(board: board)
+        case .soda: return await qishui.getLeaderboardDetail(board: board)
         default: return .failure(LxRuntimeError.message("暂不支持该平台榜单"))
         }
     }
@@ -291,6 +298,7 @@ final class MusicAggregator: Sendable {
         case .tx: direct = await qq.getLyric(songmid: track.songmid)
         case .kw: direct = await kuwo.getLyric(songmid: track.songmid)
         case .kg: direct = await kugou.getLyric(track: track)
+        case .soda: direct = await qishui.getLyric(songmid: track.songmid)
         default: direct = ParsedLyrics()
         }
         if !direct.isEmpty { return direct }

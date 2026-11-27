@@ -120,7 +120,7 @@
    - 若为纯文档/注释/CI/流程微调：保持版本号不变，避免触发重复 Release。
 3. 构建与发布规范：
    - Windows 本地构建使用 `--no-daemon --max-workers=2`。
-   - 提交信息中避免裸露 `@annotation`（应使用反引号包裹如 `` `@MainActor` ``），防止 GitHub 误触发提及。
+   - 发版提交标题（commit subject）与 Release 变更内容**必须使用中文**（因为 `.github/workflows/release.yml` 直接提取提交标题生成 Release 变更记录）；提交信息中避免裸露 `@annotation`（应使用反引号包裹如 `` `@MainActor` ``），防止 GitHub 误触发提及。
    - 推送 `origin/main` 后核查 `gh run list`（Android CI、iOS CI、Auto Release APK & IPA）与 `gh release list`。
 4. 分支收尾：
    - 推送 `main` 后，遵循工作区 `GEMINI.md` 规则完成后续本地分支同步，确认当前停留在干净的 `main`。

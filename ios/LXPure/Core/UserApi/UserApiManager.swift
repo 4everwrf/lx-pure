@@ -51,6 +51,25 @@ struct BatchUpdateSummary: Sendable {
     }
 }
 
+struct SourceImportBatchResult: Sendable {
+    let imported: [UserApiSource]
+    let skippedCount: Int
+
+    init(imported: [UserApiSource], skippedCount: Int = 0) {
+        self.imported = imported
+        self.skippedCount = skippedCount
+    }
+
+    func formatUserMessage() -> String {
+        if imported.isEmpty { return "未导入任何有效音源" }
+        if imported.count == 1 && skippedCount == 0 {
+            return "已导入音源：\(imported[0].name)"
+        }
+        let base = "已导入 \(imported.count) 个音源"
+        return skippedCount > 0 ? "\(base)（跳过 \(skippedCount) 个无效项）" : base
+    }
+}
+
 final class UserApiManager: ObservableObject, @unchecked Sendable {
     @MainActor @Published private(set) var sources: [UserApiSource] = []
 
@@ -59,7 +78,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     private static let resolveTotalBudgetSec: TimeInterval = 16.0
     private static let initialReadyGraceSec: TimeInterval = 0.6
     private static let cooldownDurationSec: TimeInterval = 45.0
-    private static let maxScriptDownloadBytes: Int = 2 * 1024 * 1024
+    private static let maxScriptDownloadBytes: Int = LxScriptParser.maxBundlePayloadBytes
     private static let chromeUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     private static let searchablePlatformCodes: Set<String> = [
@@ -177,21 +196,42 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Validates a downloaded custom source script while rejecting HTML/JSON error pages
-    /// (including UTF-8 BOM prefixed responses).
+    /// Validates a downloaded custom source script while rejecting HTML/JSON error pages,
+    /// JSON source bundles (including top-level JSON arrays), NUL bytes, and oversized payloads.
     static func isValidDownloadedScript(_ content: String?) -> Bool {
         guard let content, content.count >= 150 else { return false }
+        guard !content.unicodeScalars.contains("\u{0000}") else { return false }
+        guard content.utf8.count <= LxScriptParser.maxSingleScriptBytes else { return false }
         var cleaned = content
         if cleaned.unicodeScalars.first == "\u{FEFF}" {
             cleaned = String(cleaned.unicodeScalars.dropFirst())
         }
         let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.hasPrefix("<"), !trimmed.hasPrefix("{") else { return false }
+        if trimmed.hasPrefix("[") {
+            if case .notBundle = LxScriptParser.parseScriptBundle(content) {
+                // Rare obfuscated JS starting with `[`
+            } else {
+                return false
+            }
+        }
         let lower = trimmed.lowercased()
         return lower.contains("lx") ||
             lower.contains("\\x6c\\x78") ||
             lower.contains("@name") ||
             lower.contains("globalthis")
+    }
+
+    static func isValidDownloadedPayload(_ content: String?) -> Bool {
+        guard let content, !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        switch LxScriptParser.parseScriptBundle(content) {
+        case .validBundle:
+            return true
+        case .invalidBundle:
+            return false
+        case .notBundle:
+            return isValidDownloadedScript(content)
+        }
     }
 
     /// Distinguishes infrastructure/runtime failures from per-track/per-tier misses
@@ -337,6 +377,29 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         return await importRawScript(script, sourceUrl: cleanUrl)
     }
 
+    func importFromUrlPayload(_ urlString: String) async -> Result<SourceImportBatchResult, Error> {
+        let cleanUrl = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = cleanUrl.lowercased()
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else {
+            return .failure(LxRuntimeError.message("请输入有效的 http:// 或 https:// 自定义源链接"))
+        }
+        guard let content = await downloadText(urlString: cleanUrl) else {
+            return .failure(LxRuntimeError.message("无法下载该音源链接"))
+        }
+        switch LxScriptParser.parseScriptBundle(content) {
+        case .validBundle(let entries, let skippedCount):
+            return await importParsedBundle(entries: entries, skippedCount: skippedCount)
+        case .invalidBundle(let reason):
+            return .failure(LxRuntimeError.message(reason))
+        case .notBundle:
+            guard Self.isValidDownloadedScript(content) else {
+                return .failure(LxRuntimeError.message("下载内容不是有效的自定义源 JavaScript 脚本或音源包"))
+            }
+            let singleRes = await importRawScript(content, sourceUrl: cleanUrl)
+            return singleRes.map { SourceImportBatchResult(imported: [$0], skippedCount: 0) }
+        }
+    }
+
     private func downloadText(urlString: String) async -> String? {
         guard let url = LxJsRuntime.parseLenientURL(urlString) else { return nil }
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
@@ -352,6 +415,114 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         return text
     }
 
+    private func importParsedBundle(
+        entries: [BundledScriptEntry],
+        skippedCount: Int
+    ) async -> Result<SourceImportBatchResult, Error> {
+        var orderedIds: [String] = []
+        var dedupedById: [String: (ParsedScriptMeta, String)] = [:]
+        for entry in entries {
+            let meta = LxScriptParser.parse(entry.script, fallbackName: entry.fallbackName)
+            if dedupedById[meta.id] == nil {
+                orderedIds.append(meta.id)
+            }
+            dedupedById[meta.id] = (meta, entry.script)
+        }
+
+        let orderedParsed: [(ParsedScriptMeta, String)] = orderedIds.compactMap { dedupedById[$0] }
+        let (importedModels, displacedInFlight): ([UserApiSource], [LxJsRuntime]) = await MainActor.run {
+            var existing = libraryStore.loadSavedUserApis()
+            var nextPriority = (existing.map(\.priority).max() ?? -1) + 1
+            var builtList: [UserApiSource] = []
+            for (meta, normalizedScript) in orderedParsed {
+                let existingIdx = existing.firstIndex { $0.id == meta.id }
+                let priority: Int
+                if let idx = existingIdx {
+                    priority = existing[idx].priority
+                } else {
+                    priority = nextPriority
+                    nextPriority += 1
+                }
+                // Never bind a multi-script JSON bundle URL as a single-script update URL
+                let mergedSourceUrl = existingIdx.flatMap { existing[$0].sourceUrl }
+                let built = UserApiSource(
+                    id: meta.id,
+                    name: meta.name,
+                    description: meta.description,
+                    version: meta.version,
+                    author: meta.author,
+                    homepage: meta.homepage,
+                    script: normalizedScript,
+                    sourceUrl: mergedSourceUrl,
+                    enabled: true,
+                    priority: priority,
+                    status: .initializing
+                )
+                if let idx = existingIdx {
+                    existing[idx] = built
+                } else {
+                    existing.append(built)
+                }
+                builtList.append(built)
+            }
+            libraryStore.saveUserApis(existing)
+
+            // Atomically bump generations and update snapshot on MainActor so concurrent movePriorityUp cannot clobber priorities
+            let (publishedCopy, oldInFlights): ([UserApiSource], [LxJsRuntime]) = self.withLock {
+                var displaced: [LxJsRuntime] = []
+                for model in builtList {
+                    self.runtimeGenerations[model.id] = (self.runtimeGenerations[model.id] ?? 0) &+ 1
+                    if let inflight = self.inFlightRuntimes.removeValue(forKey: model.id) {
+                        self.inFlightWaiterCounts.removeValue(forKey: model.id)
+                        displaced.append(inflight)
+                    }
+                }
+                var copy = self.sourcesSnapshot
+                for model in builtList {
+                    if let idx = copy.firstIndex(where: { $0.id == model.id }) {
+                        copy[idx] = model
+                    } else {
+                        copy.append(model)
+                    }
+                }
+                copy.sort { $0.priority < $1.priority }
+                self.sourcesSnapshot = copy
+                return (copy, displaced)
+            }
+            self.sources = publishedCopy
+            return (builtList, oldInFlights)
+        }
+
+        displacedInFlight.forEach { $0.destroy() }
+        for model in importedModels {
+            Task { await self.startRuntime(for: model) }
+        }
+        return .success(SourceImportBatchResult(imported: importedModels, skippedCount: skippedCount))
+    }
+
+    func importRawPayload(
+        _ rawContent: String,
+        sourceUrl: String? = nil,
+        fallbackName: String = "自定义音源"
+    ) async -> Result<SourceImportBatchResult, Error> {
+        guard !rawContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failure(LxRuntimeError.message("脚本内容为空"))
+        }
+        guard !rawContent.unicodeScalars.contains("\u{0000}") else {
+            return .failure(LxRuntimeError.message("文件包含二进制内容，不是有效的 JS 音源脚本或音源包"))
+        }
+
+        switch LxScriptParser.parseScriptBundle(rawContent) {
+        case .notBundle:
+            let singleRes = await importRawScript(rawContent, sourceUrl: sourceUrl, fallbackName: fallbackName)
+            return singleRes.map { SourceImportBatchResult(imported: [$0], skippedCount: 0) }
+        case .invalidBundle(let message):
+            return .failure(LxRuntimeError.message(message))
+        case .validBundle(let entries, let skippedCount):
+            return await importParsedBundle(entries: entries, skippedCount: skippedCount)
+        }
+    }
+
     func importRawScript(
         _ script: String,
         sourceUrl: String? = nil,
@@ -364,12 +535,12 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         guard !normalizedScript.unicodeScalars.contains("\u{0000}") else {
             return .failure(LxRuntimeError.message("文件包含二进制内容，不是有效的 JS 音源脚本"))
         }
-        guard normalizedScript.utf8.count <= 1 * 1024 * 1024 else {
+        guard normalizedScript.utf8.count <= LxScriptParser.maxSingleScriptBytes else {
             return .failure(LxRuntimeError.message("脚本体积过大（上限 1 MB），请导入标准 JS 音源文件"))
         }
 
         let meta = LxScriptParser.parse(normalizedScript, fallbackName: fallbackName)
-        let model: UserApiSource = await MainActor.run {
+        let (model, displacedInFlight): (UserApiSource, LxJsRuntime?) = await MainActor.run {
             var existing = libraryStore.loadSavedUserApis()
             let existingIdx = existing.firstIndex { $0.id == meta.id }
             let priority = existingIdx.map { existing[$0].priority }
@@ -396,26 +567,27 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                 existing.append(built)
             }
             libraryStore.saveUserApis(existing)
-            return built
-        }
 
-        // Bump generation before updating snapshot so an earlier finishing runtime for this id cannot clobber the import
-        _ = bumpGeneration(for: model.id)
-
-        // Update only the imported source in memory so other healthy runtimes keep playing uninterrupted
-        let nextList: [UserApiSource] = withLock {
-            var copy = sourcesSnapshot
-            if let idx = copy.firstIndex(where: { $0.id == model.id }) {
-                copy[idx] = model
-            } else {
-                copy.append(model)
+            // Atomically bump generation & update snapshot on MainActor alongside persistence
+            let (publishedCopy, oldInFlight): ([UserApiSource], LxJsRuntime?) = self.withLock {
+                self.runtimeGenerations[built.id] = (self.runtimeGenerations[built.id] ?? 0) &+ 1
+                let inflight = self.inFlightRuntimes.removeValue(forKey: built.id)
+                self.inFlightWaiterCounts.removeValue(forKey: built.id)
+                var copy = self.sourcesSnapshot
+                if let idx = copy.firstIndex(where: { $0.id == built.id }) {
+                    copy[idx] = built
+                } else {
+                    copy.append(built)
+                }
+                copy.sort { $0.priority < $1.priority }
+                self.sourcesSnapshot = copy
+                return (copy, inflight)
             }
-            copy.sort { $0.priority < $1.priority }
-            sourcesSnapshot = copy
-            return copy
+            self.sources = publishedCopy
+            return (built, oldInFlight)
         }
-        await publishCurrentSnapshot()
-        _ = nextList
+
+        displacedInFlight?.destroy()
         Task { await self.startRuntime(for: model) }
         return .success(model)
     }
@@ -475,9 +647,9 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
     }
 
     func movePriorityUp(id: String) async {
-        let reorderedPriorities: [String: Int] = await MainActor.run {
+        let didReorder: Bool = await MainActor.run {
             var saved = libraryStore.loadSavedUserApis()
-            guard let idx = saved.firstIndex(where: { $0.id == id }), idx > 0 else { return [:] }
+            guard let idx = saved.firstIndex(where: { $0.id == id }), idx > 0 else { return false }
             let item = saved.remove(at: idx)
             saved.insert(item, at: idx - 1)
             var map: [String: Int] = [:]
@@ -486,20 +658,20 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                 map[saved[i].id] = i
             }
             libraryStore.saveUserApis(saved)
-            return map
-        }
-        guard !reorderedPriorities.isEmpty else { return }
-        clearCooldowns(forSourceId: id)
-
-        withLock {
-            for i in sourcesSnapshot.indices {
-                if let p = reorderedPriorities[sourcesSnapshot[i].id] {
-                    sourcesSnapshot[i].priority = p
+            let updatedSnapshot: [UserApiSource] = self.withLock {
+                for i in self.sourcesSnapshot.indices {
+                    if let p = map[self.sourcesSnapshot[i].id] {
+                        self.sourcesSnapshot[i].priority = p
+                    }
                 }
+                self.sourcesSnapshot.sort { $0.priority < $1.priority }
+                return self.sourcesSnapshot
             }
-            sourcesSnapshot.sort { $0.priority < $1.priority }
+            self.sources = updatedSnapshot
+            return true
         }
-        await publishCurrentSnapshot()
+        guard didReorder else { return }
+        clearCooldowns(forSourceId: id)
     }
 
     func updateSingleSource(id: String) async -> SourceUpdateResult {
@@ -804,6 +976,16 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
             return .failure(LxRuntimeError.message(msg))
         }
 
+        let trackPlatformCode = track.source.code.lowercased()
+        let hasReadyForTrackPlatform = readySources.contains {
+            $0.supportedPlatforms[trackPlatformCode] != nil
+        }
+        if !hasReadyForTrackPlatform && !allowCrossPlatformFallback {
+            return .failure(LxRuntimeError.message(
+                "当前自定义音源不支持\(track.source.displayName)，请在设置开启「无感自动换源兜底」或导入支持\(track.source.displayName)的音源"
+            ))
+        }
+
         let prunedPlatformsBox = PrunedSetBox(initial: excludedSourcePlatforms)
         let prunedTracksBox = PrunedSetBox(initial: excludedSourceTracks)
         let missCounterBox = MissCounterBox()
@@ -814,6 +996,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                 .filter { !excludedTrackIds.contains($0.id) }
                 .sorted { MusicAggregator.platformPriority($0.source) > MusicAggregator.platformPriority($1.source) }
             : []
+        var matchedCrossPlatformCount = attachedAlts.count
 
         // Phase A: Healthy (non-cooling) sources — Primary -> Attached Alts -> Dynamic Alts
         if !excludedTrackIds.contains(track.id) {
@@ -876,6 +1059,7 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
                 if Task.isCancelled { return .failure(CancellationError()) }
 
                 let dynamicAlts = rawDynamicAlts.filter { !attemptedTrackIds.contains($0.id) }
+                matchedCrossPlatformCount += dynamicAlts.count
                 if !dynamicAlts.isEmpty {
                     var seenPlatforms = Set<MusicSource>()
                     dynamicCandidates = Array(dynamicAlts.filter { seenPlatforms.insert($0.source).inserted }.prefix(3))
@@ -938,6 +1122,11 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
         }
 
         if Task.isCancelled { return .failure(CancellationError()) }
+        if !hasReadyForTrackPlatform && matchedCrossPlatformCount == 0 {
+            return .failure(LxRuntimeError.message(
+                "当前自定义音源不支持\(track.source.displayName)，且暂未在其他平台匹配到《\(track.title)》"
+            ))
+        }
         return .failure(LxRuntimeError.message("所有音源与平台均无法获取《\(track.title)》的可用音频流"))
     }
 
@@ -1343,6 +1532,13 @@ final class UserApiManager: ObservableObject, @unchecked Sendable {
 
     func hasReadySource() -> Bool {
         currentSources().contains { $0.enabled && $0.status == .ready }
+    }
+
+    func hasReadySourceSupporting(platformCode: String) -> Bool {
+        let normalized = platformCode.lowercased()
+        return currentSources().contains {
+            $0.enabled && $0.status == .ready && $0.supportedPlatforms[normalized] != nil
+        }
     }
 
     func readySourcesSnapshot(preferredSourceId: String? = nil) -> [UserApiSource] {

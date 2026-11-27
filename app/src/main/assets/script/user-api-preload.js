@@ -214,13 +214,14 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
   const events = {
     request: null,
   }
-  const allSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'local']
+  const allSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'soda', 'local']
   const supportQualitys = {
     kw: ['128k', '320k', 'flac', 'flac24bit'],
     kg: ['128k', '320k', 'flac', 'flac24bit'],
     tx: ['128k', '320k', 'flac', 'flac24bit'],
     wy: ['128k', '320k', 'flac', 'flac24bit'],
     mg: ['128k', '320k', 'flac', 'flac24bit'],
+    soda: ['128k', '320k', 'flac', 'flac24bit'],
     local: [],
   }
   const supportActions = {
@@ -229,6 +230,7 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
     tx: ['musicUrl'],
     wy: ['musicUrl'],
     mg: ['musicUrl'],
+    soda: ['musicUrl'],
     xm: ['musicUrl'],
     local: ['musicUrl', 'lyric', 'pic'],
   }
@@ -584,6 +586,7 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
             statusMessage: resp.statusMessage,
             headers: resp.headers,
             body: resp.body,
+            finalUrl: resp.finalUrl,
           }, resp.body)
         }
       })

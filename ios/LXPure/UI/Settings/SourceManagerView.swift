@@ -20,36 +20,32 @@ struct SourceManagerView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: 14) {
+            LazyVStack(alignment: .leading, spacing: 16) {
                 // 3 Quick Import Methods
-                HStack(spacing: 10) {
-                    importTile(icon: "link", title: "在线链接", subtitle: "粘贴 .js URL", disabled: isImporting) {
+                HStack(alignment: .center, spacing: 10) {
+                    importTile(icon: "link", title: "在线链接", subtitle: "粘贴 .js / .json", disabled: isImporting) {
                         urlInput = ""
                         showUrlSheet = true
                     }
-                    importTile(icon: "folder", title: "本地文件", subtitle: "选择 .js 文件", disabled: isImporting) {
+                    importTile(icon: "folder", title: "本地文件", subtitle: "选择 .js / .json", disabled: isImporting) {
                         showJsFilePicker = true
                     }
-                    importTile(icon: "chevron.left.forwardslash.chevron.right", title: "粘贴脚本", subtitle: "源码导入", disabled: isImporting) {
+                    importTile(icon: "chevron.left.forwardslash.chevron.right", title: "粘贴脚本", subtitle: "源码 / 音源包", disabled: isImporting) {
                         pasteInput = ""
                         showPasteSheet = true
                     }
                 }
+                .fixedSize(horizontal: false, vertical: true)
 
                 if userApiManager.sources.isEmpty {
                     GlassCard(cornerRadius: 18) {
-                        VStack(spacing: 8) {
-                            Text("尚未添加任何音源")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(lx.textPrimary)
-                            Text("轻雪音乐本身不内置也不提供任何音源脚本，请通过上方三种方式自行导入合规的洛雪协议 .js 自定义源。支持同时启用多个源并按优先级自动切换兜底。")
-                                .font(.system(size: 12))
-                                .foregroundColor(lx.textSecondary)
-                                .multilineTextAlignment(.center)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 28)
+                        Text("尚未添加任何音源")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(lx.textPrimary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 28)
                     }
                 } else {
                     ForEach(Array(userApiManager.sources.enumerated()), id: \.element.id) { index, source in
@@ -58,7 +54,7 @@ struct SourceManagerView: View {
                 }
             }
             .padding(.horizontal, 18)
-            .padding(.top, 10)
+            .padding(.top, 12)
             .padding(.bottom, bottomInset)
         }
         .background(lx.background)
@@ -91,7 +87,7 @@ struct SourceManagerView: View {
         }
         .fileImporter(
             isPresented: $showJsFilePicker,
-            allowedContentTypes: [.javaScript, .plainText, .data],
+            allowedContentTypes: [.javaScript, .json, .plainText, .data],
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -100,31 +96,32 @@ struct SourceManagerView: View {
                 isImporting = true
                 Task {
                     defer { isImporting = false }
+                    let maxBytes = LxScriptParser.maxBundlePayloadBytes
                     let fileReadResult: Result<String, Error> = await Task.detached(priority: .userInitiated) {
                         let accessed = url.startAccessingSecurityScopedResource()
                         defer { if accessed { url.stopAccessingSecurityScopedResource() } }
                         let values = try? url.resourceValues(forKeys: [.fileSizeKey])
-                        if let size = values?.fileSize, size > 1_048_576 {
+                        if let size = values?.fileSize, size > maxBytes {
                             return .failure(NSError(
                                 domain: "SourceImport",
                                 code: -1,
-                                userInfo: [NSLocalizedDescriptionKey: "脚本文件过大（超过 1 MB），请确认选择的是 .js 音源脚本"]
+                                userInfo: [NSLocalizedDescriptionKey: "文件过大（超过 4 MB），请选择标准 .js 脚本或 .json 音源包"]
                             ))
                         }
                         do {
                             let data = try Data(contentsOf: url, options: .mappedIfSafe)
-                            if data.count > 1_048_576 {
+                            if data.count > maxBytes {
                                 return .failure(NSError(
                                     domain: "SourceImport",
                                     code: -1,
-                                    userInfo: [NSLocalizedDescriptionKey: "脚本文件过大（超过 1 MB），请确认选择的是 .js 音源脚本"]
+                                    userInfo: [NSLocalizedDescriptionKey: "文件过大（超过 4 MB），请选择标准 .js 脚本或 .json 音源包"]
                                 ))
                             }
                             if data.contains(0) {
                                 return .failure(NSError(
                                     domain: "SourceImport",
                                     code: -2,
-                                    userInfo: [NSLocalizedDescriptionKey: "文件包含非文本二进制内容，请确认选择的是 UTF-8 编码 .js 脚本"]
+                                    userInfo: [NSLocalizedDescriptionKey: "文件包含非文本二进制内容，请确认选择的是 UTF-8 编码 .js 脚本或 .json 音源包"]
                                 ))
                             }
                             guard let text = String(data: data, encoding: .utf8) else {
@@ -141,12 +138,12 @@ struct SourceManagerView: View {
                     }.value
                     switch fileReadResult {
                     case .success(let content):
-                        let res = await userApiManager.importRawScript(
+                        let res = await userApiManager.importRawPayload(
                             content,
                             fallbackName: url.deletingPathExtension().lastPathComponent
                         )
                         switch res {
-                        case .success(let src): onMessage("已导入音源：\(src.name)")
+                        case .success(let batch): onMessage(batch.formatUserMessage())
                         case .failure(let err): onMessage("导入失败：\(err.localizedDescription)")
                         }
                     case .failure(let err):
@@ -160,7 +157,7 @@ struct SourceManagerView: View {
         .sheet(isPresented: $showUrlSheet) {
             NavigationStack {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("请输入有效的 http:// 或 https:// 洛雪协议 .js 脚本直链。")
+                    Text("请输入有效的 http:// 或 https:// 洛雪 .js 脚本直链或 Melora .json 音源包链接。")
                         .font(.system(size: 13))
                         .foregroundColor(lx.textSecondary)
 
@@ -193,9 +190,9 @@ struct SourceManagerView: View {
                             isImporting = true
                             Task {
                                 defer { isImporting = false }
-                                let res = await userApiManager.importFromUrl(targetUrl)
+                                let res = await userApiManager.importFromUrlPayload(targetUrl)
                                 switch res {
-                                case .success(let src): onMessage("已导入音源：\(src.name)")
+                                case .success(let batch): onMessage(batch.formatUserMessage())
                                 case .failure(let err): onMessage("导入失败：\(err.localizedDescription)")
                                 }
                             }
@@ -210,7 +207,7 @@ struct SourceManagerView: View {
         .sheet(isPresented: $showPasteSheet) {
             NavigationStack {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("将完整的洛雪 .js 自定义源脚本源码粘贴至下方。")
+                    Text("将完整的洛雪 .js 自定义源脚本或 Melora JSON 音源包粘贴至下方。")
                         .font(.system(size: 13))
                         .foregroundColor(lx.textSecondary)
 
@@ -225,7 +222,7 @@ struct SourceManagerView: View {
                 }
                 .padding(18)
                 .background(lx.background)
-                .navigationTitle("粘贴脚本源码")
+                .navigationTitle("粘贴脚本或音源包")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
@@ -240,9 +237,9 @@ struct SourceManagerView: View {
                             isImporting = true
                             Task {
                                 defer { isImporting = false }
-                                let res = await userApiManager.importRawScript(code)
+                                let res = await userApiManager.importRawPayload(code)
                                 switch res {
-                                case .success(let src): onMessage("已导入音源：\(src.name)")
+                                case .success(let batch): onMessage(batch.formatUserMessage())
                                 case .failure(let err): onMessage("导入失败：\(err.localizedDescription)")
                                 }
                             }
@@ -279,22 +276,31 @@ struct SourceManagerView: View {
     private func importTile(icon: String, title: String, subtitle: String, disabled: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             GlassCard(cornerRadius: 16) {
-                VStack(spacing: 6) {
+                VStack(alignment: .center, spacing: 6) {
                     Image(systemName: icon)
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundColor(lx.accent)
+                        .frame(width: 22, height: 22)
                     Text(title)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(lx.textPrimary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
                     Text(subtitle)
                         .font(.system(size: 10))
                         .foregroundColor(lx.textTertiary)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.85)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity, minHeight: 88, maxHeight: .infinity)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 12)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .buttonStyle(.plain)
         .disabled(disabled)
         .opacity(disabled ? 0.55 : 1)

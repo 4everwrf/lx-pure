@@ -697,6 +697,7 @@ final class LxJsRuntime: @unchecked Sendable {
                 }
             }
 
+            let finalUrlStr = httpResp?.url?.absoluteString ?? url.absoluteString
             let payload: [String: Any] = [
                 "requestKey": requestKey,
                 "error": NSNull(),
@@ -705,7 +706,8 @@ final class LxJsRuntime: @unchecked Sendable {
                     "statusMessage": statusMessage,
                     "headers": respHeaders,
                     "binary": isBinary,
-                    "body": bodyPayload
+                    "body": bodyPayload,
+                    "finalUrl": finalUrlStr
                 ]
             ]
 

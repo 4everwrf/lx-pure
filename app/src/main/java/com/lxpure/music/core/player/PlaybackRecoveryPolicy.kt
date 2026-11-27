@@ -269,7 +269,8 @@ object PlaybackRecoveryPolicy {
         mode: RepeatMode,
         autoSkippedIndices: Set<Int>,
         queueNavigator: QueueNavigator,
-        fallbackErrorMessage: String? = null
+        fallbackErrorMessage: String? = null,
+        preferFallbackErrorOnStop: Boolean = false
     ): AutoSkipDecision {
         if (!hasReadySource && !isLocalTrack) {
             return AutoSkipDecision.Stop(
@@ -302,11 +303,17 @@ object PlaybackRecoveryPolicy {
             )
         }
 
+        val stopNotice = if (preferFallbackErrorOnStop && !fallbackErrorMessage.isNullOrBlank()) {
+            fallbackErrorMessage
+        } else {
+            "《$trackTitle》暂无可用音源，已停止播放"
+        }
+
         val updatedSkipped = autoSkippedIndices + currentIndex
         val maxChain = minOf(queueSize, MAX_AUTO_SKIP_CHAIN)
         if (queueSize <= 1 || updatedSkipped.size >= maxChain) {
             return AutoSkipDecision.Stop(
-                noticeMessage = "《$trackTitle》暂无可用音源，已停止播放",
+                noticeMessage = stopNotice,
                 promptImportSource = false
             )
         }
@@ -319,7 +326,7 @@ object PlaybackRecoveryPolicy {
         )
         if (targetIndex == null || targetIndex in updatedSkipped || targetIndex == currentIndex) {
             return AutoSkipDecision.Stop(
-                noticeMessage = "《$trackTitle》暂无可用音源，已停止播放",
+                noticeMessage = stopNotice,
                 promptImportSource = false
             )
         }

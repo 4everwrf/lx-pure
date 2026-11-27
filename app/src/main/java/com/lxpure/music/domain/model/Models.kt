@@ -15,6 +15,7 @@ enum class MusicSource(val code: String, val displayName: String, val shortLabel
     KW("kw", "酷我音乐", "酷我"),
     KG("kg", "酷狗音乐", "酷狗"),
     MG("mg", "咪咕音乐", "咪咕"),
+    SODA("soda", "汽水音乐", "汽水"),
     LOCAL("local", "本地音乐", "本地");
 
     companion object {

@@ -70,7 +70,12 @@ import com.lxpure.music.ui.components.TrackListFastScroller
 import com.lxpure.music.ui.components.TrackListItem
 import com.lxpure.music.ui.theme.LocalLxColors
 
-val DISCOVER_SUPPORTED_SOURCES: List<MusicSource> = listOf(MusicSource.WY, MusicSource.TX, MusicSource.KW)
+val DISCOVER_SUPPORTED_SOURCES: List<MusicSource> = listOf(
+    MusicSource.WY,
+    MusicSource.TX,
+    MusicSource.KW,
+    MusicSource.SODA
+)
 
 fun normalizeDiscoverSource(source: MusicSource): MusicSource =
     if (source in DISCOVER_SUPPORTED_SOURCES) source else MusicSource.WY
@@ -190,18 +195,23 @@ fun DiscoverScreen(
     ) {
         item {
             Column(
-                modifier = Modifier.padding(horizontal = 20.dp),
+                modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Text(
                     text = "发现",
                     style = MaterialTheme.typography.headlineLarge,
-                    color = lxColors.textPrimary
+                    color = lxColors.textPrimary,
+                    modifier = Modifier.padding(horizontal = 20.dp)
                 )
 
-                // Minimalist Platform Segmented Pills
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    platforms.forEach { source ->
+                // Minimalist Platform Segmented Pills (horizontally scrollable for narrow screens)
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 20.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(platforms, key = { it.code }) { source ->
                         val active = source == selectedSource
                         Surface(
                             onClick = { onSelectSource(source) },
@@ -212,6 +222,8 @@ fun DiscoverScreen(
                                 text = source.displayName,
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
                                 color = if (active) onPrimaryColor else lxColors.textSecondary,
+                                maxLines = 1,
+                                softWrap = false,
                                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                             )
                         }

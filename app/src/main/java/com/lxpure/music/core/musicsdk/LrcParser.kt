@@ -9,6 +9,7 @@ object LrcParser {
     private val offsetTagRegex = Regex("^\\[offset:([+-]?\\d+)]$", RegexOption.IGNORE_CASE)
     private val yrcLineRegex = Regex("^\\[(\\d+),\\d+]")
     private val yrcWordRegex = Regex("\\(-?\\d+,-?\\d+(?:,-?\\d+)?\\)")
+    private val qishuiWordRegex = Regex("<-?\\d+,-?\\d+(?:,-?\\d+)?>")
 
     fun parse(rawLrc: String?, rawTranslation: String? = null): ParsedLyrics {
         val (primary, primaryOffsetMs) = parseSingle(rawLrc)
@@ -65,13 +66,14 @@ object LrcParser {
                 return@forEach
             }
 
-            // Support NetEase YRC `[startMs,duration](word...)` lines
+            // Support NetEase YRC `[startMs,duration](word...)` and Qishui `[startMs,duration]<word...>` lines
             val yrcMatch = yrcLineRegex.find(line)
             if (yrcMatch != null) {
                 val timeMs = yrcMatch.groupValues[1].toLongOrNull() ?: return@forEach
                 val text = FormatUtils.decodeHtml(
                     line.substring(yrcMatch.range.last + 1)
                         .replace(yrcWordRegex, "")
+                        .replace(qishuiWordRegex, "")
                         .trim()
                 )
                 if (text.isNotEmpty()) {
@@ -83,7 +85,11 @@ object LrcParser {
             val matches = timeTagRegex.findAll(line).toList()
             if (matches.isEmpty()) return@forEach
 
-            val text = FormatUtils.decodeHtml(line.replace(timeTagRegex, "").trim())
+            val text = FormatUtils.decodeHtml(
+                line.replace(timeTagRegex, "")
+                    .replace(qishuiWordRegex, "")
+                    .trim()
+            )
             if (text.isEmpty()) return@forEach
 
             matches.forEach { m ->
